@@ -8,99 +8,170 @@ from typing import Optional
 
 from .errors import BuildError
 from .audio_profile import AudioProfile
+from .board_facts import BoardFacts, LogUart, ServiceUart
 
-def configure_ac79_log_uart(board_file: Path, uart_port: int, baudrate: int) -> None:
-    """Match the official AC79 DevKitBoard UART1/PB3 logging configuration."""
-    if uart_port != 1:
-        raise BuildError("AC79_DevKitBoard logging uses SDK UART1 (PB3)")
+# The UART platform data names both the pins and the port group they belong to
+# (``.port = PORTA_5_6`` next to ``.tx_pin = IO_PORTA_05``). The board states the
+# pins; the group is derived from them, because the schema has no field for it
+# and a pin pair is what actually selects the group.
+_PIN_PATTERN = re.compile(r"^IO_PORT([A-Z])_(\d{1,2})$")
+
+
+def _uart_port_group(tx_pin: str, rx_pin: str) -> str:
+    """Return the vendor port-group macro for a same-port TX/RX pin pair."""
+    tx = _PIN_PATTERN.match(tx_pin)
+    rx = _PIN_PATTERN.match(rx_pin)
+    if tx is None or rx is None or tx.group(1) != rx.group(1):
+        raise BuildError(
+            f"service UART pins {tx_pin!r}/{rx_pin!r} are not a same-port "
+            f"IO_PORT<X>_<n> pair, so no port group can be derived for them"
+        )
+    return f"PORT{tx.group(1)}_{int(tx.group(2))}_{int(rx.group(2))}"
+
+
+def configure_log_uart_block(
+    board_file: Path, uart_port: int, baudrate: int, facts: BoardFacts
+) -> None:
+    """Program the board's documented log UART into the staged board file.
+
+    This is the wl82 layout, where the log UART is a UART platform-data block in
+    the demo's board.c. The port is asserted against the board's own declaration
+    so a build that selected a different controller fails rather than logging
+    into nothing.
+    """
+    log_uart: LogUart = facts.log_uart
+    if uart_port != log_uart.port:
+        raise BuildError(
+            f"{facts.board} logs on SDK UART{log_uart.port}, but the build "
+            f"selected UART{uart_port}"
+        )
+    if log_uart.tx_pin is None:
+        raise BuildError(
+            f"{facts.board} logs on UART{log_uart.port} but declares no tx_pin, "
+            f"which this chip's board file has to rewrite"
+        )
     if not board_file.is_file():
         return
 
+    name = f"uart{log_uart.port}"
     content = board_file.read_text(encoding="utf-8")
-    marker = "UART1_PLATFORM_DATA_BEGIN(uart1_data)"
-    end = "UART1_PLATFORM_DATA_END();"
+    marker = f"UART{log_uart.port}_PLATFORM_DATA_BEGIN({name}_data)"
+    end = f"UART{log_uart.port}_PLATFORM_DATA_END();"
     start = content.find(marker)
     if start < 0:
+        # The wl82 demo board carries only the vendor's UART2 block, so a new
+        # log UART is inserted ahead of it.
         uart2_marker = "UART2_PLATFORM_DATA_BEGIN(uart2_data)"
         insertion = content.find(uart2_marker)
         if insertion < 0:
             raise BuildError(f"Jieli board file has no UART2 insertion point: {board_file}")
         uart_block = (
-            "UART1_PLATFORM_DATA_BEGIN(uart1_data)\n"
+            f"UART{log_uart.port}_PLATFORM_DATA_BEGIN({name}_data)\n"
             f"    .baudrate = {baudrate},\n"
             "    .port = PORT_REMAP,\n"
             "    .output_channel = OUTPUT_CHANNEL0,\n"
-            "    .tx_pin = IO_PORTB_03,\n"
+            f"    .tx_pin = {log_uart.tx_pin},\n"
             "    .rx_pin = -1,\n"
             "    .max_continue_recv_cnt = 1024,\n"
             "    .idle_sys_clk_cnt = 500000,\n"
             "    .clk_src = PLL_48M,\n"
             "    .flags = UART_DEBUG,\n"
-            "UART1_PLATFORM_DATA_END();\n\n"
+            f"UART{log_uart.port}_PLATFORM_DATA_END();\n\n"
         )
         content = content[:insertion] + uart_block + content[insertion:]
     else:
         finish = content.find(end, start)
         if finish < 0:
-            raise BuildError(f"Jieli board file has an incomplete UART1 block: {board_file}")
+            raise BuildError(
+                f"Jieli board file has an incomplete UART{log_uart.port} block: {board_file}"
+            )
         finish += len(end)
         uart_block = content[start:finish]
         replacements = (
             (r"\.baudrate\s*=\s*\d+\s*,", f".baudrate = {baudrate},"),
             (r"\.port\s*=\s*[^,]+,", ".port = PORT_REMAP,"),
             (r"\.output_channel\s*=\s*[^,]+,", ".output_channel = OUTPUT_CHANNEL0,"),
-            (r"\.tx_pin\s*=\s*[^,]+,", ".tx_pin = IO_PORTB_03,"),
+            (r"\.tx_pin\s*=\s*[^,]+,", f".tx_pin = {log_uart.tx_pin},"),
             (r"\.rx_pin\s*=\s*[^,]+,", ".rx_pin = -1,"),
         )
         for pattern, replacement in replacements:
             uart_block, count = re.subn(pattern, replacement, uart_block, count=1)
             if count != 1:
-                raise BuildError(f"AC79 UART1 log setting was not found in {board_file}")
+                raise BuildError(
+                    f"UART{log_uart.port} log setting was not found in {board_file}"
+                )
         content = content[:start] + uart_block + content[finish:]
 
+    # The vendor's debug_uart_init still points at the UART2 block it was
+    # written for; the log UART it must initialize is the board's.
     init_marker = "uart_init(&uart2_data);"
-    content, count = content.replace(init_marker, "uart_init(&uart1_data);", 1), content.count(init_marker)
+    content, count = (
+        content.replace(init_marker, f"uart_init(&{name}_data);", 1),
+        content.count(init_marker),
+    )
     if count != 1:
-        raise BuildError(f"AC79 debug_uart_init does not initialize UART2 in {board_file}")
+        raise BuildError(f"Jieli debug_uart_init does not initialize UART2 in {board_file}")
     board_file.write_text(content, encoding="utf-8")
 
-def configure_ac792_log_uart(board_header: Path, uart_port: int, baudrate: int) -> None:
-    """Set AC792N's documented UART0 log baud in the staged board profile."""
-    if uart_port != 0:
-        raise BuildError("AC792N_Develop_Board logging uses SDK UART0 (PD1)")
+def configure_log_uart_baudrate(
+    board_header: Path, uart_port: int, baudrate: int, facts: BoardFacts
+) -> None:
+    """Set the board's documented log UART baud in the staged board profile.
+
+    This is the wl83 layout, where the log UART is the vendor board profile's
+    ``TCFG_UART<n>_BAUDRATE``. The port is asserted against the board's own
+    declaration for the same reason as the wl82 block hook.
+    """
+    log_uart: LogUart = facts.log_uart
+    if uart_port != log_uart.port:
+        raise BuildError(
+            f"{facts.board} logs on SDK UART{log_uart.port}, but the build "
+            f"selected UART{uart_port}"
+        )
     content = board_header.read_text(encoding="utf-8")
     content, count = re.subn(
-        r"(#define\s+TCFG_UART0_BAUDRATE\s+)\d+",
+        rf"(#define\s+TCFG_UART{log_uart.port}_BAUDRATE\s+)\d+",
         rf"\g<1>{baudrate}",
         content,
         count=1,
     )
     if count != 1:
-        raise BuildError(f"AC792 UART0 baudrate was not found in {board_header}")
+        raise BuildError(
+            f"UART{log_uart.port} baudrate was not found in {board_header}"
+        )
     board_header.write_text(content, encoding="utf-8")
 
-def configure_service_uart(board_file: Path) -> None:
-    """Route Tuya logical UART0/TAL CLI to AC79 hardware UART0 on PA5/PA6."""
+def configure_service_uart(board_file: Path, facts: BoardFacts) -> None:
+    """Route the Tuya logical UART0/TAL CLI to the board's service UART.
+
+    The UART index, the pins and the port group all come from the board's facts;
+    only the platform-data shape is the vendor's.
+    """
+    service: Optional[ServiceUart] = facts.service_uart
+    if service is None:
+        raise BuildError(f"{facts.board} declares no service UART to configure")
     if not board_file.is_file():
         return
 
+    name = f"uart{service.port}"
+    port_group = _uart_port_group(service.tx_pin, service.rx_pin)
     content = board_file.read_text(encoding="utf-8")
-    begin = "UART0_PLATFORM_DATA_BEGIN(uart0_data)"
-    end = "UART0_PLATFORM_DATA_END();"
+    begin = f"UART{service.port}_PLATFORM_DATA_BEGIN({name}_data)"
+    end = f"UART{service.port}_PLATFORM_DATA_END();"
     start = content.find(begin)
     finish = content.find(end, start) if start >= 0 else -1
     if start < 0:
         uart_block = (
-            "UART0_PLATFORM_DATA_BEGIN(uart0_data)\n"
+            f"UART{service.port}_PLATFORM_DATA_BEGIN({name}_data)\n"
             "    .baudrate = 115200,\n"
-            "    .port = PORTA_5_6,\n"
-            "    .tx_pin = IO_PORTA_05,\n"
-            "    .rx_pin = IO_PORTA_06,\n"
+            f"    .port = {port_group},\n"
+            f"    .tx_pin = {service.tx_pin},\n"
+            f"    .rx_pin = {service.rx_pin},\n"
             "    .max_continue_recv_cnt = 1024,\n"
             "    .idle_sys_clk_cnt = 500000,\n"
             "    .clk_src = PLL_48M,\n"
             "    .flags = 0,\n"
-            "UART0_PLATFORM_DATA_END();\n\n"
+            f"UART{service.port}_PLATFORM_DATA_END();\n\n"
         )
         insertion = content.find("UART1_PLATFORM_DATA_BEGIN(uart1_data)")
         if insertion < 0:
@@ -110,33 +181,39 @@ def configure_service_uart(board_file: Path) -> None:
         content = content[:insertion] + uart_block + content[insertion:]
     else:
         if finish < 0:
-            raise BuildError(f"Jieli board file has an incomplete UART0 service block: {board_file}")
+            raise BuildError(
+                f"Jieli board file has an incomplete UART{service.port} "
+                f"service block: {board_file}"
+            )
         finish += len(end)
         uart_block = content[start:finish]
         replacements = (
             (r"\.baudrate\s*=\s*\d+\s*,", ".baudrate = 115200,"),
-            (r"\.port\s*=\s*[^,]+,", ".port = PORTA_5_6,"),
-            (r"\.tx_pin\s*=\s*[^,]+,", ".tx_pin = IO_PORTA_05,"),
-            (r"\.rx_pin\s*=\s*[^,]+,", ".rx_pin = IO_PORTA_06,"),
+            (r"\.port\s*=\s*[^,]+,", f".port = {port_group},"),
+            (r"\.tx_pin\s*=\s*[^,]+,", f".tx_pin = {service.tx_pin},"),
+            (r"\.rx_pin\s*=\s*[^,]+,", f".rx_pin = {service.rx_pin},"),
             (r"\.flags\s*=\s*[^,]+,", ".flags = 0,"),
         )
         for pattern, replacement in replacements:
             uart_block, count = re.subn(pattern, replacement, uart_block, count=1)
             if count != 1:
-                raise BuildError(f"AC79 UART0 service setting was not found in {board_file}")
+                raise BuildError(
+                    f"UART{service.port} service setting was not found in {board_file}"
+                )
         content = content[:start] + uart_block + content[finish:]
 
-    uart0_registered = re.search(
-        r'\{\s*"uart0"\s*,\s*&uart_dev_ops\s*,\s*\(void\s*\*\)\s*&uart0_data\s*\}',
+    uart_registered = re.search(
+        r'\{\s*"' + name + r'"\s*,\s*&uart_dev_ops\s*,\s*\(void\s*\*\)\s*&'
+        + name + r'_data\s*\}',
         content,
     )
-    if not uart0_registered:
+    if not uart_registered:
         device_table = "REGISTER_DEVICES(device_table) = {"
         if device_table not in content:
             raise BuildError(f"Jieli board file has no device table: {board_file}")
         content = content.replace(
             device_table,
-            device_table + '\n    {"uart0", &uart_dev_ops, (void *)&uart0_data },',
+            device_table + f'\n    {{"{name}", &uart_dev_ops, (void *)&{name}_data }},',
             1,
         )
 
@@ -216,11 +293,6 @@ def configure_full_stack_app_config(app_config_file: Path) -> None:
         raise BuildError(f"Jieli app_config.h has no final #endif: {app_config_file}")
     app_config_file.write_text(content[:insert_at] + config + content[insert_at:], encoding="utf-8")
 
-def configure_ac79_devkit_memory(app_config_file: Path) -> None:
-    """Use the AC79 DevKit reference memory map in the staging copy."""
-    _rewrite_memory_macros(app_config_file, {"__FLASH_SIZE__": 8, "__SDRAM_SIZE__": 8})
-
-
 def _rewrite_memory_macros(config_file: Path, sizes: dict[str, int]) -> None:
     """Set named memory macros exactly once in an SDK staging config."""
     if not config_file.is_file():
@@ -240,24 +312,48 @@ def _rewrite_memory_macros(config_file: Path, sizes: dict[str, int]) -> None:
 
     config_file.write_text(content, encoding="utf-8")
 
-def configure_ac792_devkit_memory(chip_config_file: Path, board_config_file: Path) -> None:
-    """Use the AC792N development-board reference SKU (AC7926A) memory map."""
-    _rewrite_memory_macros(chip_config_file, {"__FLASH_SIZE__": 8, "__SDRAM_SIZE__": 16})
+def configure_board_memory(
+    config_file: Path, facts: BoardFacts, ddr_config_file: Optional[Path] = None
+) -> None:
+    """Apply the board's memory map to the SDK config that carries it.
 
-    if not board_config_file.is_file():
-        raise BuildError(f"Jieli board config not found: {board_config_file}")
-    content = board_config_file.read_text(encoding="utf-8")
+    ``config_file`` is where this chip's SDK keeps ``__FLASH_SIZE__`` and
+    ``__SDRAM_SIZE__``. ``ddr_config_file`` is the board profile that gates the
+    external DDR through ``CONFIG_NO_SDRAM_ENABLE``; a chip whose DDR is not
+    gated that way passes none, and a board that declares DDR then fails rather
+    than silently staging a map the SDK will not use.
+    """
+    _rewrite_memory_macros(
+        config_file,
+        {
+            "__FLASH_SIZE__": facts.memory.flash_mib,
+            "__SDRAM_SIZE__": facts.memory.sdram_mib,
+        },
+    )
+
+    if not facts.memory.external_ddr:
+        return
+    if ddr_config_file is None:
+        raise BuildError(
+            f"{facts.board} declares external DDR, but this chip's SDK enables "
+            f"it through a board profile the platform did not stage"
+        )
+    if not ddr_config_file.is_file():
+        raise BuildError(f"Jieli board config not found: {ddr_config_file}")
+    content = ddr_config_file.read_text(encoding="utf-8")
     content, count = re.subn(
         r"(?m)^[ \t]*#define[ \t]+CONFIG_NO_SDRAM_ENABLE[ \t]*$",
+        # A comment, not a fact the build reads: kept byte-for-byte because it
+        # is already baked into every staged tree.
         "/* External DDR is enabled for AC7926A DevKit. */",
         content,
     )
     if count != 1:
         raise BuildError(
             f"Expected exactly one CONFIG_NO_SDRAM_ENABLE definition in "
-            f"{board_config_file}, found {count}"
+            f"{ddr_config_file}, found {count}"
         )
-    board_config_file.write_text(content, encoding="utf-8")
+    ddr_config_file.write_text(content, encoding="utf-8")
 
 def configure_audio_board(board_file: Path, audio_config_header: Path, board: "AudioProfile") -> None:
     """Patch the staged board file with the profile's audio device and init.
@@ -417,19 +513,19 @@ def configure_usb_download_app_config(app_config_file: Path) -> None:
     _insert_before_final_endif(app_config_file, block)
 
 
-def configure_usb_download_board_header(
-    board_header: Path, usb_device: str = "TCFG_FUSB_DEVICE"
-) -> None:
+def configure_usb_download_board_header(board_header: Path, facts: BoardFacts) -> None:
     """Enable the AC792 USB slave/MSD stack in the staged board profile.
 
     board_demo.h is reached from the USB sources through
-    app_config.h -> board_config.h -> board_demo.h.
+    app_config.h -> board_config.h -> board_demo.h. The device macro is the
+    board's own: a host port (``TCFG_HUSB_DEVICE``) or a full-speed device port
+    (``TCFG_FUSB_DEVICE``).
     """
     block = (
         f"{USB_DOWNLOAD_MARKER}\n"
         "#define TCFG_FUSB_DEVICE                    BIT(0)\n"
         "#define TCFG_HUSB_DEVICE                    BIT(1)\n"
-        f"#define TCFG_USB_DEVICE                     {usb_device}\n"
+        f"#define TCFG_USB_DEVICE                     {facts.usb_device}\n"
         "#define TCFG_PC_ENABLE                      1\n"
         "#define USB_PC_NO_APP_MODE                  2\n"
         "#define USB_MALLOC_ENABLE                   1\n"
@@ -515,30 +611,32 @@ def configure_lcd_app_config(app_config_file: Path) -> None:
     _insert_before_final_endif(app_config_file, block, LCD_MARKER)
 
 
-def configure_lcd_board_header(
-    board_header: Path,
-    panel_macro: str = "TCFG_LCD_MIPI_ST7701S_480x800",
-) -> None:
-    """Select a MIPI-DSI panel in the staged vendor board profile.
+def configure_lcd_board_header(board_header: Path, facts: BoardFacts) -> None:
+    """Select the board's MIPI-DSI panel in the staged vendor board profile.
 
-    The values are stated explicitly rather than left to lcd_board_cfg_template.h:
-    that header deliberately carries no block for the 480x800 ST7701S panel (its
-    own copy is commented out with the note that the board file states it
-    directly), so including it here would leave every TCFG_LCD_* macro undefined.
-    They match the vendor's demo_ui profile for this panel.
+    The panel macro, device name and reset/backlight pins are the board's facts.
+    The values are stated explicitly rather than left to
+    lcd_board_cfg_template.h: that header deliberately carries no block for the
+    480x800 ST7701S panel (its own copy is commented out with the note that the
+    board file states it directly), so including it here would leave every
+    TCFG_LCD_* macro undefined. They match the vendor's demo_ui profile for this
+    panel.
 
     TCFG_LCD_INPUT_FORMAT must agree with the LVGL colour depth the TuyaOpen side
     builds with; the vendor header notes the same requirement.
     """
+    display = facts.display
+    if display is None:
+        raise BuildError(f"{facts.board} declares no display panel to configure")
     block = (
         f"{LCD_MARKER}\n"
         "#define TCFG_LCD_ENABLE                     1\n"
-        f"#define {panel_macro}    1\n"
+        f"#define {display.panel_macro}    1\n"
         "#define TCFG_LCD_INPUT_FORMAT               LCD_IN_RGB565\n"
-        '#define TCFG_LCD_DEVICE_NAME                "MIPI_480x800_ST7701S"\n'
+        f'#define TCFG_LCD_DEVICE_NAME                "{display.device_name}"\n'
         "#define TCFG_LCD_BL_VALUE                   1\n"
-        "#define TCFG_LCD_RESET_IO                   IO_PORTB_00\n"
-        "#define TCFG_LCD_BL_IO                      IO_PORTB_01\n"
+        f"#define TCFG_LCD_RESET_IO                   {display.reset_io}\n"
+        f"#define TCFG_LCD_BL_IO                      {display.backlight_io}\n"
         "#define TCFG_LCD_RS_IO                      -1\n"
         "#define TCFG_LCD_CS_IO                      -1\n"
         "#define TCFG_LCD_TE_ENABLE                  0\n"

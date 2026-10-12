@@ -28,10 +28,28 @@ def parse_build_params(path: Path) -> dict[str, str]:
     return params
 
 
+# The board catalog under boards/JIELI declares each board twice in Kconfig: the
+# canonical name in CONFIG_BOARD_CHOICE and a selection flag whose symbol is
+# that name upper-cased (config BOARD_CHOICE_<NAME>). Reading the pair instead
+# of hardcoding a board name is what lets a new board be added by editing
+# boards/JIELI only. Both halves are required so a stale or aliased flag cannot
+# select a board whose profile was not actually chosen.
+BOARD_CHOICE_FLAG_PREFIX = "CONFIG_BOARD_CHOICE_"
+_TRUTHY = ("y", "true", "True")
+
+
 def resolve_board_name(params: dict[str, str]) -> str | None:
-    """Return the selected Jieli board profile used by the staging hooks."""
-    if params.get("CONFIG_BOARD_CHOICE_AC792N_DEVELOP_BOARD") in ("y", "true", "True"):
-        return "AC792N_Develop_Board"
+    """Return the selected Jieli board profile used by the staging hooks.
+
+    The selection is data, not code: the board name comes from the generated
+    build parameters and is confirmed by its matching Kconfig choice flag, so
+    the platform carries no per-board branch.
+    """
+    board = params.get("CONFIG_BOARD_CHOICE", "").strip()
+    if not board:
+        return None
+    if params.get(BOARD_CHOICE_FLAG_PREFIX + board.upper()) in _TRUTHY:
+        return board
     return None
 
 

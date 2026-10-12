@@ -159,3 +159,56 @@ set(CMAKE_CXX_FLAGS
 
 set(CMAKE_C_COMPILER_WORKS 1)
 set(CMAKE_CXX_COMPILER_WORKS 1)
+
+# ---------------------------------------------------------------------------
+# Shadow build plan
+#
+# Resolve the same inputs this file just resolved into a machine-readable plan
+# at <build-dir>/cache/jieli/build_plan.json. Nothing below feeds back into the
+# build: the plan is written for the parent repository's preflight and for
+# debugging, so every failure -- a missing interpreter included -- is a warning
+# and never a FATAL_ERROR.
+#
+# TOS_PYTHON is the interpreter tos.py pinned for this build, an absolute path.
+# The bare "python" fallback the top-level CMakeLists uses when tos.py did not
+# inject one is resolved through find_program, so PATH is never trusted for the
+# executable name. JIELI_SDK_ROOT and JIELI_TOOL_DIR are deliberately not
+# forwarded: the resolver re-derives both from the same environment this file
+# reads, and on wl83 this file's JIELI_SDK_ROOT is the SDK *source* root while
+# the Python helper's environment variable means the *checkout* root.
+# ---------------------------------------------------------------------------
+set(JIELI_BUILD_PLAN_SCRIPT "${PLATFORM_PATH}/tools/jieli_build/build_plan.py")
+if(EXISTS "${JIELI_BUILD_PLAN_SCRIPT}"
+        AND DOT_CONFIG_DIR AND TOP_SOURCE_DIR AND TOP_BINARY_DIR)
+    if(TOS_PYTHON AND IS_ABSOLUTE "${TOS_PYTHON}")
+        set(JIELI_BUILD_PLAN_PYTHON "${TOS_PYTHON}")
+    else()
+        find_program(JIELI_BUILD_PLAN_PYTHON NAMES python3 python)
+    endif()
+    if(JIELI_BUILD_PLAN_PYTHON)
+        execute_process(
+            COMMAND
+                "${JIELI_BUILD_PLAN_PYTHON}" "${JIELI_BUILD_PLAN_SCRIPT}"
+                --config "${DOT_CONFIG_DIR}/${DOT_CONFIG}"
+                --open-root "${TOP_SOURCE_DIR}"
+                --build-dir "${TOP_BINARY_DIR}"
+                --bin-output-dir "${EXECUTABLE_OUTPUT_PATH}"
+            RESULT_VARIABLE JIELI_BUILD_PLAN_RESULT
+            OUTPUT_VARIABLE JIELI_BUILD_PLAN_STDOUT
+            ERROR_VARIABLE JIELI_BUILD_PLAN_STDERR
+        )
+        if(JIELI_BUILD_PLAN_RESULT)
+            message(WARNING
+                "[JIELI] shadow build plan not written: ${JIELI_BUILD_PLAN_STDERR}")
+        elseif(JIELI_BUILD_PLAN_STDERR)
+            # The resolver reports every failure as a warning and still exits 0
+            # so it can never block this configure, which leaves its stderr as
+            # the only signal that it skipped the plan.
+            message(WARNING "[JIELI] shadow build plan: ${JIELI_BUILD_PLAN_STDERR}")
+        else()
+            message(STATUS "${JIELI_BUILD_PLAN_STDOUT}")
+        endif()
+    else()
+        message(STATUS "[JIELI] shadow build plan skipped: no absolute Python interpreter")
+    endif()
+endif()

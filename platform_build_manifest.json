@@ -6,7 +6,9 @@
     "protocol_versions": [1],
     "resolver": "tools/jieli_build/build_plan.py",
     "default_output": "cache/jieli/build_plan.json",
-    "shadow_only": true
+    "shadow_only": false,
+    "resolver_never_blocks_configure": true,
+    "consumers": ["build_example.py"]
   },
   "capabilities": {
     "chips": ["wl82", "wl83"],

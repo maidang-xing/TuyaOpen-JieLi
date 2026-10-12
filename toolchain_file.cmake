@@ -164,10 +164,11 @@ set(CMAKE_CXX_COMPILER_WORKS 1)
 # Shadow build plan
 #
 # Resolve the same inputs this file just resolved into a machine-readable plan
-# at <build-dir>/cache/jieli/build_plan.json. Nothing below feeds back into the
-# build: the plan is written for the parent repository's preflight and for
-# debugging, so every failure -- a missing interpreter included -- is a warning
-# and never a FATAL_ERROR.
+# at <build-dir>/cache/jieli/build_plan.json. The plan is the authority for the
+# post-build stage: build_example.py consumes it and fails if it is missing or
+# stale. This hook still never blocks a configure -- every failure, a missing
+# interpreter included, is a warning and never a FATAL_ERROR -- so a configure
+# whose resolver skipped is caught at the build step instead.
 #
 # TOS_PYTHON is the interpreter tos.py pinned for this build, an absolute path.
 # The bare "python" fallback the top-level CMakeLists uses when tos.py did not

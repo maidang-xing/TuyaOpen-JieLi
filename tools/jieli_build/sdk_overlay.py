@@ -11,13 +11,13 @@ from typing import Optional
 
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
-    configure_ac79_devkit_memory, configure_ac79_log_uart, configure_ac792_devkit_memory,
-    configure_ac792_log_uart, configure_audio_board, configure_full_stack_app_config,
+    configure_audio_board, configure_board_memory, configure_full_stack_app_config,
     configure_full_stack_board, configure_lcd_app_config, configure_lcd_board,
-    configure_lcd_board_header, configure_service_uart,
-    configure_usb_download_app_config,
+    configure_lcd_board_header, configure_log_uart_baudrate, configure_log_uart_block,
+    configure_service_uart, configure_usb_download_app_config,
     configure_usb_download_board, configure_usb_download_board_header,
 )
+from .board_facts import load_board_facts
 from .chip_profiles import JIELI_CHIPS, PLATFORM_ROOT, resolve_chip
 from .errors import BuildError
 
@@ -373,6 +373,9 @@ def create_staging_tree(
 
     build_root = staging_root / "build"
     chip = chip or resolve_chip()
+    # Every board-level decision below reads this, never a per-board branch. A
+    # board that does not declare its facts is a build error, not a default.
+    facts = load_board_facts(tuyaopen_root, board_name)
     vendor_root = sdk_root / chip.sdk_source_relative
     stage_sdk_inputs(sdk_root, build_root, chip)
     source_overlay_root = build_root / chip.sdk_source_relative
@@ -380,16 +383,21 @@ def create_staging_tree(
     apps_root = source_overlay_root / "apps"
     board_file = source_overlay_root / chip.board_build_relative / "board.c"
     app_config_file = source_overlay_root / "apps/demo/demo_hello/include/app_config.h"
-    if chip.name == "wl82":
-        configure_ac79_devkit_memory(app_config_file)
-        configure_ac79_log_uart(board_file, uart_log_port, uart_log_baudrate)
-        configure_service_uart(board_file)
-    else:
-        configure_ac792_log_uart(
-            source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
-            uart_log_port,
-            uart_log_baudrate,
+    # board_demo.h is the wl83 demo profile's board header; the wl82 demo has
+    # none. Which SDK file carries which setting is a chip-layout fact.
+    board_header = source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h"
+    if facts.display is not None and chip.name != "wl83":
+        raise BuildError(
+            f"{facts.board} declares a display panel, but the platform stages the "
+            f"MIPI-DSI panel path only into the wl83 SDK"
         )
+    if chip.name == "wl82":
+        configure_board_memory(app_config_file, facts)
+        configure_log_uart_block(board_file, uart_log_port, uart_log_baudrate, facts)
+    else:
+        configure_log_uart_baudrate(board_header, uart_log_port, uart_log_baudrate, facts)
+    if facts.service_uart is not None:
+        configure_service_uart(board_file, facts)
     reference_board_file = (
         vendor_root / "apps/demo/demo_wifi_ext/board/wl83/board.c"
         if chip.name == "wl83"
@@ -401,19 +409,16 @@ def create_staging_tree(
         board_file, "TCFG_USB_DEVICE" if chip.name == "wl83" else "0x03",
     )
     if chip.name == "wl83":
-        configure_usb_download_board_header(
-            source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
-            "TCFG_HUSB_DEVICE" if board_name == "AC792N_Develop_Board" else "TCFG_FUSB_DEVICE",
-        )
-        configure_ac792_devkit_memory(
+        configure_usb_download_board_header(board_header, facts)
+        configure_board_memory(
             source_overlay_root / "apps/demo/demo_hello/board/wl83/chip_cfg.h",
-            source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
+            facts,
+            ddr_config_file=board_header,
         )
-        configure_lcd_board_header(
-            source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
-        )
-        configure_lcd_app_config(app_config_file)
-        configure_lcd_board(board_file)
+        if facts.display is not None:
+            configure_lcd_board_header(board_header, facts)
+            configure_lcd_app_config(app_config_file)
+            configure_lcd_board(board_file)
     else:
         configure_usb_download_app_config(app_config_file)
     profile = AUDIO_PROFILES.get(chip.name)
@@ -459,7 +464,7 @@ def create_staging_tree(
     )
     extra_sources_list.extend(usb_device_sources())
     extra_sources_list.append("../../../../../tuyaos/entry/jieli_usb_download.c")
-    if chip.name == "wl83":
+    if facts.display is not None:
         extra_sources_list.extend(lcd_sources())
     extra_sources_list.extend(
         [
@@ -523,7 +528,7 @@ def create_staging_tree(
     content += "    -I../../../../../apps/common/config/include \\\n"
     for include in usb_include_lines():
         content += f"    {include} \\\n"
-    if chip.name == "wl83":
+    if facts.display is not None:
         for include in lcd_include_lines():
             content += f"    {include} \\\n"
     content += "    -I../../../../../include_lib/btstack \\\n"
@@ -577,8 +582,10 @@ def create_staging_tree(
     if chip.name == "wl83":
         # AC792's WPA/SAE archives delegate crypto primitives to this
         # provider; AC791's equivalent implementation is bundled in its
-        # wpasupplicant archive.
+        # wpasupplicant archive. This is a chip-level link fact, independent of
+        # whether the board carries a panel.
         libraries += ("libcrypto_mbedtls.a",)
+    if facts.display is not None:
         # video.a carries the DSI/DPI/DMM/DMA2D driver implementations that
         # lcd_driver.c resolves into (dsi_dev_init, dpi_open, dmm_config,
         # dma2d_init, ...). They have no source in the tree - the vendor ships

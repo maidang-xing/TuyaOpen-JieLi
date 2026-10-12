@@ -277,6 +277,7 @@ class StagedAudioMakefileTest(unittest.TestCase):
                         tuya_lib_dir=pathlib.Path(tmp) / "libs",
                         uart_log_port=1 if name == "wl82" else 0,
                         chip=chip,
+                        board_name=AUDIO_PROFILES[name].audio_board_name,
                     )
                     makefile = (
                         build_root / chip.sdk_source_relative

@@ -171,6 +171,34 @@ class UsbDownloadStagingTest(unittest.TestCase):
             )
             self.assertIsNone(resolve_board_name(parse_build_params(params_path)))
 
+    def test_board_selection_reads_the_board_catalog_not_a_platform_table(self):
+        # A board the platform has never named: the profile comes from the
+        # generated Kconfig data (CONFIG_BOARD_CHOICE plus its selection flag),
+        # so adding a board under boards/JIELI needs no platform edit.
+        with tempfile.TemporaryDirectory() as directory:
+            params_path = Path(directory) / "build_param.config"
+            params_path.write_text(
+                'CONFIG_BOARD_CHOICE="Hypothetical_New_Board"\n'
+                "CONFIG_BOARD_CHOICE_HYPOTHETICAL_NEW_BOARD=y\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                resolve_board_name(parse_build_params(params_path)),
+                "Hypothetical_New_Board",
+            )
+
+            # The catalog's existing boards resolve the same way, with no
+            # per-board branch: the name is the Kconfig string, not a literal.
+            params_path.write_text(
+                'CONFIG_BOARD_CHOICE="AC79_DevKitBoard"\n'
+                "CONFIG_BOARD_CHOICE_AC79_DEVKITBOARD=y\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                resolve_board_name(parse_build_params(params_path)),
+                "AC79_DevKitBoard",
+            )
+
     @unittest.skipUnless(
         all(
             (PLATFORM_ROOT / chip.sdk_dir / chip.sdk_source_relative / source).is_file()

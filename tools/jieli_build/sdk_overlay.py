@@ -124,6 +124,22 @@ def lcd_include_lines() -> list[str]:
     return ["-I../../../../../" + directory for directory in LCD_INCLUDE_DIRS]
 
 
+def audio_board_config_path(tuyaopen_root: Path, board_name: Optional[str], profile) -> Path:
+    """Return the board's audio_config.h, preferring the selected board.
+
+    The chip profile also carries a board name, and that is what a board with
+    no audio data of its own falls back to. Reading the selected board first is
+    what lets a second board on the same chip bring its own audio data instead
+    of silently inheriting the first one's.
+    """
+    boards_root = tuyaopen_root / "boards" / "JIELI"
+    if board_name:
+        selected = boards_root / board_name / "audio_config.h"
+        if selected.is_file():
+            return selected
+    return boards_root / profile.audio_board_name / "audio_config.h"
+
+
 # The vendor demo_hello Makefile lists its own peripheral self-test programs and
 # the dhrystone benchmark in c_SRC_FILES. Nothing in a TuyaOpen image references
 # them: -flto is on and sdk.map carries no apps/common/example entry, so all 32
@@ -404,7 +420,7 @@ def create_staging_tree(
     if profile is not None and profile.board_declarations:
         configure_audio_board(
             board_file,
-            tuyaopen_root / "boards/JIELI" / profile.audio_board_name / "audio_config.h",
+            audio_board_config_path(tuyaopen_root, board_name, profile),
             profile,
         )
     shutil.copytree(

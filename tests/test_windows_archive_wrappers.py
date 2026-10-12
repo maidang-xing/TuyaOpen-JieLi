@@ -67,7 +67,11 @@ class WindowsArchiveWrapperTest(unittest.TestCase):
             )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(temp_dir, result.stdout + result.stderr)
+        # PowerShell folds a long path across lines when it formats the error,
+        # so the path is matched with the line breaks removed.
+        self.assertIn(
+            temp_dir, (result.stdout + result.stderr).replace("\r", "").replace("\n", "")
+        )
 
     def test_ranlib_wrapper_uses_portable_tree_without_environment(self):
         with tempfile.TemporaryDirectory() as temp_dir:

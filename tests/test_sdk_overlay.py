@@ -2,8 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path, PureWindowsPath
 
+from tools.jieli_build.audio_profile import AUDIO_PROFILES
 from tools.jieli_build.chip_profiles import JIELI_CHIPS
 from tools.jieli_build.sdk_overlay import (
+    audio_board_config_path,
     build_make_command,
     clean_staging_tree,
     drop_vendor_example_sources,
@@ -34,6 +36,33 @@ class JieliSdkOverlayTest(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
         return sdk
+
+    def test_audio_data_follows_the_selected_board_not_the_chip(self):
+        profile = AUDIO_PROFILES["wl83"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tuyaopen = Path(temp_dir)
+            boards = tuyaopen / "boards" / "JIELI"
+            for board in ("AC792N_Develop_Board", "Second_Wl83_Board"):
+                target = boards / board / "audio_config.h"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(board, encoding="utf-8")
+
+            # A second board on the same chip brings its own audio data. Going
+            # through the chip profile would hand it the first board's.
+            self.assertEqual(
+                audio_board_config_path(tuyaopen, "Second_Wl83_Board", profile),
+                boards / "Second_Wl83_Board" / "audio_config.h",
+            )
+            # A board with no audio data of its own falls back to the profile's,
+            # which is what every current board relies on.
+            self.assertEqual(
+                audio_board_config_path(tuyaopen, "Board_With_No_Audio", profile),
+                boards / profile.audio_board_name / "audio_config.h",
+            )
+            self.assertEqual(
+                audio_board_config_path(tuyaopen, None, profile),
+                boards / profile.audio_board_name / "audio_config.h",
+            )
 
     def test_staging_copies_writable_sdk_paths_and_links_read_only_inputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -8,9 +8,18 @@ and build_example.py -- in two languages, with two different meanings for the
 same JIELI_SDK_ROOT name. The plan names the two roots separately so the
 confusion cannot survive a consumer.
 
-Shadow only: nothing here feeds back into the build. A plan that cannot be
-resolved, or that fails validation, is reported and dropped. The CLI always
-exits 0, because the configure step that calls it must never depend on it.
+Two different contracts meet here, and they are deliberately not the same:
+
+* The resolver itself never blocks a configure. A plan that cannot be resolved,
+  or that fails validation, is reported and dropped, and the CLI always exits 0
+  because the configure step that calls it must not depend on it.
+* The plan is nevertheless the authority for the build. build_example.py
+  consumes it and fails when it is missing, stale, or contradicts the build
+  parameters -- so a configure whose resolver skipped is caught at the build
+  step rather than silently resolved a second time.
+
+Retiring the first contract is a separate step; until then a consumer that
+needs the plan has to say so, which is what build_example.py does.
 """
 
 from __future__ import annotations

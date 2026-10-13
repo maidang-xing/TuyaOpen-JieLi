@@ -1,15 +1,17 @@
-"""The board facts reader: what it accepts, and how loudly it rejects the rest."""
+"""The board facts reader: what it accepts, and how loudly it rejects the rest.
 
-import json
-import tempfile
+The facts are Kconfig settings under boards/JIELI/<board>/Kconfig, so the reader
+takes the evaluated config mapping rather than a file of its own.
+"""
+
 import unittest
-from pathlib import Path
 
 from tools.jieli_build.board_facts import (
-    BOARD_FACTS_FILENAME,
-    SCHEMA_VERSION,
-    BoardFacts,
-    board_facts_path,
+    KCONFIG_PREFIX,
+    PANELS,
+    SYMBOL_PREFIX,
+    USB_DEVICE_MACROS,
+    board_facts_digest,
     load_board_facts,
 )
 from tools.jieli_build.chip_profiles import PLATFORM_ROOT
@@ -17,193 +19,210 @@ from tools.jieli_build.errors import BuildError
 
 TUYAOPEN_ROOT = PLATFORM_ROOT.parents[1]
 
+# A board that declares everything, in the shape the evaluated config carries:
+# Kconfig writes CONFIG_<name>=<value> and omits a symbol the board does not
+# declare.
+FULL_BOARD = {
+    "CONFIG_BOARD_CHOICE": "Test_Board",
+    "CONFIG_JIELI_BOARD_USB_ROLE": "host",
+    "CONFIG_JIELI_BOARD_FLASH_MIB": "8",
+    "CONFIG_JIELI_BOARD_SDRAM_MIB": "16",
+    "CONFIG_JIELI_BOARD_EXTERNAL_DDR": "y",
+    "CONFIG_JIELI_BOARD_LOG_UART_PORT": "0",
+    "CONFIG_JIELI_BOARD_LOG_UART_TX_PIN": "",
+    "CONFIG_JIELI_BOARD_HAS_SERVICE_UART": "y",
+    "CONFIG_JIELI_BOARD_SERVICE_UART_PORT": "0",
+    "CONFIG_JIELI_BOARD_SERVICE_UART_TX_PIN": "IO_PORTA_05",
+    "CONFIG_JIELI_BOARD_SERVICE_UART_RX_PIN": "IO_PORTA_06",
+    "CONFIG_JIELI_BOARD_HAS_DISPLAY": "y",
+    "CONFIG_JIELI_BOARD_DISPLAY_PANEL": "MIPI_480x800_ST7701S",
+    "CONFIG_JIELI_BOARD_DISPLAY_RESET_IO": "IO_PORTB_00",
+    "CONFIG_JIELI_BOARD_DISPLAY_BACKLIGHT_IO": "IO_PORTB_01",
+}
 
-def complete_facts(board: str = "Test_Board") -> dict:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "board": board,
-        "usb_device": "TCFG_HUSB_DEVICE",
-        "memory": {"flash_mib": 8, "sdram_mib": 16, "external_ddr": True},
-        "log_uart": {"port": 0},
-        "service_uart": None,
-        "display": {
-            "panel_macro": "TCFG_LCD_MIPI_ST7701S_480x800",
-            "device_name": "MIPI_480x800_ST7701S",
-            "reset_io": "IO_PORTB_00",
-            "backlight_io": "IO_PORTB_01",
-        },
-    }
+
+def config_with(**overrides) -> dict[str, str]:
+    values = dict(FULL_BOARD)
+    for name, value in overrides.items():
+        key = name if name.startswith("CONFIG_") else SYMBOL_PREFIX + name
+        if value is None:
+            values.pop(key, None)
+        else:
+            values[key] = value
+    return values
 
 
 class BoardFactsTest(unittest.TestCase):
-    def _write(self, root: Path, board: str, data) -> Path:
-        path = root / "boards" / "JIELI" / board / BOARD_FACTS_FILENAME
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(data, str):
-            path.write_text(data, encoding="utf-8")
-        else:
-            path.write_text(json.dumps(data), encoding="utf-8")
-        return path
-
-    def _load(self, data, board: str = "Test_Board") -> BoardFacts:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            self._write(Path(temp_dir), board, data)
-            return load_board_facts(Path(temp_dir), board)
-
-    # -- the happy path ---------------------------------------------------
-
     def test_reads_every_fact_into_a_typed_value(self):
-        facts = self._load(complete_facts())
+        facts = load_board_facts(config_with())
 
-        self.assertIsInstance(facts, BoardFacts)
         self.assertEqual(facts.board, "Test_Board")
         self.assertEqual(facts.usb_device, "TCFG_HUSB_DEVICE")
-        self.assertEqual(
-            (facts.memory.flash_mib, facts.memory.sdram_mib, facts.memory.external_ddr),
-            (8, 16, True),
-        )
+        self.assertEqual(facts.memory.flash_mib, 8)
+        self.assertEqual(facts.memory.sdram_mib, 16)
+        self.assertTrue(facts.memory.external_ddr)
         self.assertEqual(facts.log_uart.port, 0)
         self.assertIsNone(facts.log_uart.tx_pin)
-        self.assertIsNone(facts.service_uart)
+        self.assertEqual(facts.service_uart.port, 0)
+        self.assertEqual(facts.service_uart.tx_pin, "IO_PORTA_05")
+        self.assertEqual(facts.display.panel_macro, "TCFG_LCD_MIPI_ST7701S_480x800")
         self.assertEqual(facts.display.device_name, "MIPI_480x800_ST7701S")
         self.assertEqual(facts.display.reset_io, "IO_PORTB_00")
         self.assertEqual(facts.display.backlight_io, "IO_PORTB_01")
 
+    def test_the_usb_role_maps_onto_the_vendors_macro(self):
+        for role, macro in USB_DEVICE_MACROS.items():
+            with self.subTest(role=role):
+                facts = load_board_facts(config_with(USB_ROLE=role))
+                self.assertEqual(facts.usb_device, macro)
+
+    def test_an_unknown_usb_role_is_rejected(self):
+        with self.assertRaisesRegex(BuildError, "USB_ROLE.*expected one of"):
+            load_board_facts(config_with(USB_ROLE="otg"))
+
+    def test_an_unknown_panel_is_rejected(self):
+        with self.assertRaisesRegex(BuildError, "DISPLAY_PANEL.*no vendor macro"):
+            load_board_facts(config_with(DISPLAY_PANEL="ILI9488"))
+
+    def test_the_panel_macro_is_not_the_board_s_business(self):
+        # The board names the model; which macro and driver that means is the
+        # platform's mapping. So every known model has an entry.
+        for model, (macro, device) in PANELS.items():
+            with self.subTest(model=model):
+                facts = load_board_facts(config_with(DISPLAY_PANEL=model))
+                self.assertEqual(facts.display.panel_macro, macro)
+                self.assertEqual(facts.display.device_name, device)
+
     def test_a_board_with_a_service_uart_and_no_panel(self):
-        data = complete_facts()
-        data["display"] = None
-        data["service_uart"] = {
-            "port": 0,
-            "tx_pin": "IO_PORTA_05",
-            "rx_pin": "IO_PORTA_06",
-        }
-        data["log_uart"] = {"port": 1, "tx_pin": "IO_PORTB_03"}
-
-        facts = self._load(data)
-
-        self.assertIsNone(facts.display)
-        self.assertEqual(facts.service_uart.tx_pin, "IO_PORTA_05")
-        self.assertEqual(facts.service_uart.rx_pin, "IO_PORTA_06")
-        self.assertEqual(facts.log_uart.tx_pin, "IO_PORTB_03")
-
-    def test_board_facts_path_follows_the_catalog_layout(self):
-        self.assertEqual(
-            board_facts_path(Path("/root"), "Some_Board"),
-            Path("/root/boards/JIELI/Some_Board/jieli_board.json"),
+        facts = load_board_facts(
+            config_with(
+                HAS_DISPLAY=None,
+                DISPLAY_PANEL=None,
+                DISPLAY_RESET_IO=None,
+                DISPLAY_BACKLIGHT_IO=None,
+            )
         )
 
-    # -- failure paths ----------------------------------------------------
+        self.assertIsNone(facts.display)
+        self.assertIsNotNone(facts.service_uart)
 
-    def test_a_missing_file_fails_and_says_what_to_add(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with self.assertRaises(BuildError) as caught:
-                load_board_facts(Path(temp_dir), "Absent_Board")
+    def test_a_board_with_a_panel_and_no_service_uart(self):
+        facts = load_board_facts(
+            config_with(
+                HAS_SERVICE_UART=None,
+                SERVICE_UART_PORT=None,
+                SERVICE_UART_TX_PIN=None,
+                SERVICE_UART_RX_PIN=None,
+            )
+        )
 
-        message = str(caught.exception)
-        self.assertIn("Absent_Board", message)
-        self.assertIn("boards/JIELI/Absent_Board/jieli_board.json", message)
-        self.assertIn("does not declare its hardware facts", message)
+        self.assertIsNone(facts.service_uart)
+        self.assertIsNotNone(facts.display)
 
     def test_no_board_selected_fails(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with self.assertRaisesRegex(BuildError, "no Jieli board was selected"):
-                load_board_facts(Path(temp_dir), None)
+        with self.assertRaisesRegex(BuildError, "CONFIG_BOARD_CHOICE is missing"):
+            load_board_facts(config_with(**{"CONFIG_BOARD_CHOICE": ""}))
 
-    def test_an_unsupported_schema_version_fails(self):
-        data = complete_facts()
-        data["schema_version"] = 2
+    def test_a_missing_setting_fails_naming_the_symbol(self):
+        with self.assertRaisesRegex(BuildError, "CONFIG_JIELI_BOARD_FLASH_MIB"):
+            load_board_facts(config_with(FLASH_MIB=None))
 
-        with self.assertRaises(BuildError) as caught:
-            self._load(data)
+    def test_a_setting_that_is_not_an_integer_fails(self):
+        with self.assertRaisesRegex(BuildError, "not an integer"):
+            load_board_facts(config_with(SDRAM_MIB="sixteen"))
 
-        self.assertIn("schema_version", str(caught.exception))
+    def test_a_memory_size_must_be_positive(self):
+        with self.assertRaisesRegex(BuildError, "must be positive"):
+            load_board_facts(config_with(FLASH_MIB="0"))
 
-    def test_the_board_field_must_match_the_directory(self):
-        data = complete_facts(board="Other_Board")
-
-        with self.assertRaises(BuildError) as caught:
-            self._load(data, board="Test_Board")
-
-        message = str(caught.exception)
-        self.assertIn("'Other_Board'", message)
-        self.assertIn("'Test_Board'", message)
-
-    def test_a_missing_required_field_fails_naming_it(self):
-        for field in ("usb_device", "memory", "log_uart", "service_uart", "display"):
-            with self.subTest(field=field):
-                data = complete_facts()
-                del data[field]
-
-                with self.assertRaises(BuildError) as caught:
-                    self._load(data)
-
-                message = str(caught.exception)
-                self.assertIn("missing required field", message)
-                self.assertIn(repr(field), message)
-
-    def test_an_unknown_field_is_rejected(self):
-        # A field the platform does not read would suggest a fact is honoured
-        # when it is not.
-        data = complete_facts()
-        data["screen_brightness"] = 42
-
-        with self.assertRaises(BuildError) as caught:
-            self._load(data)
-
-        self.assertIn("unknown field", str(caught.exception))
-        self.assertIn("screen_brightness", str(caught.exception))
-
-    def test_a_memory_size_must_be_a_positive_integer(self):
-        for value in ("8", 0, -4, True):
-            with self.subTest(value=value):
-                data = complete_facts()
-                data["memory"]["flash_mib"] = value
-
-                with self.assertRaises(BuildError):
-                    self._load(data)
-
-    def test_external_ddr_must_be_a_boolean(self):
-        data = complete_facts()
-        data["memory"]["external_ddr"] = "true"
-
-        with self.assertRaisesRegex(BuildError, "external_ddr"):
-            self._load(data)
+    def test_a_negative_uart_port_fails(self):
+        with self.assertRaisesRegex(BuildError, "must not be negative"):
+            load_board_facts(config_with(LOG_UART_PORT="-1"))
 
     def test_a_service_uart_must_name_both_pins(self):
-        data = complete_facts()
-        data["service_uart"] = {"port": 0, "tx_pin": "IO_PORTA_05"}
+        with self.assertRaisesRegex(BuildError, "SERVICE_UART_RX_PIN"):
+            load_board_facts(config_with(SERVICE_UART_RX_PIN=None))
 
-        with self.assertRaisesRegex(BuildError, "rx_pin"):
-            self._load(data)
+    def test_a_display_must_name_its_pins(self):
+        with self.assertRaisesRegex(BuildError, "DISPLAY_RESET_IO"):
+            load_board_facts(config_with(DISPLAY_RESET_IO=None))
 
-    def test_a_display_must_name_all_four_fields(self):
-        data = complete_facts()
-        del data["display"]["backlight_io"]
+    def test_an_unset_flag_means_the_feature_is_absent(self):
+        # Kconfig omits a bool the board leaves at n, rather than writing
+        # "# X is not set" into the build parameters. Absent has to mean false.
+        facts = load_board_facts(config_with(HAS_SERVICE_UART=None))
+        self.assertIsNone(facts.service_uart)
 
-        with self.assertRaisesRegex(BuildError, "backlight_io"):
-            self._load(data)
+    def test_the_digest_follows_every_field(self):
+        base = board_facts_digest(load_board_facts(config_with()))
 
-    def test_unreadable_json_fails(self):
-        with self.assertRaisesRegex(BuildError, "not readable JSON"):
-            self._load("{ this is not json")
+        for override in (
+            {"USB_ROLE": "device"},
+            {"FLASH_MIB": "16"},
+            {"SDRAM_MIB": "8"},
+            {"EXTERNAL_DDR": None},
+            {"LOG_UART_PORT": "1"},
+            {"LOG_UART_TX_PIN": "IO_PORTB_03"},
+            {"HAS_SERVICE_UART": None},
+            {"DISPLAY_PANEL": None, "HAS_DISPLAY": None},
+        ):
+            with self.subTest(override=override):
+                changed = board_facts_digest(load_board_facts(config_with(**override)))
+                self.assertNotEqual(base, changed)
 
-    def test_a_non_object_document_fails(self):
-        with self.assertRaisesRegex(BuildError, "must be a JSON object"):
-            self._load("[1, 2, 3]")
+    def test_the_digest_is_stable_for_the_same_facts(self):
+        self.assertEqual(
+            board_facts_digest(load_board_facts(config_with())),
+            board_facts_digest(load_board_facts(config_with())),
+        )
 
-    # -- the real catalog -------------------------------------------------
 
-    @unittest.skipUnless(
-        (TUYAOPEN_ROOT / "boards/JIELI/AC79_DevKitBoard/jieli_board.json").is_file()
-        and (TUYAOPEN_ROOT / "boards/JIELI/AC792N_Develop_Board/jieli_board.json").is_file(),
-        "the board catalog is not checked out next to this platform",
-    )
-    def test_the_catalog_boards_all_load(self):
-        for board in ("AC79_DevKitBoard", "AC792N_Develop_Board"):
+class BoardKconfigTest(unittest.TestCase):
+    """The reader and the board Kconfigs have to agree on the symbol names.
+
+    The reader builds each name from SYMBOL_PREFIX and a suffix, so a typo in
+    either place would only show up as a missing setting at build time.
+    """
+
+    BOARD_DIRS = ("AC792N_Develop_Board", "AC79_DevKitBoard")
+
+    def _kconfig_text(self, board: str) -> str:
+        path = TUYAOPEN_ROOT / "boards" / "JIELI" / board / "Kconfig"
+        if not path.is_file():
+            self.skipTest(f"board Kconfig not present: {path}")
+        return path.read_text(encoding="utf-8")
+
+    def test_every_symbol_the_reader_asks_for_is_declared(self):
+        wanted = {
+            "USB_ROLE",
+            "FLASH_MIB",
+            "SDRAM_MIB",
+            "EXTERNAL_DDR",
+            "LOG_UART_PORT",
+            "LOG_UART_TX_PIN",
+            "HAS_SERVICE_UART",
+            "HAS_DISPLAY",
+        }
+        for board in self.BOARD_DIRS:
+            declared = self._kconfig_text(board)
+            for suffix in sorted(wanted):
+                with self.subTest(board=board, symbol=suffix):
+                    self.assertIn(f"config {KCONFIG_PREFIX}{suffix}", declared)
+
+    def test_the_nested_symbols_are_declared_by_the_board_that_needs_them(self):
+        nested = {
+            "AC792N_Develop_Board": ("DISPLAY_PANEL", "DISPLAY_RESET_IO"),
+            "AC79_DevKitBoard": ("SERVICE_UART_TX_PIN", "SERVICE_UART_RX_PIN"),
+        }
+        for board, suffixes in nested.items():
+            declared = self._kconfig_text(board)
+            for suffix in suffixes:
+                with self.subTest(board=board, symbol=suffix):
+                    self.assertIn(f"config {KCONFIG_PREFIX}{suffix}", declared)
+
+    def test_no_board_facts_json_is_left_behind(self):
+        # The facts moved into Kconfig; a stray file would be a second source.
+        for board in self.BOARD_DIRS:
+            path = TUYAOPEN_ROOT / "boards" / "JIELI" / board / "jieli_board.json"
             with self.subTest(board=board):
-                facts = load_board_facts(TUYAOPEN_ROOT, board)
-                self.assertEqual(facts.board, board)
-
-
-if __name__ == "__main__":
-    unittest.main()
+                self.assertFalse(path.exists(), path)

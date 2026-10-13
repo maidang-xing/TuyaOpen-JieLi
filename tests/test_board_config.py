@@ -28,7 +28,7 @@ def facts_with(**overrides) -> BoardFacts:
         "display": None,
     }
     values.update(overrides)
-    return BoardFacts(source=Path("jieli_board.json"), **values)
+    return BoardFacts(**values)
 
 
 class ServiceUartTest(unittest.TestCase):

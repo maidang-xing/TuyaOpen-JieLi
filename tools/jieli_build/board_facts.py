@@ -1,30 +1,52 @@
-"""Read the hardware facts a Jieli board declares next to itself.
+"""Read the hardware facts a Jieli board declares in its Kconfig.
 
 The staging hooks apply board-specific values to the vendor SDK: the USB device
 macro, the memory map, the log and service UARTs and the panel. Those values
-used to be per-board branches inside this package. They now live with the board,
-in ``boards/JIELI/<board>/jieli_board.json``, so a new board is data rather than
-a platform edit.
+used to be per-board branches inside this package, and briefly a JSON file
+beside each board. They are now ordinary Kconfig settings under
+``boards/JIELI/<board>/Kconfig``, so the platform reads them from the evaluated
+config the way it reads every other setting, and a new board is data rather
+than a platform edit.
 
-Nothing here falls back to a default. A fact the platform acts on is a fact the
-board has to state: a missing file or field is a build error naming the file and
-the field, never a silently inherited value. A default would only move the
-hardcoding, not remove it.
+Values that would name a vendor macro stay semantic in Kconfig -- ``usb_role``
+is ``host`` or ``device``, the panel is its model -- and the mapping to the
+vendor's vocabulary lives here, in the platform. Pin names are the SDK's own
+vocabulary and the board writes them as the vendor headers spell them.
+
+Nothing falls back to a default. A fact the platform acts on is a fact the
+board has to state: a missing setting is a build error naming the symbol, never
+a silently inherited value. A default would only move the hardcoding.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Mapping, Optional
+from dataclasses import asdict, dataclass
+from typing import Mapping, Optional
 
 from .errors import BuildError
 
-SCHEMA_VERSION = 1
-SUPPORTED_SCHEMA_VERSIONS = (SCHEMA_VERSION,)
-BOARD_FACTS_FILENAME = "jieli_board.json"
-BOARDS_RELATIVE = Path("boards") / "JIELI"
+# The namespace a board declares its facts in. Both boards declare the same
+# names, so the platform reads one set whichever is selected; Kconfig resolves
+# each value from the node the board choice makes visible, and a setting the
+# selected board does not declare simply is not there.
+# The Kconfig spelling, and the one the evaluated config carries.
+KCONFIG_PREFIX = "JIELI_BOARD_"
+SYMBOL_PREFIX = "CONFIG_" + KCONFIG_PREFIX
+
+# What the board's semantic usb_role maps onto.
+USB_DEVICE_MACROS = {
+    "host": "TCFG_HUSB_DEVICE",
+    "device": "TCFG_FUSB_DEVICE",
+}
+
+# Panel model -> (the vendor macro that selects its driver, the device name the
+# vendor's LCD registration matches on). A board names the model; which macro
+# and which driver that means is the SDK's business, not the board's.
+PANELS = {
+    "MIPI_480x800_ST7701S": ("TCFG_LCD_MIPI_ST7701S_480x800", "MIPI_480x800_ST7701S"),
+}
 
 
 @dataclass(frozen=True)
@@ -42,8 +64,8 @@ class Memory:
 class LogUart:
     """The SDK UART the board logs on.
 
-    ``tx_pin`` is optional: a board that keeps the vendor's default pin omits
-    it, and the staging hook then leaves the vendor pin alone.
+    ``tx_pin`` is optional: a board that keeps the vendor's default pin leaves
+    it empty, and the staging hook then leaves the vendor pin alone.
     """
 
     port: int
@@ -74,8 +96,6 @@ class BoardFacts:
     """Every board-level fact the staging hooks act on.
 
     ``service_uart`` and ``display`` are None for a board that has neither.
-    ``source`` is the file the facts were read from, so a later failure can name
-    it.
     """
 
     board: str
@@ -84,188 +104,132 @@ class BoardFacts:
     log_uart: LogUart
     service_uart: Optional[ServiceUart]
     display: Optional[Display]
-    source: Path
 
 
-def board_facts_path(tuyaopen_root: Path, board: str) -> Path:
-    """Return where a board's facts live, whether or not the file exists."""
-    return Path(tuyaopen_root) / BOARDS_RELATIVE / board / BOARD_FACTS_FILENAME
+def board_facts_digest(facts: BoardFacts) -> str:
+    """Render the facts so a staging tree can record which ones it was built from.
 
-
-def _fail(source: Path, message: str) -> BuildError:
-    return BuildError(f"{source}: {message}")
-
-
-def _field(data: Mapping[str, Any], source: Path, name: str) -> Any:
-    if name not in data:
-        raise _fail(source, f"missing required field {name!r}")
-    return data[name]
-
-
-def _reject_unknown(data: Mapping[str, Any], source: Path, known: set[str]) -> None:
-    """A field the platform does not read is a mistake, not a harmless extra.
-
-    Accepting it would suggest a fact is being honoured when it is not.
+    The staging inputs are named components and this is the one that covers the
+    board's facts. It is a digest of the resolved facts rather than of a file,
+    because there is no longer a file: the values come from the evaluated
+    config, and what staging acts on is the result.
     """
-    unknown = sorted(set(data) - known)
-    if unknown:
-        raise _fail(
-            source,
-            "unknown field(s) the platform does not read: "
-            + ", ".join(repr(name) for name in unknown),
+    rendered = json.dumps(asdict(facts), sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _symbol(name: str) -> str:
+    return SYMBOL_PREFIX + name
+
+
+def _text(params: Mapping[str, str], name: str) -> str:
+    return params.get(_symbol(name), "").strip()
+
+
+def _require(params: Mapping[str, str], name: str) -> str:
+    value = _text(params, name)
+    if not value:
+        raise BuildError(
+            f"the selected board does not declare {_symbol(name)}; add it to "
+            f"boards/JIELI/<board>/Kconfig"
         )
-
-
-def _require_str(data: Mapping[str, Any], source: Path, name: str) -> str:
-    value = _field(data, source, name)
-    if not isinstance(value, str) or not value:
-        raise _fail(source, f"field {name!r} must be a non-empty string, found {value!r}")
     return value
 
 
-def _require_int(data: Mapping[str, Any], source: Path, name: str) -> int:
-    value = _field(data, source, name)
-    # bool is an int subclass, but a boolean where a size belongs is a mistake.
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise _fail(source, f"field {name!r} must be an integer, found {value!r}")
-    return value
+def _require_int(params: Mapping[str, str], name: str) -> int:
+    raw = _require(params, name)
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise BuildError(f"{_symbol(name)} is not an integer: {raw!r}") from exc
 
 
-def _require_bool(data: Mapping[str, Any], source: Path, name: str) -> bool:
-    value = _field(data, source, name)
-    if not isinstance(value, bool):
-        raise _fail(source, f"field {name!r} must be true or false, found {value!r}")
-    return value
+def _flag(params: Mapping[str, str], name: str) -> bool:
+    """A Kconfig bool. Unset means the symbol is absent, which is false."""
+    return params.get(_symbol(name), "").strip() in ("y", "true", "True")
 
 
-def _require_object(value: Any, source: Path, name: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise _fail(source, f"field {name!r} must be a JSON object, found {value!r}")
-    return value
-
-
-def _parse_memory(data: Mapping[str, Any], source: Path) -> Memory:
-    memory = _require_object(_field(data, source, "memory"), source, "memory")
-    _reject_unknown(memory, source, {"flash_mib", "sdram_mib", "external_ddr"})
-    flash_mib = _require_int(memory, source, "flash_mib")
-    sdram_mib = _require_int(memory, source, "sdram_mib")
-    if flash_mib <= 0 or sdram_mib <= 0:
-        raise _fail(source, f"memory sizes must be positive, found {flash_mib}/{sdram_mib} MiB")
+def _parse_memory(params: Mapping[str, str]) -> Memory:
+    flash = _require_int(params, "FLASH_MIB")
+    sdram = _require_int(params, "SDRAM_MIB")
+    for name, value in (("FLASH_MIB", flash), ("SDRAM_MIB", sdram)):
+        if value <= 0:
+            raise BuildError(f"{_symbol(name)} must be positive, found {value}")
     return Memory(
-        flash_mib=flash_mib,
-        sdram_mib=sdram_mib,
-        external_ddr=_require_bool(memory, source, "external_ddr"),
+        flash_mib=flash,
+        sdram_mib=sdram,
+        external_ddr=_flag(params, "EXTERNAL_DDR"),
     )
 
 
-def _parse_log_uart(data: Mapping[str, Any], source: Path) -> LogUart:
-    log_uart = _require_object(_field(data, source, "log_uart"), source, "log_uart")
-    _reject_unknown(log_uart, source, {"port", "tx_pin"})
-    port = _require_int(log_uart, source, "port")
+def _parse_log_uart(params: Mapping[str, str]) -> LogUart:
+    port = _require_int(params, "LOG_UART_PORT")
     if port < 0:
-        raise _fail(source, f"log_uart.port must not be negative, found {port}")
-    tx_pin = log_uart.get("tx_pin")
-    if tx_pin is not None and (not isinstance(tx_pin, str) or not tx_pin):
-        raise _fail(source, f"field 'log_uart.tx_pin' must be a non-empty string, found {tx_pin!r}")
-    return LogUart(port=port, tx_pin=tx_pin)
+        raise BuildError(f"{_symbol('LOG_UART_PORT')} must not be negative, found {port}")
+    return LogUart(port=port, tx_pin=_text(params, "LOG_UART_TX_PIN") or None)
 
 
-def _parse_service_uart(data: Mapping[str, Any], source: Path) -> Optional[ServiceUart]:
-    value = _field(data, source, "service_uart")
-    if value is None:
+def _parse_service_uart(params: Mapping[str, str]) -> Optional[ServiceUart]:
+    if not _flag(params, "HAS_SERVICE_UART"):
         return None
-    service = _require_object(value, source, "service_uart")
-    _reject_unknown(service, source, {"port", "tx_pin", "rx_pin"})
-    port = _require_int(service, source, "port")
+    port = _require_int(params, "SERVICE_UART_PORT")
     if port < 0:
-        raise _fail(source, f"service_uart.port must not be negative, found {port}")
+        raise BuildError(
+            f"{_symbol('SERVICE_UART_PORT')} must not be negative, found {port}"
+        )
     return ServiceUart(
         port=port,
-        tx_pin=_require_str(service, source, "tx_pin"),
-        rx_pin=_require_str(service, source, "rx_pin"),
+        tx_pin=_require(params, "SERVICE_UART_TX_PIN"),
+        rx_pin=_require(params, "SERVICE_UART_RX_PIN"),
     )
 
 
-def _parse_display(data: Mapping[str, Any], source: Path) -> Optional[Display]:
-    value = _field(data, source, "display")
-    if value is None:
+def _parse_display(params: Mapping[str, str]) -> Optional[Display]:
+    if not _flag(params, "HAS_DISPLAY"):
         return None
-    display = _require_object(value, source, "display")
-    _reject_unknown(
-        display, source, {"panel_macro", "device_name", "reset_io", "backlight_io"}
-    )
+    model = _require(params, "DISPLAY_PANEL")
+    known = PANELS.get(model)
+    if known is None:
+        raise BuildError(
+            f"{_symbol('DISPLAY_PANEL')} names panel {model!r}, which this "
+            f"platform has no vendor macro for. It knows: {', '.join(sorted(PANELS))}"
+        )
+    panel_macro, device_name = known
     return Display(
-        panel_macro=_require_str(display, source, "panel_macro"),
-        device_name=_require_str(display, source, "device_name"),
-        reset_io=_require_str(display, source, "reset_io"),
-        backlight_io=_require_str(display, source, "backlight_io"),
+        panel_macro=panel_macro,
+        device_name=device_name,
+        reset_io=_require(params, "DISPLAY_RESET_IO"),
+        backlight_io=_require(params, "DISPLAY_BACKLIGHT_IO"),
     )
 
 
-def _parse_facts(data: Mapping[str, Any], source: Path, board: str) -> BoardFacts:
-    _reject_unknown(
-        data,
-        source,
-        {
-            "schema_version",
-            "board",
-            "usb_device",
-            "memory",
-            "log_uart",
-            "service_uart",
-            "display",
-        },
-    )
-    version = _field(data, source, "schema_version")
-    if version not in SUPPORTED_SCHEMA_VERSIONS:
-        raise _fail(
-            source,
-            f"unsupported schema_version {version!r}; this platform reads "
-            f"{list(SUPPORTED_SCHEMA_VERSIONS)}",
+def _parse_usb_device(params: Mapping[str, str]) -> str:
+    role = _require(params, "USB_ROLE")
+    macro = USB_DEVICE_MACROS.get(role)
+    if macro is None:
+        raise BuildError(
+            f"{_symbol('USB_ROLE')} is {role!r}; expected one of "
+            f"{', '.join(sorted(USB_DEVICE_MACROS))}"
         )
-    declared = _require_str(data, source, "board")
-    if declared != board:
-        raise _fail(
-            source,
-            f"field 'board' is {declared!r} but the board directory is {board!r}; "
-            f"they must match",
-        )
-    return BoardFacts(
-        board=declared,
-        usb_device=_require_str(data, source, "usb_device"),
-        memory=_parse_memory(data, source),
-        log_uart=_parse_log_uart(data, source),
-        service_uart=_parse_service_uart(data, source),
-        display=_parse_display(data, source),
-        source=source,
-    )
+    return macro
 
 
-def load_board_facts(tuyaopen_root: Path, board: Optional[str]) -> BoardFacts:
-    """Read and validate one board's facts, or fail explaining what is missing.
+def load_board_facts(params: Mapping[str, str]) -> BoardFacts:
+    """Read the selected board's facts out of the evaluated config.
 
-    ``board`` is the Kconfig board name, which is also the directory name under
-    ``boards/JIELI``. There is deliberately no default: a build that does not
-    know its board cannot honour its hardware.
+    ``params`` is the build's config mapping -- the same one the build plan and
+    the staging hooks already read. The board name comes from
+    CONFIG_BOARD_CHOICE, which the platform has already confirmed against its
+    Kconfig choice flag.
     """
+    board = params.get("CONFIG_BOARD_CHOICE", "").strip()
     if not board:
-        raise BuildError(
-            "no Jieli board was selected, so the staging hooks have no hardware "
-            f"facts to apply; the board's facts live in "
-            f"boards/JIELI/<board>/{BOARD_FACTS_FILENAME}"
-        )
-    source = board_facts_path(tuyaopen_root, board)
-    if not source.is_file():
-        raise BuildError(
-            f"Jieli board {board!r} does not declare its hardware facts: "
-            f"{source} is missing. Add boards/JIELI/{board}/{BOARD_FACTS_FILENAME} "
-            f"(schema_version {SCHEMA_VERSION}); the platform has no default to "
-            f"fall back to."
-        )
-    try:
-        data = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise BuildError(f"{source}: board facts are not readable JSON: {exc}") from exc
-    if not isinstance(data, Mapping):
-        raise _fail(source, "board facts must be a JSON object")
-    return _parse_facts(data, source, board)
+        raise BuildError("CONFIG_BOARD_CHOICE is missing, so no board facts apply")
+    return BoardFacts(
+        board=board,
+        usb_device=_parse_usb_device(params),
+        memory=_parse_memory(params),
+        log_uart=_parse_log_uart(params),
+        service_uart=_parse_service_uart(params),
+        display=_parse_display(params),
+    )

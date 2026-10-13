@@ -79,11 +79,39 @@ class _Fixture:
             "CONFIG_BOARD_CHOICE_" + self.board.upper(): "y",
             "CONFIG_JIELI_UART_LOG_PORT": "1" if self.chip == "wl82" else "0",
             "CONFIG_JIELI_UART_LOG_BAUDRATE": "115200",
+            # The board's hardware facts, as the board Kconfig declares them.
+            **self.board_facts(),
         }
         values.update(overrides)
         lines = [f'{key}="{value}"' for key, value in values.items()]
         self.config.parent.mkdir(parents=True, exist_ok=True)
         self.config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def board_facts(self) -> dict[str, str]:
+        """The board's Kconfig facts, in the shape the evaluated config carries."""
+        if self.chip == "wl82":
+            return {
+                "CONFIG_JIELI_BOARD_USB_ROLE": "device",
+                "CONFIG_JIELI_BOARD_FLASH_MIB": "8",
+                "CONFIG_JIELI_BOARD_SDRAM_MIB": "8",
+                "CONFIG_JIELI_BOARD_LOG_UART_PORT": "1",
+                "CONFIG_JIELI_BOARD_LOG_UART_TX_PIN": "IO_PORTB_03",
+                "CONFIG_JIELI_BOARD_HAS_SERVICE_UART": "y",
+                "CONFIG_JIELI_BOARD_SERVICE_UART_PORT": "0",
+                "CONFIG_JIELI_BOARD_SERVICE_UART_TX_PIN": "IO_PORTA_05",
+                "CONFIG_JIELI_BOARD_SERVICE_UART_RX_PIN": "IO_PORTA_06",
+            }
+        return {
+            "CONFIG_JIELI_BOARD_USB_ROLE": "host",
+            "CONFIG_JIELI_BOARD_FLASH_MIB": "8",
+            "CONFIG_JIELI_BOARD_SDRAM_MIB": "16",
+            "CONFIG_JIELI_BOARD_EXTERNAL_DDR": "y",
+            "CONFIG_JIELI_BOARD_LOG_UART_PORT": "0",
+            "CONFIG_JIELI_BOARD_HAS_DISPLAY": "y",
+            "CONFIG_JIELI_BOARD_DISPLAY_PANEL": "MIPI_480x800_ST7701S",
+            "CONFIG_JIELI_BOARD_DISPLAY_RESET_IO": "IO_PORTB_00",
+            "CONFIG_JIELI_BOARD_DISPLAY_BACKLIGHT_IO": "IO_PORTB_01",
+        }
 
     def write_params(self, **overrides) -> None:
         values = {
@@ -96,6 +124,8 @@ class _Fixture:
             "CONFIG_BOARD_CHOICE_" + self.board.upper(): "y",
             "CONFIG_JIELI_UART_LOG_PORT": "1" if self.chip == "wl82" else "0",
             "CONFIG_JIELI_UART_LOG_BAUDRATE": "115200",
+            # The board's hardware facts, as the board Kconfig declares them.
+            **self.board_facts(),
         }
         values.update(overrides)
         lines = [f'{key}="{value}"' for key, value in values.items()]
@@ -189,7 +219,7 @@ class PlanConsumptionTest(unittest.TestCase):
 
         self.assertEqual(stage.call_args.args[0], Path(plan["sdk_checkout_root"]))
         self.assertEqual(stage.call_args.kwargs["chip"].name, plan["chip"])
-        self.assertEqual(stage.call_args.kwargs["board_name"], plan["board"])
+        self.assertEqual(stage.call_args.kwargs["facts"].board, plan["board"])
         self.assertEqual(stage.call_args.kwargs["uart_log_port"], plan["uart"]["log_port"])
         self.assertEqual(
             stage.call_args.kwargs["uart_log_baudrate"], plan["uart"]["log_baudrate"]

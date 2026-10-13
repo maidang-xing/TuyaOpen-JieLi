@@ -4,8 +4,43 @@ import unittest
 
 from tools.jieli_build.audio_profile import AUDIO_PROFILES, AudioProfile, apply_audio_profile
 from tools.jieli_build.board_config import configure_audio_board
+from tools.jieli_build.board_facts import (
+    BoardFacts, Display, LogUart, Memory, ServiceUart,
+)
 from tools.jieli_build.chip_profiles import JIELI_CHIPS, PLATFORM_ROOT
 from tools.jieli_build.sdk_overlay import create_staging_tree
+
+
+
+def board_facts_for(chip_name: str, board: str) -> BoardFacts:
+    """Facts that satisfy staging, mirroring what the board's Kconfig declares.
+
+    This test is about the audio Makefile, not about the reader, so the values
+    only have to be the ones the staging hooks assert against: the log UART the
+    caller asks for, and a panel or service UART where the board has one.
+    """
+    if chip_name == "wl82":
+        return BoardFacts(
+            board=board,
+            usb_device="TCFG_FUSB_DEVICE",
+            memory=Memory(flash_mib=8, sdram_mib=8, external_ddr=False),
+            log_uart=LogUart(port=1, tx_pin="IO_PORTB_03"),
+            service_uart=ServiceUart(port=0, tx_pin="IO_PORTA_05", rx_pin="IO_PORTA_06"),
+            display=None,
+        )
+    return BoardFacts(
+        board=board,
+        usb_device="TCFG_HUSB_DEVICE",
+        memory=Memory(flash_mib=8, sdram_mib=16, external_ddr=True),
+        log_uart=LogUart(port=0, tx_pin=None),
+        service_uart=None,
+        display=Display(
+            panel_macro="TCFG_LCD_MIPI_ST7701S_480x800",
+            device_name="MIPI_480x800_ST7701S",
+            reset_io="IO_PORTB_00",
+            backlight_io="IO_PORTB_01",
+        ),
+    )
 
 
 class AudioProfileTest(unittest.TestCase):
@@ -277,7 +312,7 @@ class StagedAudioMakefileTest(unittest.TestCase):
                         tuya_lib_dir=pathlib.Path(tmp) / "libs",
                         uart_log_port=1 if name == "wl82" else 0,
                         chip=chip,
-                        board_name=AUDIO_PROFILES[name].audio_board_name,
+                        facts=board_facts_for(name, AUDIO_PROFILES[name].audio_board_name),
                     )
                     makefile = (
                         build_root / chip.sdk_source_relative

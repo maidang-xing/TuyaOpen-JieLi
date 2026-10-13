@@ -16,7 +16,6 @@ def board_facts(flash_mib: int, sdram_mib: int, external_ddr: bool) -> BoardFact
         log_uart=LogUart(port=0, tx_pin=None),
         service_uart=None,
         display=None,
-        source=Path("jieli_board.json"),
     )
 
 

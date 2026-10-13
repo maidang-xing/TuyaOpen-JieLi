@@ -7,40 +7,43 @@ from pathlib import Path
 
 from build_example import parse_build_params, resolve_board_name
 from tools.jieli_build.audio_profile import AUDIO_PROFILES
+from tools.jieli_build.board_facts import BoardFacts, Display, LogUart, Memory, ServiceUart
 from tools.jieli_build.chip_profiles import JIELI_CHIPS, PLATFORM_ROOT
 from tools.jieli_build.sdk_overlay import USB_DEVICE_SOURCES, create_staging_tree
 
 
-def synthetic_facts(board: str, chip_name: str, usb_device: str) -> dict:
+def synthetic_facts(board: str, chip_name: str, usb_device: str) -> BoardFacts:
     """Board facts for the synthetic checkout, shaped like the real catalog's.
 
     The UART and memory values follow the chip, because the staging hooks assert
-    the log UART against them; the USB device is what each test varies.
+    the log UART against them; the USB device is what each test varies. The real
+    reader turns Kconfig settings into this, so building it directly keeps these
+    tests about staging rather than about the reader.
     """
     if chip_name == "wl82":
-        return {
-            "schema_version": 1,
-            "board": board,
-            "usb_device": usb_device,
-            "memory": {"flash_mib": 8, "sdram_mib": 8, "external_ddr": False},
-            "log_uart": {"port": 1, "tx_pin": "IO_PORTB_03"},
-            "service_uart": {"port": 0, "tx_pin": "IO_PORTA_05", "rx_pin": "IO_PORTA_06"},
-            "display": None,
-        }
-    return {
-        "schema_version": 1,
-        "board": board,
-        "usb_device": usb_device,
-        "memory": {"flash_mib": 8, "sdram_mib": 16, "external_ddr": True},
-        "log_uart": {"port": 0},
-        "service_uart": None,
-        "display": None,
-    }
+        return BoardFacts(
+            board=board,
+            usb_device=usb_device,
+            memory=Memory(flash_mib=8, sdram_mib=8, external_ddr=False),
+            log_uart=LogUart(port=1, tx_pin="IO_PORTB_03"),
+            service_uart=ServiceUart(port=0, tx_pin="IO_PORTA_05", rx_pin="IO_PORTA_06"),
+            display=None,
+        )
+    return BoardFacts(
+        board=board,
+        usb_device=usb_device,
+        memory=Memory(flash_mib=8, sdram_mib=16, external_ddr=True),
+        log_uart=LogUart(port=0, tx_pin=None),
+        service_uart=None,
+        display=None,
+    )
 
 
 class UsbDownloadStagingTest(unittest.TestCase):
     def _stage(self, root: Path, chip, board_name=None, usb_device="TCFG_FUSB_DEVICE",
                write_facts=True):
+        # write_facts is kept as a knob only so a test can prove the stage
+        # refuses without them; there is no file to write any more.
         sdk = root / "sdk"
         vendor = sdk / chip.sdk_source_relative
         for name in ("include_lib", "lib", "tools"):
@@ -72,14 +75,7 @@ class UsbDownloadStagingTest(unittest.TestCase):
             (board_profile / "audio_config.h").write_text(
                 "#define TUYA_AUDIO_STUB 1\n", encoding="utf-8"
             )
-        # The staging hooks read the board's hardware facts now, so the synthetic
-        # TuyaOpen root has to carry them.
-        if write_facts:
-            facts_path = root / "tuyaopen" / "boards/JIELI" / selected / "jieli_board.json"
-            facts_path.parent.mkdir(parents=True, exist_ok=True)
-            facts_path.write_text(
-                json.dumps(synthetic_facts(selected, chip.name, usb_device)), encoding="utf-8"
-            )
+        facts = synthetic_facts(selected, chip.name, usb_device) if write_facts else None
 
         demo = Path("apps/demo/demo_hello")
         demo_root = vendor / demo
@@ -140,7 +136,7 @@ class UsbDownloadStagingTest(unittest.TestCase):
             tuya_lib_dir=root / "libs",
             uart_log_port=1 if chip.name == "wl82" else 0,
             chip=chip,
-            board_name=selected,
+            facts=facts,
         )
         return vendor, build / chip.sdk_source_relative, watched
 
@@ -200,7 +196,7 @@ class UsbDownloadStagingTest(unittest.TestCase):
         # hardware it does not know.
         chip = JIELI_CHIPS["wl82"]
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(Exception, "does not declare its hardware facts"):
+            with self.assertRaisesRegex(Exception, "board facts are required to stage"):
                 self._stage(
                     Path(directory), chip, board_name="No_Facts_Board", write_facts=False
                 )

@@ -82,11 +82,17 @@ def resolve_board_name(params: dict[str, str]) -> str | None:
 
 
 def _same_path(left: object, right: object) -> bool:
-    """Compare two paths the way the host filesystem would, not as strings."""
-    def normalised(value: object) -> str:
-        return os.path.normcase(os.path.normpath(os.path.abspath(str(value))))
+    """Compare two paths the way the plan records them, not as strings.
 
-    return normalised(left) == normalised(right)
+    canonical_path resolves a path before rendering a plan field, so a value
+    that names the same directory through a symlink or a relative segment would
+    not compare equal to it as text. Resolve both sides, and let Path's own
+    comparison apply the host's case and separator rules.
+    """
+    try:
+        return Path(str(left)).resolve() == Path(str(right)).resolve()
+    except OSError:
+        return False
 
 
 def _is_within(path: Path, root: Path) -> bool:

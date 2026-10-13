@@ -16,9 +16,32 @@ from .board_facts import BoardFacts, LogUart, ServiceUart
 # and a pin pair is what actually selects the group.
 _PIN_PATTERN = re.compile(r"^IO_PORT([A-Z])_(\d{1,2})$")
 
+# The port-group macros the wl82 SDK's asm/uart.h defines, and the only values a
+# UART platform-data block may name. The header lists exactly these, so a pair
+# that is not among them has no macro to expand to: the generated block would
+# name an identifier the vendor headers never define, and the compile would fail
+# inside SDK code rather than here.
+#
+# tests/test_board_config.py cross-checks this against the header when the SDK
+# checkout is present, so a vendor update that adds or removes a group fails
+# there rather than at link time.
+UART_PORT_GROUPS = (
+    "PORTA_3_4", "PORTA_5_6",
+    "PORTB_1_2", "PORTB_3_4", "PORTB_6_7",
+    "PORTC_3_4", "PORTC_9_10",
+    "PORTE_0_1",
+    "PORTH_0_1", "PORTH_2_3", "PORTH_6_7",
+)
+
 
 def _uart_port_group(tx_pin: str, rx_pin: str) -> str:
-    """Return the vendor port-group macro for a same-port TX/RX pin pair."""
+    """Return the vendor port-group macro for a same-port TX/RX pin pair.
+
+    The macro has to be one the SDK actually defines; see UART_PORT_GROUPS. A
+    pair on the same port can still name a group the SDK has no macro for, and
+    synthesising the name from the pins would hide that until the vendor header
+    rejects it.
+    """
     tx = _PIN_PATTERN.match(tx_pin)
     rx = _PIN_PATTERN.match(rx_pin)
     if tx is None or rx is None or tx.group(1) != rx.group(1):
@@ -26,7 +49,14 @@ def _uart_port_group(tx_pin: str, rx_pin: str) -> str:
             f"service UART pins {tx_pin!r}/{rx_pin!r} are not a same-port "
             f"IO_PORT<X>_<n> pair, so no port group can be derived for them"
         )
-    return f"PORT{tx.group(1)}_{int(tx.group(2))}_{int(rx.group(2))}"
+    port_group = f"PORT{tx.group(1)}_{int(tx.group(2))}_{int(rx.group(2))}"
+    if port_group not in UART_PORT_GROUPS:
+        raise BuildError(
+            f"service UART pins {tx_pin!r}/{rx_pin!r} name the port group "
+            f"{port_group}, which this SDK does not define. It defines: "
+            f"{', '.join(UART_PORT_GROUPS)}"
+        )
+    return port_group
 
 
 def configure_log_uart_block(

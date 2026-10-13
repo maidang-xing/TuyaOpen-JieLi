@@ -1,16 +1,19 @@
 """The board-config hooks read their values from the board's facts."""
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
 
 from tools.jieli_build.board_config import (
+    UART_PORT_GROUPS,
     configure_lcd_board_header,
     configure_log_uart_block,
     configure_log_uart_baudrate,
     configure_service_uart,
 )
 from tools.jieli_build.board_facts import BoardFacts, Display, LogUart, Memory, ServiceUart
+from tools.jieli_build.chip_profiles import PLATFORM_ROOT
 from tools.jieli_build.errors import BuildError
 
 
@@ -56,13 +59,24 @@ class ServiceUartTest(unittest.TestCase):
     def test_a_different_port_is_named_after_its_index(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             board = self._board(temp_dir)
-            facts = facts_with(service_uart=ServiceUart(0, "IO_PORTB_07", "IO_PORTB_08"))
+            facts = facts_with(service_uart=ServiceUart(0, "IO_PORTB_06", "IO_PORTB_07"))
 
             configure_service_uart(board, facts)
 
             content = board.read_text(encoding="utf-8")
-            self.assertIn(".port = PORTB_7_8,", content)
+            self.assertIn(".port = PORTB_6_7,", content)
             self.assertIn('{"uart0", &uart_dev_ops, (void *)&uart0_data },', content)
+
+    def test_a_port_group_the_sdk_does_not_define_is_rejected(self):
+        # Same port, valid pin syntax, but no macro: asm/uart.h lists PORTB_6_7
+        # and not PORTB_7_8, so synthesising the name from the pins would emit an
+        # identifier the vendor header never defines.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            board = self._board(temp_dir)
+            facts = facts_with(service_uart=ServiceUart(0, "IO_PORTB_07", "IO_PORTB_08"))
+
+            with self.assertRaisesRegex(BuildError, "PORTB_7_8.*does not define"):
+                configure_service_uart(board, facts)
 
     def test_pins_on_different_ports_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -71,6 +85,23 @@ class ServiceUartTest(unittest.TestCase):
 
             with self.assertRaisesRegex(BuildError, "same-port"):
                 configure_service_uart(board, facts)
+
+    @unittest.skipUnless(
+        (PLATFORM_ROOT / "chip/wl82/AC79_AIoT_SDK/include_lib/driver/cpu/wl82/asm/uart.h").is_file(),
+        "the wl82 SDK checkout is not present",
+    )
+    def test_the_port_group_table_matches_the_sdk_header(self):
+        # UART_PORT_GROUPS is a transcription of the vendor header. When the SDK
+        # is on disk, compare against it, so a vendor update that adds or removes
+        # a group fails here rather than inside SDK code at compile time.
+        header = (
+            PLATFORM_ROOT / "chip/wl82/AC79_AIoT_SDK/include_lib/driver/cpu/wl82/asm/uart.h"
+        ).read_text(encoding="utf-8", errors="replace")
+
+        self.assertEqual(
+            sorted(set(re.findall(r"\bPORT[A-Z]_\d+_\d+\b", header))),
+            sorted(UART_PORT_GROUPS),
+        )
 
 
 class LogUartTest(unittest.TestCase):

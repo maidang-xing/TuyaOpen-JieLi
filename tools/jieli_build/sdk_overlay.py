@@ -20,6 +20,13 @@ from .board_config import (
 from .board_facts import load_board_facts
 from .chip_profiles import JIELI_CHIPS, PLATFORM_ROOT, resolve_chip
 from .errors import BuildError
+from .feature_map import (
+    FEATURES,
+    SDK_SOURCE_PREFIX,
+    feature_defines,
+    feature_sources,
+    link_libraries,
+)
 
 # SDK-root-relative sources that keep the vendor USB slave stack serviced while
 # the Tuya app runs. msd_upgrade.c owns go_mask_usb_updata() and user_setup.c
@@ -65,7 +72,8 @@ def usb_include_lines() -> list[str]:
 # The vendor LCD stack lives in apps/common/lcd and is not referenced by the
 # staged demo_hello profile at all, so its objects are absent unless staged
 # explicitly. The authoritative list of what the display path needs is the
-# vendor's own demo_ui Makefile; this mirrors its LCD/dma2d entries.
+# vendor's own demo_ui Makefile; the display feature in feature_map.py mirrors
+# its LCD/dma2d entries.
 #
 # fb_component/ IS required. It reads like a UI-side compositor, but
 # lcd_driver.c's DMM/DMA2D path resolves into it, and leaving it out leaves
@@ -77,51 +85,17 @@ def usb_include_lines() -> list[str]:
 #
 # The vendor profile's freetype and rlottie entries are text/vector renderers
 # and are not part of the panel path, so they are not staged.
-LCD_SOURCES = (
-    # CONFIG_VIDEO_ENABLE brings in the ISP pipeline inside video.a, which
-    # references the scene tables these two provide.
-    "apps/common/camera/isp_scenes.c",
-    "apps/common/camera/isp_tools.c",
-    "apps/common/dma2d_gpu/dma2d_common_api.c",
-    "apps/common/dma2d_gpu/gpu_common_api.c",
-    "apps/common/lcd/lcd_driver/lcd_driver.c",
-    "apps/common/lcd/lcd_driver/lcd_scenes.c",
-    "apps/common/lcd/lcd_driver/lcd_tools.c",
-    "apps/common/lcd/lcd_driver/fb_component/fb_combine.c",
-    "apps/common/lcd/lcd_driver/fb_component/fb_lcd.c",
-    "apps/common/lcd/lcd_driver/fb_component/fb_out_dev.c",
-    "apps/common/lcd/lcd_driver/fb_component/fb_rotate.c",
-    "apps/common/lcd/lcd_driver/mipi_lcd/lcd_mipi_st7701s_480x800.c",
-)
-LCD_INCLUDE_DIRS = (
-    "apps/common/lcd/include",
-    "apps/common/lcd/lcd_driver",
-    # The set below is the part of the vendor demo_ui profile's INCLUDES that
-    # the display path needs and the demo_hello profile does not already carry.
-    # Taken from demo_ui/board/wl83/Makefile rather than added one failing
-    # include at a time. Its LVGL, freetype and rlottie entries are deliberately
-    # excluded: this build takes LVGL from TuyaOpen's src/liblvgl, and the other
-    # two are text/vector renderers the panel path does not use.
-    "apps/common",
-    "apps/common/include",
-    "apps/common/lzw",
-    "apps/common/usb",
-    "include_lib/driver/cpu/wl83/asm",
-    "include_lib/driver/device/video",
-    "include_lib/driver/device/video/pipeline",
-    "include_lib/driver/device/video/pipeline/buffer",
-    "include_lib/driver/device/video/pipeline/core",
-)
-
-
 def lcd_sources() -> list[str]:
-    """Render the LCD sources relative to the demo board directory."""
-    return ["../../../../../" + source for source in LCD_SOURCES]
+    """Render the display feature's sources relative to the demo board directory."""
+    return [SDK_SOURCE_PREFIX + source for source in FEATURES["display"].sources]
 
 
-def lcd_include_lines() -> list[str]:
-    """Render the LCD include paths relative to the demo board directory."""
-    return ["-I../../../../../" + directory for directory in LCD_INCLUDE_DIRS]
+def lcd_include_lines(cpu: str) -> list[str]:
+    """Render the display feature's include paths relative to the demo board directory."""
+    return [
+        "-I" + SDK_SOURCE_PREFIX + directory.format(cpu=cpu)
+        for directory in FEATURES["display"].includes
+    ]
 
 
 def audio_board_config_path(tuyaopen_root: Path, board_name: Optional[str], profile) -> Path:
@@ -466,17 +440,12 @@ def create_staging_tree(
     extra_sources_list.append("../../../../../tuyaos/entry/jieli_usb_download.c")
     if facts.display is not None:
         extra_sources_list.extend(lcd_sources())
+    # The feature switches are decorative today: Wi-Fi and Bluetooth are staged
+    # for every image. feature_map.py names what a switch would have to remove,
+    # sources, macros and archives together.
     extra_sources_list.extend(
-        [
-            "../../../../../apps/common/config/bt_profile_config.c",
-            "../../../../../apps/common/config/log_config/app_config.c",
-            "../../../../../apps/common/config/log_config/lib_btctrler_config.c",
-            "../../../../../apps/common/config/log_config/lib_btstack_config.c",
-            "../../../../../apps/common/net/assign_macaddr.c",
-            "../../../../../apps/common/net/config_network.c",
-            "../../../../../apps/common/net/platform_cfg.c",
-            "../../../../../apps/common/net/wifi_conf.c",
-        ]
+        SDK_SOURCE_PREFIX + source
+        for source in feature_sources(("bluetooth", "wifi"))
     )
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):
@@ -529,7 +498,7 @@ def create_staging_tree(
     for include in usb_include_lines():
         content += f"    {include} \\\n"
     if facts.display is not None:
-        for include in lcd_include_lines():
+        for include in lcd_include_lines(chip.cpu):
             content += f"    {include} \\\n"
     content += "    -I../../../../../include_lib/btstack \\\n"
     content += "    -I../../../../../include_lib/btstack/le \\\n"
@@ -554,7 +523,9 @@ def create_staging_tree(
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
-    content += "DEFINES += -DCONFIG_NET_ENABLE=1 -DCONFIG_BT_ENABLE=1 -DCONFIG_TWS_ENABLE -DCONFIG_BTCTRLER_TASK_DEL_ENABLE -DCONFIG_LMP_CONN_SUSPEND_ENABLE -DCONFIG_LMP_REFRESH_ENCRYPTION_KEY_ENABLE\n"
+    content += "DEFINES += " + " ".join(
+        "-D" + define for define in feature_defines(("wifi", "bluetooth"))
+    ) + "\n"
     if chip.name in AUDIO_PROFILES:
         # The vendor media runtime and the staged app entry both key off this
         # switch; without it tkl_jieli_audio_prepare compiles out entirely.
@@ -572,27 +543,14 @@ def create_staging_tree(
     # library group. BLE/Wi-Fi archives introduce provider references
     # later, so repeat those archives inside the group for a rescan.
     liba = f"../../../../../cpu/{chip.cpu}/liba"
-    libraries = (
-        "cpu.a", "system.a", "hsm.a", "event.a", "common_lib.a",
-        "wpasupplicant.a", "http_cli.a", "https_cli.a", "json.a",
-        "libmbedtls_3_4_0.a", "lwip_2_2_0.a", "wl_wifi_sta.a",
-        "net_server.a", "wl_rf_common.a", "btctrler.a", "btstack.a",
-        "crypto_toolbox_Osize.a", "lib_ccm_aes.a",
-    )
-    if chip.name == "wl83":
-        # AC792's WPA/SAE archives delegate crypto primitives to this
-        # provider; AC791's equivalent implementation is bundled in its
-        # wpasupplicant archive. This is a chip-level link fact, independent of
-        # whether the board carries a panel.
-        libraries += ("libcrypto_mbedtls.a",)
+    # The feature switches do not gate the link yet. libcrypto_mbedtls.a (wl83
+    # only) and video.a (display only) are the two chip/board-conditional
+    # additions; feature_map.py owns both facts, so the chip and display cases
+    # are stated once instead of branched here.
+    enabled_libraries = ["wifi", "bluetooth", "tls", "lwip"]
     if facts.display is not None:
-        # video.a carries the DSI/DPI/DMM/DMA2D driver implementations that
-        # lcd_driver.c resolves into (dsi_dev_init, dpi_open, dmm_config,
-        # dma2d_init, ...). They have no source in the tree - the vendor ships
-        # them prebuilt, and the demo_ui profile links this archive for exactly
-        # that reason. Only needed once the display stack is staged.
-        libraries += ("video.a",)
-    for library in libraries:
+        enabled_libraries.append("display")
+    for library in link_libraries(chip.name, enabled_libraries):
         content += f"    {liba}/{library} \\\n"
     content += "    --end-group\n"
     if header_dir is not None:

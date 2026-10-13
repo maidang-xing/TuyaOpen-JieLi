@@ -1,0 +1,29 @@
+# Excerpt of a real sdk.elf.resolution.txt, taken from the Jieli wl82
+# switch_demo build (platform HEAD 1918d395). It is an LLVM LTO resolution
+# file: one -r=<object>,<symbol>,<flags> record per object and symbol, with 'p'
+# in the flags marking the prevailing definition. The absolute build paths were
+# replaced with <OPEN_ROOT>; every archive and member name is unchanged, and
+# the symbol set covers one case per audit rule:
+#
+#   mbedtls_aes_init                 TuyaOpen prevails, vendor references it (R3)
+#   mbedtls_net_connect              vendor prevails, allowlisted group A
+#   mbedtls_ssl_read_ext             vendor prevails, not a stock name (INFO)
+#   mbedtls_test_cas_pem             vendor prevails, allowlisted group B
+#   mbedtls_ssl_write                TuyaOpen prevails, vendor references it (R3)
+#   mbedtls_ctr_drbg_seed            TuyaOpen prevails, vendor references it (R3)
+#   mbedtls_pk_write_pubkey_formatted vendor prevails, allowlisted group C
+#
+-r=<OPEN_ROOT>/apps/tuya_cloud/switch_demo/.build/lib/libtuyaos.a.llvm.331524.aes.c,mbedtls_aes_init,pl
+-r=<OPEN_ROOT>/apps/tuya_cloud/switch_demo/.build/lib/libtuyaos.a.llvm.494868.cipher_wrap.c,mbedtls_aes_init,l
+-r=../../../../../cpu/wl82/liba/wl_wifi_sta.a.llvm.311020.air_kiss.c,mbedtls_aes_init,l
+-r=../../../../../cpu/wl82/liba/https_cli.a.llvm.192.https_cli.c,mbedtls_net_connect,l
+-r=../../../../../cpu/wl82/liba/libmbedtls_3_4_0.a.llvm.1267558.net_sockets.c,mbedtls_net_connect,pl
+-r=../../../../../cpu/wl82/liba/libmbedtls_3_4_0.a.llvm.1267558.net_sockets.c,mbedtls_ssl_read_ext,pl
+-r=../../../../../cpu/wl82/liba/https_cli.a.llvm.192.https_cli.c,mbedtls_test_cas_pem,l
+-r=../../../../../cpu/wl82/liba/libmbedtls_3_4_0.a.llvm.3673462.certs.c,mbedtls_test_cas_pem,pl
+-r=<OPEN_ROOT>/apps/tuya_cloud/switch_demo/.build/lib/libtuyaos.a.llvm.1216032.ssl_msg.c,mbedtls_ssl_write,pl
+-r=<OPEN_ROOT>/apps/tuya_cloud/switch_demo/.build/lib/libtuyaos.a.llvm.2586428.tuya_tls.c,mbedtls_ssl_write,l
+-r=../../../../../cpu/wl82/liba/https_cli.a.llvm.192.https_cli.c,mbedtls_ssl_write,l
+-r=<OPEN_ROOT>/apps/tuya_cloud/switch_demo/.build/lib/libtuyaos.a.llvm.532416.ctr_drbg.c,mbedtls_ctr_drbg_seed,pl
+-r=../../../../../cpu/wl82/liba/https_cli.a.llvm.192.https_cli.c,mbedtls_ctr_drbg_seed,l
+-r=../../../../../cpu/wl82/liba/libcrypto_mbedtls.a.llvm.75754.crypto_mbedtls-ec.c,mbedtls_pk_write_pubkey_formatted,pl

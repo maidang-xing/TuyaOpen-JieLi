@@ -741,11 +741,10 @@ def create_staging_tree(
     )
     extra_sources_list.extend(usb_device_sources())
     extra_sources_list.append("../../../../../tuyaos/entry/jieli_usb_download.c")
-    if facts.display is not None:
-        extra_sources_list.extend(lcd_sources())
-    # The feature switches are decorative today: Wi-Fi and Bluetooth are staged
-    # for every image. feature_map.py names what a switch would have to remove,
-    # sources, macros and archives together.
+    # Every feature-owned source comes from the enabled set, display included:
+    # the board declaring a panel is what puts "display" in that set, so listing
+    # the display sources separately here would emit them twice and the linker
+    # would reject the duplicate objects.
     extra_sources_list.extend(
         SDK_SOURCE_PREFIX + source
         for source in feature_sources(features)

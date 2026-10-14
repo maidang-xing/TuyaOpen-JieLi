@@ -86,6 +86,11 @@ class Feature:
     includes: tuple[str, ...]
     removal_note: str
     shared_dependencies: tuple[str, ...] = SHARED_DEPENDENCIES
+    # True when the feature is on precisely while its switch is *off*. The
+    # vendor lwIP is the case: CONFIG_ENABLE_LIBLWIP selects TuyaOpen's own
+    # stack, so the vendor archive belongs on the link line only while that
+    # switch is unset. See the feature's removal_note.
+    kconfig_inverted: bool = False
 
     @property
     def libraries(self) -> tuple[str, ...]:
@@ -241,6 +246,7 @@ TLS = Feature(
 LWIP = Feature(
     name="lwip",
     kconfig="CONFIG_ENABLE_LIBLWIP",
+    kconfig_inverted=True,
     defines=(),
     sources=(),
     # sdk_overlay.py:542-545 emits these unconditionally today.
@@ -338,6 +344,41 @@ def _owned_library_entries() -> tuple[tuple[str, Optional[str]], ...]:
     for chip_entries in CHIP_LIBRARIES.values():
         entries.extend(chip_entries)
     return tuple(entries)
+
+
+# The values a Kconfig bool can carry when it is set.
+TRUTHY = ("y", "true", "True")
+
+
+def enabled_features(params: Mapping[str, str], *, has_display: bool) -> tuple[str, ...]:
+    """The features the evaluated config turns on, in the map's own order.
+
+    A feature with no switch of its own is always part of the build. The rest
+    follow their symbol, inverted where the feature says so -- the vendor lwIP
+    is on while CONFIG_ENABLE_LIBLWIP is *unset*, because that switch selects
+    TuyaOpen's own stack.
+
+    Display follows the board rather than a symbol: whether the hardware
+    carries a panel is a board fact, and the platform already reads it from
+    there. CONFIG_ENABLE_DISPLAY is the application asking for the display
+    stack, which is a different question.
+
+    An absent symbol means the switch is off, which is how Kconfig writes a
+    bool left at n.
+    """
+    enabled: list[str] = []
+    for name, feature in FEATURES.items():
+        if name == "display":
+            if has_display:
+                enabled.append(name)
+            continue
+        if feature.kconfig is None:
+            enabled.append(name)
+            continue
+        set_to_y = params.get(feature.kconfig, "").strip() in TRUTHY
+        if set_to_y != feature.kconfig_inverted:
+            enabled.append(name)
+    return tuple(enabled)
 
 
 def link_libraries(chip_name: str, enabled: Iterable[str]) -> tuple[str, ...]:

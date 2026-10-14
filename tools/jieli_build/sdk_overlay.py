@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
@@ -34,6 +34,7 @@ from .chip_profiles import JIELI_CHIPS, PLATFORM_ROOT, resolve_chip
 from .errors import BuildError
 from .feature_map import (
     FEATURES,
+    enabled_features,
     SDK_SOURCE_PREFIX,
     feature_defines,
     feature_sources,
@@ -444,6 +445,7 @@ def staging_input_components(
     chip,
     board_name: Optional[str],
     board_facts: str,
+    features: str,
     audio_config_source: Optional[Path],
     header_dir: Optional[Path],
     tuya_lib_dir: Optional[Path],
@@ -473,6 +475,7 @@ def staging_input_components(
         # The board's own facts, and the audio header the board brings. Both are
         # read to decide what to write into the staged board files.
         "board_facts": board_facts,
+        "features": features,
         "audio_config": _file_digest(audio_config_source),
         # The staging hooks themselves. An edit to any of them can change the
         # staged bytes without changing any other input.
@@ -609,6 +612,7 @@ def create_staging_tree(
     platform_root: Path = PLATFORM_ROOT,
     chip=None,
     facts: Optional[BoardFacts] = None,
+    features: Optional[Iterable[str]] = None,
 ) -> Path:
     """Create a small overlay tree without modifying the vendor checkout.
 
@@ -623,6 +627,9 @@ def create_staging_tree(
     # that does not declare them is a build error there, not a default here.
     if facts is None:
         raise BuildError("board facts are required to stage a Jieli build")
+    if features is None:
+        raise BuildError("the enabled feature set is required to stage a Jieli build")
+    features = tuple(features)
     board_name = facts.board
     profile = AUDIO_PROFILES.get(chip.name)
     audio_config_source = (
@@ -637,6 +644,7 @@ def create_staging_tree(
         chip=chip,
         board_name=board_name,
         board_facts=board_facts_digest(facts),
+        features=','.join(features),
         audio_config_source=audio_config_source,
         header_dir=header_dir,
         tuya_lib_dir=tuya_lib_dir,
@@ -740,7 +748,7 @@ def create_staging_tree(
     # sources, macros and archives together.
     extra_sources_list.extend(
         SDK_SOURCE_PREFIX + source
-        for source in feature_sources(("bluetooth", "wifi"))
+        for source in feature_sources(features)
     )
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):
@@ -819,7 +827,7 @@ def create_staging_tree(
     content += f"DEFINES += -D{selected_chip_define}=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
     content += "DEFINES += " + " ".join(
-        "-D" + define for define in feature_defines(("wifi", "bluetooth"))
+        "-D" + define for define in feature_defines(features)
     ) + "\n"
     if chip.name in AUDIO_PROFILES:
         # The vendor media runtime and the staged app entry both key off this
@@ -842,10 +850,7 @@ def create_staging_tree(
     # only) and video.a (display only) are the two chip/board-conditional
     # additions; feature_map.py owns both facts, so the chip and display cases
     # are stated once instead of branched here.
-    enabled_libraries = ["wifi", "bluetooth", "tls", "lwip"]
-    if facts.display is not None:
-        enabled_libraries.append("display")
-    for library in link_libraries(chip.name, enabled_libraries):
+    for library in link_libraries(chip.name, features):
         content += f"    {liba}/{library} \\\n"
     content += "    --end-group\n"
     if header_dir is not None:

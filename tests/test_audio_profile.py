@@ -313,6 +313,8 @@ class StagedAudioMakefileTest(unittest.TestCase):
                         uart_log_port=1 if name == "wl82" else 0,
                         chip=chip,
                         facts=board_facts_for(name, AUDIO_PROFILES[name].audio_board_name),
+                        features=(("wifi", "bluetooth", "tls", "lwip", "display") if name == "wl83"
+                                  else ("wifi", "bluetooth", "tls", "lwip")),
                     )
                     makefile = (
                         build_root / chip.sdk_source_relative

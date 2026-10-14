@@ -181,6 +181,11 @@ class StagingReuseTest(unittest.TestCase):
             platform_root=platform_root or PLATFORM_ROOT,
             chip=chip,
             facts=facts,
+            features=(
+                ("wifi", "bluetooth", "tls", "lwip", "display")
+                if chip.name == "wl83"
+                else ("wifi", "bluetooth", "tls", "lwip")
+            ),
         )
         return staging_root, build_root, sdk
 
@@ -215,6 +220,11 @@ class StagingReuseTest(unittest.TestCase):
                     uart_log_port=1 if chip.name == "wl82" else 0,
                     chip=chip,
                     facts=facts_for(chip.name, AUDIO_PROFILES[chip.name].audio_board_name),
+                    features=(
+                        ("wifi", "bluetooth", "tls", "lwip", "display")
+                        if chip.name == "wl83"
+                        else ("wifi", "bluetooth", "tls", "lwip")
+                    ),
                 )
 
                 self.assertEqual(again, build_root)
@@ -245,6 +255,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1,
                 chip=chip, facts=changed,
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
 
             self.assertFalse(sentinel.exists())
@@ -264,6 +275,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1, uart_log_baudrate=921600,
                 chip=chip, facts=facts_for(chip.name, "AC79_DevKitBoard"),
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
 
             self.assertFalse(sentinel.exists())
@@ -284,6 +296,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1,
                 chip=chip, facts=facts_for(chip.name, "AC79_DevKitBoard"),
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
 
             self.assertFalse(sentinel.exists())
@@ -301,6 +314,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1,
                 chip=chip, facts=facts_for(chip.name, "AC79_DevKitBoard"),
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
 
             self.assertFalse(sentinel.exists())
@@ -323,6 +337,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1,
                 chip=chip, facts=facts_for(chip.name, "AC79_DevKitBoard"),
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
 
             self.assertFalse(sentinel.exists())
@@ -344,6 +359,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1,
                 chip=chip, facts=facts_for(chip.name, "AC79_DevKitBoard"),
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
 
             self.assertTrue(sentinel.is_file())
@@ -365,6 +381,7 @@ class StagingReuseTest(unittest.TestCase):
                 second, staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=0,
                 chip=wl83, facts=facts_for("wl83", "AC792N_Develop_Board"),
+                features=("wifi", "bluetooth", "tls", "lwip", "display"),
             )
 
             self.assertFalse(sentinel.exists())
@@ -385,6 +402,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1,
                 chip=chip, facts=facts_for(chip.name, "AC79_DevKitBoard"),
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
 
             self.assertFalse(sentinel.exists())
@@ -404,6 +422,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1,
                 chip=chip, facts=facts_for(chip.name, "AC79_DevKitBoard"),
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
 
             self.assertFalse(sentinel.exists())
@@ -423,6 +442,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1,
                 chip=chip, facts=facts_for(chip.name, "AC79_DevKitBoard"),
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
             self.assertTrue((build_root / "cpu/wl82/sdk_ld.c").is_file())
 
@@ -451,6 +471,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1,
                 platform_root=platform_root, chip=chip, facts=facts_for(chip.name, "AC79_DevKitBoard"),
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
 
             self.assertFalse(sentinel.exists())
@@ -473,6 +494,7 @@ class StagingReuseTest(unittest.TestCase):
                 root / "sdk", staging_root, root / "tuyaopen",
                 tuya_lib_dir=root / "libs", uart_log_port=1,
                 platform_root=platform_root, chip=chip, facts=facts_for(chip.name, "AC79_DevKitBoard"),
+                features=("wifi", "bluetooth", "tls", "lwip"),
             )
 
             self.assertFalse(sentinel.exists())
@@ -508,6 +530,7 @@ class StagingInputComponentTest(unittest.TestCase):
             chip=chip,
             board_name="AC79_DevKitBoard",
             board_facts="sha256:" + "0" * 64,
+            features="wifi,bluetooth,tls,lwip",
             audio_config_source=None,
             header_dir=None,
             tuya_lib_dir=root / "libs",

@@ -22,6 +22,7 @@ from typing import Any, Mapping, Optional
 
 from tools.jieli_build.board_facts import load_board_facts
 from tools.jieli_build.build_plan import chip_probe_path, config_digest, parse_config
+from tools.jieli_build.feature_map import enabled_features
 from tools.jieli_build.chip_profiles import JIELI_CHIPS, PLATFORM_ROOT
 from tools.jieli_build.errors import BuildError
 from tools.jieli_build.packaging import find_qio_artifact, run_postbuild, tuya_qio_name
@@ -330,6 +331,7 @@ def build(param_dir: Path, params: dict[str, str]) -> Path:
     header_dir_text = params.get("OPEN_HEADER_DIR", "").split()
     header_dir = Path(header_dir_text[0]) if header_dir_text else None
     tuya_lib_dir = Path(params.get("OPEN_LIBS_DIR", ""))
+    facts = load_board_facts(params)
     build_root = create_staging_tree(
         sdk_root,
         staging_root,
@@ -341,8 +343,11 @@ def build(param_dir: Path, params: dict[str, str]) -> Path:
         platform_root=PLATFORM_ROOT,
         chip=chip,
         # The board's facts are ordinary Kconfig settings, so they are read
-        # from the same evaluated config as everything else.
-        facts=load_board_facts(params),
+        # from the same evaluated config as everything else. Which features
+        # are on is read the same way, which is what makes the switches in
+        # the board catalog decide what gets staged.
+        facts=facts,
+        features=enabled_features(params, has_display=facts.display is not None),
     )
     # The vendor Makefile builds serially at -j1, which leaves most cores idle
     # on the ~130 vendor objects every staging rebuild has to recompile. Default

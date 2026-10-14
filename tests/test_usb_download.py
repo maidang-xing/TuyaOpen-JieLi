@@ -137,6 +137,7 @@ class UsbDownloadStagingTest(unittest.TestCase):
             uart_log_port=1 if chip.name == "wl82" else 0,
             chip=chip,
             facts=facts,
+            features=("wifi", "bluetooth", "tls", "lwip"),
         )
         return vendor, build / chip.sdk_source_relative, watched
 

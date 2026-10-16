@@ -1,0 +1,37 @@
+{
+  "platform": "JIELI",
+  "protocol_version": 1,
+  "build_plan": {
+    "schema_versions": [1],
+    "protocol_versions": [1],
+    "resolver": "tools/jieli_build/build_plan.py",
+    "default_output": "cache/jieli/build_plan.json",
+    "shadow_only": false,
+    "resolver_never_blocks_configure": true,
+    "consumers": ["build_example.py"]
+  },
+  "capabilities": {
+    "chips": ["wl82", "wl83"],
+    "boards": ["AC79_DevKitBoard", "AC792N_Develop_Board"],
+    "build_modes": ["build", "clean"],
+    "log_uart": {
+      "ports": [0, 1, 2, 3, 4, 5],
+      "default_port": {"wl82": 1, "wl83": 0},
+      "default_baudrate": 115200
+    },
+    "providers": {
+      "tls": ["tuyaopen_mbedtls_3_1"],
+      "lwip": ["tuyaopen_lwip_2_1", "jieli_vendor_lwip_2_2"],
+      "lvgl": ["tuyaopen_lvgl"]
+    }
+  },
+  "required_files": [
+    "Kconfig",
+    "sdk_config.yaml",
+    "toolchain_file.cmake",
+    "platform_config.cmake",
+    "build_example.py",
+    "build_setup.py",
+    "tools/jieli_build/build_plan.py"
+  ]
+}

@@ -1,25 +1,45 @@
-"""Create and clean an isolated Jieli SDK staging tree."""
+"""Create and clean an isolated Jieli SDK staging tree.
+
+The staging tree is kept across builds rather than deleted and recreated. The
+vendor make's objects live inside it, so deleting it costs a full recompile of
+every vendor source -- tens of seconds, and the largest single cost of a build
+that changed nothing. Instead the tree records what it was built from, in a
+state file beside it, and a tree whose inputs all still match is left exactly as
+it was. Any input that cannot be shown to match forces a full rebuild: a stale
+staging tree produces a wrong image silently, which is far worse than a slow
+build.
+"""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
-    configure_ac79_devkit_memory, configure_ac79_log_uart, configure_ac792_devkit_memory,
-    configure_ac792_log_uart, configure_audio_board, configure_full_stack_app_config,
+    configure_audio_board, configure_board_memory, configure_full_stack_app_config,
     configure_full_stack_board, configure_lcd_app_config, configure_lcd_board,
-    configure_lcd_board_header, configure_service_uart,
-    configure_usb_download_app_config,
+    configure_lcd_board_header, configure_log_uart_baudrate, configure_log_uart_block,
+    configure_service_uart, configure_usb_download_app_config,
     configure_usb_download_board, configure_usb_download_board_header,
 )
+from .board_facts import BoardFacts, board_facts_digest
 from .chip_profiles import JIELI_CHIPS, PLATFORM_ROOT, resolve_chip
 from .errors import BuildError
+from .feature_map import (
+    FEATURES,
+    enabled_features,
+    SDK_SOURCE_PREFIX,
+    feature_defines,
+    feature_sources,
+    link_libraries,
+)
 
 # SDK-root-relative sources that keep the vendor USB slave stack serviced while
 # the Tuya app runs. msd_upgrade.c owns go_mask_usb_updata() and user_setup.c
@@ -65,7 +85,8 @@ def usb_include_lines() -> list[str]:
 # The vendor LCD stack lives in apps/common/lcd and is not referenced by the
 # staged demo_hello profile at all, so its objects are absent unless staged
 # explicitly. The authoritative list of what the display path needs is the
-# vendor's own demo_ui Makefile; this mirrors its LCD/dma2d entries.
+# vendor's own demo_ui Makefile; the display feature in feature_map.py mirrors
+# its LCD/dma2d entries.
 #
 # fb_component/ IS required. It reads like a UI-side compositor, but
 # lcd_driver.c's DMM/DMA2D path resolves into it, and leaving it out leaves
@@ -77,51 +98,33 @@ def usb_include_lines() -> list[str]:
 #
 # The vendor profile's freetype and rlottie entries are text/vector renderers
 # and are not part of the panel path, so they are not staged.
-LCD_SOURCES = (
-    # CONFIG_VIDEO_ENABLE brings in the ISP pipeline inside video.a, which
-    # references the scene tables these two provide.
-    "apps/common/camera/isp_scenes.c",
-    "apps/common/camera/isp_tools.c",
-    "apps/common/dma2d_gpu/dma2d_common_api.c",
-    "apps/common/dma2d_gpu/gpu_common_api.c",
-    "apps/common/lcd/lcd_driver/lcd_driver.c",
-    "apps/common/lcd/lcd_driver/lcd_scenes.c",
-    "apps/common/lcd/lcd_driver/lcd_tools.c",
-    "apps/common/lcd/lcd_driver/fb_component/fb_combine.c",
-    "apps/common/lcd/lcd_driver/fb_component/fb_lcd.c",
-    "apps/common/lcd/lcd_driver/fb_component/fb_out_dev.c",
-    "apps/common/lcd/lcd_driver/fb_component/fb_rotate.c",
-    "apps/common/lcd/lcd_driver/mipi_lcd/lcd_mipi_st7701s_480x800.c",
-)
-LCD_INCLUDE_DIRS = (
-    "apps/common/lcd/include",
-    "apps/common/lcd/lcd_driver",
-    # The set below is the part of the vendor demo_ui profile's INCLUDES that
-    # the display path needs and the demo_hello profile does not already carry.
-    # Taken from demo_ui/board/wl83/Makefile rather than added one failing
-    # include at a time. Its LVGL, freetype and rlottie entries are deliberately
-    # excluded: this build takes LVGL from TuyaOpen's src/liblvgl, and the other
-    # two are text/vector renderers the panel path does not use.
-    "apps/common",
-    "apps/common/include",
-    "apps/common/lzw",
-    "apps/common/usb",
-    "include_lib/driver/cpu/wl83/asm",
-    "include_lib/driver/device/video",
-    "include_lib/driver/device/video/pipeline",
-    "include_lib/driver/device/video/pipeline/buffer",
-    "include_lib/driver/device/video/pipeline/core",
-)
-
-
 def lcd_sources() -> list[str]:
-    """Render the LCD sources relative to the demo board directory."""
-    return ["../../../../../" + source for source in LCD_SOURCES]
+    """Render the display feature's sources relative to the demo board directory."""
+    return [SDK_SOURCE_PREFIX + source for source in FEATURES["display"].sources]
 
 
-def lcd_include_lines() -> list[str]:
-    """Render the LCD include paths relative to the demo board directory."""
-    return ["-I../../../../../" + directory for directory in LCD_INCLUDE_DIRS]
+def lcd_include_lines(cpu: str) -> list[str]:
+    """Render the display feature's include paths relative to the demo board directory."""
+    return [
+        "-I" + SDK_SOURCE_PREFIX + directory.format(cpu=cpu)
+        for directory in FEATURES["display"].includes
+    ]
+
+
+def audio_board_config_path(tuyaopen_root: Path, board_name: Optional[str], profile) -> Path:
+    """Return the board's audio_config.h, preferring the selected board.
+
+    The chip profile also carries a board name, and that is what a board with
+    no audio data of its own falls back to. Reading the selected board first is
+    what lets a second board on the same chip bring its own audio data instead
+    of silently inheriting the first one's.
+    """
+    boards_root = tuyaopen_root / "boards" / "JIELI"
+    if board_name:
+        selected = boards_root / board_name / "audio_config.h"
+        if selected.is_file():
+            return selected
+    return boards_root / profile.audio_board_name / "audio_config.h"
 
 
 # The vendor demo_hello Makefile lists its own peripheral self-test programs and
@@ -279,6 +282,265 @@ def clean_staging_tree(staging_root: Path) -> None:
         shutil.rmtree(staging_root)
 
 
+# The state file lives inside the tree it describes, so anything that removes
+# the tree -- clean_staging_tree, a manual rm -rf, a fresh .build -- removes the
+# record with it and the next build stages from scratch.
+STAGING_STATE_NAME = ".jieli-staging-state.json"
+STAGING_STATE_VERSION = 1
+
+
+def _ignore_python_caches(directory: str, names: list[str]) -> set[str]:
+    """Keep interpreter caches out of a content digest.
+
+    ``__pycache__`` is rewritten by every test run with a fresh embedded
+    timestamp, so digesting it would make the staging tree look stale on every
+    build that follows a test run.
+    """
+    del directory
+    return {name for name in names if name == "__pycache__" or name.endswith((".pyc", ".pyo"))}
+
+
+def _absolute(path: Optional[Path]) -> str:
+    """Render a path the way the staging hooks consume it, or "" for none."""
+    return Path(path).resolve().as_posix() if path is not None else ""
+
+
+def _file_digest(path: Optional[Path]) -> str:
+    """Digest one input file's bytes, or say that the file is absent.
+
+    Absent is a distinct value rather than an empty digest, so adding or
+    removing a file the staging hooks read always changes the result.
+    """
+    if path is None:
+        return "<none>"
+    try:
+        content = Path(path).read_bytes()
+    except OSError:
+        return "<absent>"
+    return "sha256:" + hashlib.sha256(content).hexdigest()
+
+
+def _walk(root: Path, ignore):
+    """Yield (relative posix path, entry) pairs, in a stable order.
+
+    The order has to be independent of the filesystem's, or two runs over the
+    same tree would digest differently.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        ignored = ignore(dirpath, list(dirnames) + list(filenames)) if ignore else set()
+        dirnames[:] = sorted(name for name in dirnames if name not in ignored)
+        for name in sorted(filenames):
+            if name in ignored:
+                continue
+            path = Path(dirpath) / name
+            yield path.relative_to(root).as_posix(), path
+
+
+def _tree_metadata_digest(root: Path, ignore=None) -> str:
+    """Digest a tree from file sizes and mtimes, never from file contents.
+
+    The vendor SDK is most of a gigabyte, so reading it on every build would
+    cost more than the compile this guard exists to skip. Size plus mtime is the
+    same evidence make itself compares, and it notices every edit a checkout, an
+    editor or a build leaves behind. Its weak boundary is a file rewritten to
+    exactly the same length inside one filesystem timestamp tick: that is
+    invisible here, and the tree is then treated as unchanged. The tick is
+    100 ns on NTFS and 2 s on FAT, so the window is narrow but not empty.
+    """
+    digest = hashlib.sha256()
+    if not root.is_dir():
+        digest.update(b"<absent>\n")
+        return "sha256:" + digest.hexdigest()
+    for relative, path in _walk(root, ignore):
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        digest.update(f"{relative}\0{info.st_size}\0{info.st_mtime_ns}\n".encode("utf-8"))
+    return "sha256:" + digest.hexdigest()
+
+
+def _tree_content_digest(root: Path, ignore=_ignore_python_caches) -> str:
+    """Digest a small tree by content, for trees where a miss would be silent.
+
+    Used for the trees the staging hooks themselves live in and for the sources
+    copied in from TuyaOpen: they are kilobytes, so reading them costs nothing,
+    and they have no metadata blind spot.
+    """
+    digest = hashlib.sha256()
+    if not root.is_dir():
+        digest.update(b"<absent>\n")
+        return "sha256:" + digest.hexdigest()
+    for relative, path in _walk(root, ignore):
+        digest.update(f"{relative}\0".encode("utf-8"))
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<unreadable>")
+        digest.update(b"\n")
+    return "sha256:" + digest.hexdigest()
+
+
+def _loose_entries_digest(root: Path) -> str:
+    """Digest a directory's own files, and the names of its subdirectories.
+
+    ``stage_sdk_inputs`` copies a directory's loose files but links its
+    subdirectories, so a change inside a linked subdirectory reaches the vendor
+    make directly and can never go stale in the staging tree. Only the loose
+    files can, so only they are covered; the subdirectory names are recorded so
+    that adding or removing one is noticed.
+    """
+    digest = hashlib.sha256()
+    if not root.is_dir():
+        digest.update(b"<absent>\n")
+        return "sha256:" + digest.hexdigest()
+    for entry in sorted(root.iterdir(), key=lambda path: path.name):
+        if entry.is_dir():
+            digest.update(f"{entry.name}/\n".encode("utf-8"))
+            continue
+        try:
+            info = entry.stat()
+        except OSError:
+            continue
+        digest.update(f"{entry.name}\0{info.st_size}\0{info.st_mtime_ns}\n".encode("utf-8"))
+    return "sha256:" + digest.hexdigest()
+
+
+def _staged_vendor_fingerprint(vendor_root: Path, chip) -> str:
+    """Fingerprint every vendor path the staging tree copies rather than links.
+
+    ``stage_sdk_inputs`` links include_lib, lib, tools and the apps/common
+    subdirectories, so the compiler reads those straight from the vendor
+    checkout and they can never be stale in staging. What it copies -- the CPU
+    profile, the demo profile, apps/common's loose files and its movable tree --
+    can be, so that is what this covers. ``liba`` is linked too, but covering a
+    linked path only ever costs an unnecessary rebuild, never correctness, and
+    the CPU tree is small enough that separating it out would not pay.
+
+    Everything here is covered by the same ignore rules the copy itself uses, so
+    a file the copy would skip cannot invalidate the tree either.
+    """
+    parts = (
+        _tree_metadata_digest(vendor_root / "cpu" / chip.cpu, _ignore_cpu_build_outputs),
+        _tree_metadata_digest(
+            vendor_root / "apps" / "common" / "movable", _ignore_demo_build_outputs
+        ),
+        _tree_metadata_digest(
+            vendor_root / "apps" / "demo" / "demo_hello", _ignore_demo_build_outputs
+        ),
+        _loose_entries_digest(vendor_root / "apps" / "common"),
+    )
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\n")
+    return "sha256:" + digest.hexdigest()
+
+
+def staging_input_components(
+    *,
+    sdk_root: Path,
+    tuyaopen_root: Path,
+    platform_root: Path,
+    chip,
+    board_name: Optional[str],
+    board_facts: str,
+    features: str,
+    audio_config_source: Optional[Path],
+    header_dir: Optional[Path],
+    tuya_lib_dir: Optional[Path],
+    uart_log_port: int,
+    uart_log_baudrate: int,
+) -> dict[str, str]:
+    """Name every input the staged bytes depend on, one digest each.
+
+    Kept as named components rather than a single hash so a rebuild can say
+    which input moved. The set is complete by construction: it covers each
+    value ``create_staging_tree`` is handed, each file it reads to decide what
+    to write, each tree it copies in, and the vendor trees it copies from.
+    Everything else it reads -- the adapter include directories, the TuyaOpen
+    sources CMake compiles -- is consumed by the compiler, not by staging, and
+    the vendor make's own dependency files track those.
+    """
+    vendor_root = Path(sdk_root) / chip.sdk_source_relative
+    return {
+        "chip": chip.name,
+        "sdk_root": _absolute(sdk_root),
+        "tuyaopen_root": _absolute(tuyaopen_root),
+        "platform_root": _absolute(platform_root),
+        "header_dir": _absolute(header_dir),
+        "tuya_lib_dir": _absolute(tuya_lib_dir),
+        "uart": f"{uart_log_port}:{uart_log_baudrate}",
+        "board": board_name or "",
+        # The board's own facts, and the audio header the board brings. Both are
+        # read to decide what to write into the staged board files.
+        "board_facts": board_facts,
+        "features": features,
+        "audio_config": _file_digest(audio_config_source),
+        # The staging hooks themselves. An edit to any of them can change the
+        # staged bytes without changing any other input.
+        "staging_scripts": _tree_content_digest(platform_root / "tools" / "jieli_build"),
+        "build_example": _file_digest(platform_root / "build_example.py"),
+        # Trees copied into staging, so their content is staged bytes.
+        "platform_entry": _tree_content_digest(platform_root / "tuyaos" / "entry"),
+        "platform_adapter": _tree_content_digest(platform_root / "tuyaos" / "tuyaos_adapter"),
+        "tuyaopen_utilities": _tree_content_digest(
+            tuyaopen_root / "tools" / "porting" / "adapter" / "utilities"
+        ),
+        # The vendor SDK, which the rest of the staging tree is copied from.
+        "vendor": _staged_vendor_fingerprint(vendor_root, chip),
+    }
+
+
+def staging_input_digest(**components) -> str:
+    """Combine named components into the digest the state file records."""
+    digest = hashlib.sha256()
+    for name in sorted(components):
+        digest.update(f"{name}={components[name]}\n".encode("utf-8"))
+    return "sha256:" + digest.hexdigest()
+
+
+def read_staging_state(staging_root: Path) -> Optional[dict]:
+    """Read a staging tree's recorded inputs, or None if it has none.
+
+    A state file this code cannot read -- truncated, hand-edited, written by a
+    different version -- is treated as no state at all, which forces a rebuild.
+    """
+    state_path = staging_root / STAGING_STATE_NAME
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or state.get("version") != STAGING_STATE_VERSION:
+        return None
+    return state
+
+
+def staging_tree_is_current(staging_root: Path, digest: str) -> bool:
+    """Whether the staging tree can be reused as it stands.
+
+    The build root has to be there as well as the record: a tree someone
+    partially deleted still carries its state file, and reusing it would fail
+    somewhere further along instead of restaging.
+    """
+    if not (staging_root / "build").is_dir():
+        return False
+    state = read_staging_state(staging_root)
+    return state is not None and state.get("digest") == digest
+
+
+def write_staging_state(staging_root: Path, components: dict[str, str]) -> None:
+    """Record what the staging tree was built from, once it is complete."""
+    state = {
+        "version": STAGING_STATE_VERSION,
+        "digest": staging_input_digest(**components),
+        "components": components,
+    }
+    (staging_root / STAGING_STATE_NAME).write_text(
+        json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
 def read_adapter_sources(platform_root: Path, chip_name: str) -> list[str]:
     """Read the source manifest shared by CMake and the SDK Makefile bridge."""
     if chip_name not in JIELI_CHIPS:
@@ -349,14 +611,53 @@ def create_staging_tree(
     uart_log_baudrate: int = 115200,
     platform_root: Path = PLATFORM_ROOT,
     chip=None,
-    board_name: Optional[str] = None,
+    facts: Optional[BoardFacts] = None,
+    features: Optional[Iterable[str]] = None,
 ) -> Path:
-    """Create a small overlay tree without modifying the vendor checkout."""
+    """Create a small overlay tree without modifying the vendor checkout.
+
+    A tree whose inputs all still match the ones it was built from is returned
+    untouched, so the vendor make inside it stays incremental. Anything else --
+    no tree, no record, an unreadable record, or any input that moved -- restages
+    from scratch.
+    """
+    chip = chip or resolve_chip()
+    # Every board-level decision below reads this, never a per-board branch.
+    # The caller reads the board's facts from the evaluated config, so a board
+    # that does not declare them is a build error there, not a default here.
+    if facts is None:
+        raise BuildError("board facts are required to stage a Jieli build")
+    if features is None:
+        raise BuildError("the enabled feature set is required to stage a Jieli build")
+    features = tuple(features)
+    board_name = facts.board
+    profile = AUDIO_PROFILES.get(chip.name)
+    audio_config_source = (
+        audio_board_config_path(tuyaopen_root, board_name, profile)
+        if profile is not None and profile.board_declarations
+        else None
+    )
+    components = staging_input_components(
+        sdk_root=sdk_root,
+        tuyaopen_root=tuyaopen_root,
+        platform_root=platform_root,
+        chip=chip,
+        board_name=board_name,
+        board_facts=board_facts_digest(facts),
+        features=','.join(features),
+        audio_config_source=audio_config_source,
+        header_dir=header_dir,
+        tuya_lib_dir=tuya_lib_dir,
+        uart_log_port=uart_log_port,
+        uart_log_baudrate=uart_log_baudrate,
+    )
+    if staging_tree_is_current(staging_root, staging_input_digest(**components)):
+        return staging_root / "build"
+
     if staging_root.exists():
         shutil.rmtree(staging_root)
 
     build_root = staging_root / "build"
-    chip = chip or resolve_chip()
     vendor_root = sdk_root / chip.sdk_source_relative
     stage_sdk_inputs(sdk_root, build_root, chip)
     source_overlay_root = build_root / chip.sdk_source_relative
@@ -364,16 +665,21 @@ def create_staging_tree(
     apps_root = source_overlay_root / "apps"
     board_file = source_overlay_root / chip.board_build_relative / "board.c"
     app_config_file = source_overlay_root / "apps/demo/demo_hello/include/app_config.h"
-    if chip.name == "wl82":
-        configure_ac79_devkit_memory(app_config_file)
-        configure_ac79_log_uart(board_file, uart_log_port, uart_log_baudrate)
-        configure_service_uart(board_file)
-    else:
-        configure_ac792_log_uart(
-            source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
-            uart_log_port,
-            uart_log_baudrate,
+    # board_demo.h is the wl83 demo profile's board header; the wl82 demo has
+    # none. Which SDK file carries which setting is a chip-layout fact.
+    board_header = source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h"
+    if facts.display is not None and chip.name != "wl83":
+        raise BuildError(
+            f"{facts.board} declares a display panel, but the platform stages the "
+            f"MIPI-DSI panel path only into the wl83 SDK"
         )
+    if chip.name == "wl82":
+        configure_board_memory(app_config_file, facts)
+        configure_log_uart_block(board_file, uart_log_port, uart_log_baudrate, facts)
+    else:
+        configure_log_uart_baudrate(board_header, uart_log_port, uart_log_baudrate, facts)
+    if facts.service_uart is not None:
+        configure_service_uart(board_file, facts)
     reference_board_file = (
         vendor_root / "apps/demo/demo_wifi_ext/board/wl83/board.c"
         if chip.name == "wl83"
@@ -385,28 +691,20 @@ def create_staging_tree(
         board_file, "TCFG_USB_DEVICE" if chip.name == "wl83" else "0x03",
     )
     if chip.name == "wl83":
-        configure_usb_download_board_header(
-            source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
-            "TCFG_HUSB_DEVICE" if board_name == "AC792N_Develop_Board" else "TCFG_FUSB_DEVICE",
-        )
-        configure_ac792_devkit_memory(
+        configure_usb_download_board_header(board_header, facts)
+        configure_board_memory(
             source_overlay_root / "apps/demo/demo_hello/board/wl83/chip_cfg.h",
-            source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
+            facts,
+            ddr_config_file=board_header,
         )
-        configure_lcd_board_header(
-            source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
-        )
-        configure_lcd_app_config(app_config_file)
-        configure_lcd_board(board_file)
+        if facts.display is not None:
+            configure_lcd_board_header(board_header, facts)
+            configure_lcd_app_config(app_config_file)
+            configure_lcd_board(board_file)
     else:
         configure_usb_download_app_config(app_config_file)
-    profile = AUDIO_PROFILES.get(chip.name)
     if profile is not None and profile.board_declarations:
-        configure_audio_board(
-            board_file,
-            tuyaopen_root / "boards/JIELI" / profile.audio_board_name / "audio_config.h",
-            profile,
-        )
+        configure_audio_board(board_file, audio_config_source, profile)
     shutil.copytree(
         platform_root / "tuyaos" / "entry",
         source_overlay_root / "tuyaos" / "entry",
@@ -443,19 +741,13 @@ def create_staging_tree(
     )
     extra_sources_list.extend(usb_device_sources())
     extra_sources_list.append("../../../../../tuyaos/entry/jieli_usb_download.c")
-    if chip.name == "wl83":
-        extra_sources_list.extend(lcd_sources())
+    # Every feature-owned source comes from the enabled set, display included:
+    # the board declaring a panel is what puts "display" in that set, so listing
+    # the display sources separately here would emit them twice and the linker
+    # would reject the duplicate objects.
     extra_sources_list.extend(
-        [
-            "../../../../../apps/common/config/bt_profile_config.c",
-            "../../../../../apps/common/config/log_config/app_config.c",
-            "../../../../../apps/common/config/log_config/lib_btctrler_config.c",
-            "../../../../../apps/common/config/log_config/lib_btstack_config.c",
-            "../../../../../apps/common/net/assign_macaddr.c",
-            "../../../../../apps/common/net/config_network.c",
-            "../../../../../apps/common/net/platform_cfg.c",
-            "../../../../../apps/common/net/wifi_conf.c",
-        ]
+        SDK_SOURCE_PREFIX + source
+        for source in feature_sources(features)
     )
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):
@@ -507,8 +799,8 @@ def create_staging_tree(
     content += "    -I../../../../../apps/common/config/include \\\n"
     for include in usb_include_lines():
         content += f"    {include} \\\n"
-    if chip.name == "wl83":
-        for include in lcd_include_lines():
+    if facts.display is not None:
+        for include in lcd_include_lines(chip.cpu):
             content += f"    {include} \\\n"
     content += "    -I../../../../../include_lib/btstack \\\n"
     content += "    -I../../../../../include_lib/btstack/le \\\n"
@@ -533,7 +825,9 @@ def create_staging_tree(
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
-    content += "DEFINES += -DCONFIG_NET_ENABLE=1 -DCONFIG_BT_ENABLE=1 -DCONFIG_TWS_ENABLE -DCONFIG_BTCTRLER_TASK_DEL_ENABLE -DCONFIG_LMP_CONN_SUSPEND_ENABLE -DCONFIG_LMP_REFRESH_ENCRYPTION_KEY_ENABLE\n"
+    content += "DEFINES += " + " ".join(
+        "-D" + define for define in feature_defines(features)
+    ) + "\n"
     if chip.name in AUDIO_PROFILES:
         # The vendor media runtime and the staged app entry both key off this
         # switch; without it tkl_jieli_audio_prepare compiles out entirely.
@@ -551,25 +845,11 @@ def create_staging_tree(
     # library group. BLE/Wi-Fi archives introduce provider references
     # later, so repeat those archives inside the group for a rescan.
     liba = f"../../../../../cpu/{chip.cpu}/liba"
-    libraries = (
-        "cpu.a", "system.a", "hsm.a", "event.a", "common_lib.a",
-        "wpasupplicant.a", "http_cli.a", "https_cli.a", "json.a",
-        "libmbedtls_3_4_0.a", "lwip_2_2_0.a", "wl_wifi_sta.a",
-        "net_server.a", "wl_rf_common.a", "btctrler.a", "btstack.a",
-        "crypto_toolbox_Osize.a", "lib_ccm_aes.a",
-    )
-    if chip.name == "wl83":
-        # AC792's WPA/SAE archives delegate crypto primitives to this
-        # provider; AC791's equivalent implementation is bundled in its
-        # wpasupplicant archive.
-        libraries += ("libcrypto_mbedtls.a",)
-        # video.a carries the DSI/DPI/DMM/DMA2D driver implementations that
-        # lcd_driver.c resolves into (dsi_dev_init, dpi_open, dmm_config,
-        # dma2d_init, ...). They have no source in the tree - the vendor ships
-        # them prebuilt, and the demo_ui profile links this archive for exactly
-        # that reason. Only needed once the display stack is staged.
-        libraries += ("video.a",)
-    for library in libraries:
+    # The feature switches do not gate the link yet. libcrypto_mbedtls.a (wl83
+    # only) and video.a (display only) are the two chip/board-conditional
+    # additions; feature_map.py owns both facts, so the chip and display cases
+    # are stated once instead of branched here.
+    for library in link_libraries(chip.name, features):
         content += f"    {liba}/{library} \\\n"
     content += "    --end-group\n"
     if header_dir is not None:
@@ -584,4 +864,7 @@ def create_staging_tree(
             source_overlay_root / "tuyaos" / "entry" / "jieli_app_entry.c",
             chip.name,
         )
+    # Recorded last, so a staging run that failed partway leaves no claim that
+    # the tree is complete.
+    write_staging_state(staging_root, components)
     return build_root

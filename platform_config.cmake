@@ -55,6 +55,14 @@ list(APPEND PLATFORM_PUBINC
     "${TOP_SOURCE_DIR}/tools/porting/adapter/utilities/include"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/security"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/flash"
+    # libtuyaos.a aggregates the components as objects, which drops the
+    # PUBLIC include interface each component target declared. The adapter
+    # exposes adc and gpio to its own sources that way, so anything built
+    # outside it - every example - needs them listed here instead. Both are
+    # declared in boards/JIELI/TKL_Kconfig, and a declared capability whose
+    # header is unreachable is a claim the build cannot honour.
+    "${TOP_SOURCE_DIR}/tools/porting/adapter/adc"
+    "${TOP_SOURCE_DIR}/tools/porting/adapter/gpio"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/network"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/wifi"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/bluetooth"

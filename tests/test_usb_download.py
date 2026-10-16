@@ -1,17 +1,49 @@
 """USB runtime download wiring in each staged Jieli SDK profile."""
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from build_example import parse_build_params, resolve_board_name
 from tools.jieli_build.audio_profile import AUDIO_PROFILES
+from tools.jieli_build.board_facts import BoardFacts, Display, LogUart, Memory, ServiceUart
 from tools.jieli_build.chip_profiles import JIELI_CHIPS, PLATFORM_ROOT
 from tools.jieli_build.sdk_overlay import USB_DEVICE_SOURCES, create_staging_tree
 
 
+def synthetic_facts(board: str, chip_name: str, usb_device: str) -> BoardFacts:
+    """Board facts for the synthetic checkout, shaped like the real catalog's.
+
+    The UART and memory values follow the chip, because the staging hooks assert
+    the log UART against them; the USB device is what each test varies. The real
+    reader turns Kconfig settings into this, so building it directly keeps these
+    tests about staging rather than about the reader.
+    """
+    if chip_name == "wl82":
+        return BoardFacts(
+            board=board,
+            usb_device=usb_device,
+            memory=Memory(flash_mib=8, sdram_mib=8, external_ddr=False),
+            log_uart=LogUart(port=1, tx_pin="IO_PORTB_03"),
+            service_uart=ServiceUart(port=0, tx_pin="IO_PORTA_05", rx_pin="IO_PORTA_06"),
+            display=None,
+        )
+    return BoardFacts(
+        board=board,
+        usb_device=usb_device,
+        memory=Memory(flash_mib=8, sdram_mib=16, external_ddr=True),
+        log_uart=LogUart(port=0, tx_pin=None),
+        service_uart=None,
+        display=None,
+    )
+
+
 class UsbDownloadStagingTest(unittest.TestCase):
-    def _stage(self, root: Path, chip, board_name=None):
+    def _stage(self, root: Path, chip, board_name=None, usb_device="TCFG_FUSB_DEVICE",
+               write_facts=True):
+        # write_facts is kept as a knob only so a test can prove the stage
+        # refuses without them; there is no file to write any more.
         sdk = root / "sdk"
         vendor = sdk / chip.sdk_source_relative
         for name in ("include_lib", "lib", "tools"):
@@ -31,6 +63,7 @@ class UsbDownloadStagingTest(unittest.TestCase):
         # The audio profile stages vendor trees outside the minimal tree, so the
         # synthetic checkout has to provide the same inputs it validates.
         profile = AUDIO_PROFILES.get(chip.name)
+        selected = board_name or (profile.audio_board_name if profile else "Synthetic_Board")
         if profile is not None:
             for tree in profile.staged_vendor_trees:
                 (vendor / tree).mkdir(parents=True, exist_ok=True)
@@ -42,6 +75,7 @@ class UsbDownloadStagingTest(unittest.TestCase):
             (board_profile / "audio_config.h").write_text(
                 "#define TUYA_AUDIO_STUB 1\n", encoding="utf-8"
             )
+        facts = synthetic_facts(selected, chip.name, usb_device) if write_facts else None
 
         demo = Path("apps/demo/demo_hello")
         demo_root = vendor / demo
@@ -102,7 +136,8 @@ class UsbDownloadStagingTest(unittest.TestCase):
             tuya_lib_dir=root / "libs",
             uart_log_port=1 if chip.name == "wl82" else 0,
             chip=chip,
-            board_name=board_name,
+            facts=facts,
+            features=("wifi", "bluetooth", "tls", "lwip"),
         )
         return vendor, build / chip.sdk_source_relative, watched
 
@@ -135,21 +170,37 @@ class UsbDownloadStagingTest(unittest.TestCase):
                 self.assertIn("-I../../../../../apps/common/usb/host", makefile)
                 self.assertIn("-I../../../../../apps/common", makefile)
 
-    def test_ac792n_board_selects_husb_without_changing_default_wl83_board(self):
+    def test_the_board_fact_selects_the_usb_device(self):
+        # The USB device macro is the board's own declaration, not the platform's
+        # guess from a board name. AC792N declares a host port; a second wl83
+        # board that declares a device port gets that instead.
         chip = JIELI_CHIPS["wl83"]
         with tempfile.TemporaryDirectory() as directory:
-            _, default_stage, _ = self._stage(Path(directory), chip)
-            default_profile = (default_stage / "apps/demo/demo_hello/board/wl83/board_demo.h").read_text(encoding="utf-8")
-            self.assertIn("#define TCFG_USB_DEVICE                     TCFG_FUSB_DEVICE", default_profile)
-
-        with tempfile.TemporaryDirectory() as directory:
-            _, ac792n_stage, _ = self._stage(
-                Path(directory), chip, board_name="AC792N_Develop_Board"
+            _, husb_stage, _ = self._stage(
+                Path(directory), chip,
+                board_name="AC792N_Develop_Board", usb_device="TCFG_HUSB_DEVICE",
             )
-            profile = (ac792n_stage / "apps/demo/demo_hello/board/wl83/board_demo.h").read_text(encoding="utf-8")
-            board = (ac792n_stage / "apps/demo/demo_hello/board/wl83/board.c").read_text(encoding="utf-8")
+            profile = (husb_stage / "apps/demo/demo_hello/board/wl83/board_demo.h").read_text(encoding="utf-8")
+            board = (husb_stage / "apps/demo/demo_hello/board/wl83/board.c").read_text(encoding="utf-8")
             self.assertIn("#define TCFG_USB_DEVICE                     TCFG_HUSB_DEVICE", profile)
             self.assertIn(".usb_dev_en = TCFG_USB_DEVICE", board)
+
+        with tempfile.TemporaryDirectory() as directory:
+            _, fusb_stage, _ = self._stage(
+                Path(directory), chip, board_name="Second_Wl83_Board",
+            )
+            profile = (fusb_stage / "apps/demo/demo_hello/board/wl83/board_demo.h").read_text(encoding="utf-8")
+            self.assertIn("#define TCFG_USB_DEVICE                     TCFG_FUSB_DEVICE", profile)
+
+    def test_a_board_without_hardware_facts_fails_the_stage(self):
+        # No default to fall back to: the platform must not stage a board whose
+        # hardware it does not know.
+        chip = JIELI_CHIPS["wl82"]
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(Exception, "board facts are required to stage"):
+                self._stage(
+                    Path(directory), chip, board_name="No_Facts_Board", write_facts=False
+                )
 
     def test_build_params_board_choice_reaches_usb_staging_selector(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -170,6 +221,34 @@ class UsbDownloadStagingTest(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertIsNone(resolve_board_name(parse_build_params(params_path)))
+
+    def test_board_selection_reads_the_board_catalog_not_a_platform_table(self):
+        # A board the platform has never named: the profile comes from the
+        # generated Kconfig data (CONFIG_BOARD_CHOICE plus its selection flag),
+        # so adding a board under boards/JIELI needs no platform edit.
+        with tempfile.TemporaryDirectory() as directory:
+            params_path = Path(directory) / "build_param.config"
+            params_path.write_text(
+                'CONFIG_BOARD_CHOICE="Hypothetical_New_Board"\n'
+                "CONFIG_BOARD_CHOICE_HYPOTHETICAL_NEW_BOARD=y\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                resolve_board_name(parse_build_params(params_path)),
+                "Hypothetical_New_Board",
+            )
+
+            # The catalog's existing boards resolve the same way, with no
+            # per-board branch: the name is the Kconfig string, not a literal.
+            params_path.write_text(
+                'CONFIG_BOARD_CHOICE="AC79_DevKitBoard"\n'
+                "CONFIG_BOARD_CHOICE_AC79_DEVKITBOARD=y\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                resolve_board_name(parse_build_params(params_path)),
+                "AC79_DevKitBoard",
+            )
 
     @unittest.skipUnless(
         all(

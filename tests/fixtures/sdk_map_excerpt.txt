@@ -1,0 +1,28 @@
+# Excerpt of a real sdk.map "Archive member included to satisfy reference by
+# file (symbol)" section, taken from the same wl82 switch_demo build as
+# sdk_resolution_excerpt.txt. The member names keep the ".o" suffix the linker
+# map writes, which the audit normalises away. It covers:
+#
+#   cpu.a(efuse.c.o)                      a shared archive, not a TLS provider
+#   libmbedtls_3_4_0.a(net_sockets.c.o)   pulled by https_cli.c
+#   libmbedtls_3_4_0.a(certs.c.o)         pulled by https_cli.c
+#   libmbedtls_3_4_0.a(version.z.o)       metadata member, no referencing file
+#   libcrypto_mbedtls.a(crypto_mbedtls-ec.c.o)  pulled by wpasupplicant's sae.c
+#   hsm.a(hsm.c.o)                        shared archive, pulled by Wi-Fi
+#
+Archive member included to satisfy reference by file (symbol)
+
+../../../../../cpu/wl82/liba/cpu.a(efuse.c.o)
+                              objs/cpu/wl82/adc_api.c.o (symbol from plugin) (efuse_get_adc_trim)
+../../../../../cpu/wl82/liba/hsm.a(hsm.c.o)
+                              wifi_connect.c.o (symbol from plugin) (HSM_STATE_Create)
+../../../../../cpu/wl82/liba/libmbedtls_3_4_0.a(net_sockets.c.o)
+                              https_cli.c.o (symbol from plugin) (mbedtls_net_init)
+../../../../../cpu/wl82/liba/libmbedtls_3_4_0.a(certs.c.o)
+                              https_cli.c.o (symbol from plugin) (mbedtls_test_cas_pem)
+../../../../../cpu/wl82/liba/libmbedtls_3_4_0.a(version.z.o)
+                              (lib_mbedtls_3_4_0_version)
+../../../../../cpu/wl82/liba/libcrypto_mbedtls.a(crypto_mbedtls-ec.c.o)
+                              sae.c.o (symbol from plugin) (mbedtls_pk_write_pubkey_formatted)
+
+Discarded input sections

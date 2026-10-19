@@ -68,6 +68,7 @@ list(APPEND PLATFORM_PUBINC
     # call tkl_io_pinmux_config - the i2c and uart ones - need the contract on
     # the include path to compile at all.
     "${TOP_SOURCE_DIR}/tools/porting/adapter/pinmux"
+    "${TOP_SOURCE_DIR}/tools/porting/adapter/i2c"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/network"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/wifi"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/bluetooth"

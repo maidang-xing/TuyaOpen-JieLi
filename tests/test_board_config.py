@@ -7,9 +7,12 @@ from pathlib import Path
 
 from tools.jieli_build.board_config import (
     UART_PORT_GROUPS,
+    WL82_LOWPOWER_SEL,
+    WL83_LOWPOWER_FUNCTION,
     configure_lcd_board_header,
     configure_log_uart_block,
     configure_log_uart_baudrate,
+    configure_lowpower,
     configure_service_uart,
 )
 from tools.jieli_build.board_facts import BoardFacts, Display, LogUart, Memory, ServiceUart
@@ -160,6 +163,103 @@ class LcdBoardHeaderTest(unittest.TestCase):
 
             with self.assertRaisesRegex(BuildError, "declares no display panel"):
                 configure_lcd_board_header(header, facts_with())
+
+
+class LowPowerTest(unittest.TestCase):
+    """The sleep macro is rewritten, not appended to.
+
+    Both vendor profiles already define it, so a second #define would warn on
+    redefinition and leave the earlier value in force for everything above it -
+    the build would look configured and sleep would stay closed.
+    """
+
+    WL82_APP_CONFIG = (
+        "#ifndef APP_CONFIG_H\n#define APP_CONFIG_H\n"
+        "#define TCFG_LOWPOWER_BTOSC_DISABLE\t\t\t0\n"
+        "#define TCFG_LOWPOWER_LOWPOWER_SEL\t\t\t0//(RF_SLEEP_EN|RF_FORCE_SYS_SLEEP_EN|SYS_SLEEP_EN)\n"
+        "#define TCFG_LOWPOWER_VDDIOM_LEVEL\t\t\tVDDIOM_VOL_32V\n"
+        "#endif\n"
+    )
+    WL83_BOARD_HEADER = (
+        "#ifndef BOARD_DEMO_H\n#define BOARD_DEMO_H\n"
+        "#define TCFG_LOWPOWER_FUNCTION              LOWPOWER_CLOSE\n"
+        "#define TCFG_LOWPOWER_OSC_TYPE              OSC_TYPE_LRC\n"
+        "#endif\n"
+    )
+
+    def _staged(self, temp_dir, name, text) -> Path:
+        path = Path(temp_dir) / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_wl82_opens_the_vendor_mask_and_keeps_the_rest_of_the_block(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_config = self._staged(temp_dir, "app_config.h", self.WL82_APP_CONFIG)
+            header = self._staged(temp_dir, "board_demo.h", self.WL83_BOARD_HEADER)
+
+            configure_lowpower("wl82", app_config, header)
+
+            content = app_config.read_text(encoding="utf-8")
+            self.assertIn(
+                "#define TCFG_LOWPOWER_LOWPOWER_SEL "
+                "SYS_SLEEP_EN|SYS_SLEEP_BY_IDLE|RF_SLEEP_EN|RF_FORCE_SYS_SLEEP_EN",
+                content,
+            )
+            self.assertEqual(content.count("TCFG_LOWPOWER_LOWPOWER_SEL"), 1)
+            self.assertIn("#define TCFG_LOWPOWER_VDDIOM_LEVEL\t\t\tVDDIOM_VOL_32V", content)
+            # The other chip's file is untouched.
+            self.assertIn("LOWPOWER_CLOSE", header.read_text(encoding="utf-8"))
+
+    def test_wl82_mask_is_the_value_the_vendor_boards_ship(self):
+        # SYS_SLEEP_EN|SYS_SLEEP_BY_IDLE|RF_SLEEP_EN|RF_FORCE_SYS_SLEEP_EN is
+        # what apps/demo/demo_ble and demo_edr enable behind
+        # CONFIG_LOW_POWER_ENABLE: BIT(1)|BIT(2)|BIT(3)|BIT(4) == 30.
+        self.assertEqual(
+            WL82_LOWPOWER_SEL,
+            "SYS_SLEEP_EN|SYS_SLEEP_BY_IDLE|RF_SLEEP_EN|RF_FORCE_SYS_SLEEP_EN",
+        )
+
+    def test_wl83_selects_plain_sleep_as_a_literal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_config = self._staged(temp_dir, "app_config.h", self.WL82_APP_CONFIG)
+            header = self._staged(temp_dir, "board_demo.h", self.WL83_BOARD_HEADER)
+
+            configure_lowpower("wl83", app_config, header)
+
+            content = header.read_text(encoding="utf-8")
+            self.assertIn("#define TCFG_LOWPOWER_FUNCTION 1 /* SLEEP_EN */", content)
+            self.assertNotIn("LOWPOWER_CLOSE", content)
+            self.assertEqual(content.count("TCFG_LOWPOWER_FUNCTION"), 1)
+            self.assertIn("#define TCFG_LOWPOWER_OSC_TYPE              OSC_TYPE_LRC", content)
+            # The AC791 profile is a different chip's file and stays as it was.
+            self.assertEqual(
+                app_config.read_text(encoding="utf-8"), self.WL82_APP_CONFIG
+            )
+
+    def test_wl83_value_must_be_a_literal_not_the_enum_name(self):
+        # apps/common/net/wifi_conf.c gates config_wifi_lowpower_enable and
+        # WL_STA_SLEEP on "#if TCFG_LOWPOWER_FUNCTION != LOWPOWER_CLOSE". Both
+        # names are enum constants, so in the preprocessor both sides read as
+        # 0 and the branches stay compiled out - the literal is what reaches
+        # them.
+        self.assertTrue(WL83_LOWPOWER_FUNCTION.startswith("1 "))
+        self.assertNotIn("SLEEP_EN|", WL83_LOWPOWER_FUNCTION.replace("/* SLEEP_EN */", ""))
+
+    def test_a_missing_macro_is_a_build_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_config = self._staged(temp_dir, "app_config.h", "#ifndef A\n#endif\n")
+            header = self._staged(temp_dir, "board_demo.h", self.WL83_BOARD_HEADER)
+
+            with self.assertRaisesRegex(BuildError, "no #define TCFG_LOWPOWER_LOWPOWER_SEL"):
+                configure_lowpower("wl82", app_config, header)
+
+    def test_an_unknown_chip_is_a_build_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_config = self._staged(temp_dir, "app_config.h", self.WL82_APP_CONFIG)
+            header = self._staged(temp_dir, "board_demo.h", self.WL83_BOARD_HEADER)
+
+            with self.assertRaisesRegex(BuildError, "no Jieli low-power profile"):
+                configure_lowpower("wl84", app_config, header)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ from .board_config import (
     configure_audio_board, configure_board_memory, configure_full_stack_app_config,
     configure_full_stack_board, configure_lcd_app_config, configure_lcd_board,
     configure_lcd_board_header, configure_log_uart_baudrate, configure_log_uart_block,
-    configure_service_uart, configure_usb_download_app_config,
+    configure_lowpower, configure_service_uart, configure_usb_download_app_config,
     configure_usb_download_board, configure_usb_download_board_header,
 )
 from .board_facts import BoardFacts, board_facts_digest
@@ -678,6 +678,11 @@ def create_staging_tree(
         configure_log_uart_block(board_file, uart_log_port, uart_log_baudrate, facts)
     else:
         configure_log_uart_baudrate(board_header, uart_log_port, uart_log_baudrate, facts)
+    # Only when the product asked for the power manager: without it the board
+    # profile keeps the vendor's sleep-closed macro, and the firmware behaves
+    # exactly as it did before this feature existed.
+    if "power" in features:
+        configure_lowpower(chip.name, app_config_file, board_header)
     if facts.service_uart is not None:
         configure_service_uart(board_file, facts)
     reference_board_file = (

@@ -268,8 +268,27 @@ LWIP = Feature(
 )
 
 
+POWER = Feature(
+    name="power",
+    kconfig="CONFIG_ENABLE_TUYA_PM",
+    defines=(),
+    sources=(),
+    includes=(),
+    removal_note=(
+        "TuyaOpen's power manager. It owns no vendor source and no archive: the "
+        "work is in the adapter's TKL (tuyaos_adapter/src/system/tkl_sleep.c and "
+        "src/driver/tkl_wifi.c), which is staged either way. What this feature "
+        "switches is the board's low-power profile - board_config."
+        "configure_lowpower() rewrites the staged TCFG_LOWPOWER_* macro so the "
+        "core may idle. It is deliberately off unless the product asks for it, "
+        "so a build without the power manager keeps the vendor's stock 'low "
+        "power closed' profile byte for byte."
+    ),
+)
+
+
 FEATURES: Mapping[str, Feature] = {
-    feature.name: feature for feature in (WIFI, BLUETOOTH, DISPLAY, TLS, LWIP)
+    feature.name: feature for feature in (WIFI, BLUETOOTH, DISPLAY, TLS, LWIP, POWER)
 }
 
 # The order the overlay appends feature-owned sources to the vendor Makefile's

@@ -82,12 +82,13 @@ DISPLAY_SOURCES = (
 class FeatureMapClosureTest(unittest.TestCase):
     def test_every_required_feature_is_declared(self):
         self.assertEqual(
-            set(FEATURES), {"wifi", "bluetooth", "display", "tls", "lwip"}
+            set(FEATURES), {"wifi", "bluetooth", "display", "tls", "lwip", "power"}
         )
         self.assertEqual(FEATURES["wifi"].kconfig, "CONFIG_ENABLE_WIFI")
         self.assertEqual(FEATURES["bluetooth"].kconfig, "CONFIG_ENABLE_BLUETOOTH")
         self.assertEqual(FEATURES["display"].kconfig, "CONFIG_ENABLE_DISPLAY")
         self.assertEqual(FEATURES["lwip"].kconfig, "CONFIG_ENABLE_LIBLWIP")
+        self.assertEqual(FEATURES["power"].kconfig, "CONFIG_ENABLE_TUYA_PM")
         # TuyaOpen's TLS stack has no switch on this platform, so the feature
         # says so rather than inventing a symbol.
         self.assertIsNone(FEATURES["tls"].kconfig)

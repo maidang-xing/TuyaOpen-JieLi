@@ -1,6 +1,7 @@
 """The board-config hooks read their values from the board's facts."""
 
 import re
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,10 @@ from pathlib import Path
 from tools.jieli_build.board_config import (
     UART_PORT_GROUPS,
     WL82_LOWPOWER_SEL,
+    WL82_STA_PS_MACRO,
     WL83_LOWPOWER_FUNCTION,
+    WL83_STA_PS_VALUE,
+    _check_ps_mode,
     configure_lcd_board_header,
     configure_log_uart_block,
     configure_log_uart_baudrate,
@@ -187,28 +191,84 @@ class LowPowerTest(unittest.TestCase):
         "#endif\n"
     )
 
+    # The decision the vendor writes in apps/common/net/wifi_conf.c, reduced to
+    # its shape. The check cuts this block out of the file by its markers, so
+    # the fixture has to keep the same three-way form and the PSMode= strings.
+    #
+    # wl82 (wifi_conf.c:519-525, :561-567):
+    WL82_WIFI_CONF = (
+        "#if defined CONFIG_LOW_POWER_ENABLE\n"
+        '#define WL_STA_SLEEP\t2\n'
+        "#elif defined CONFIG_WIFI_IDLE_RESUME_BASEBAND_ENABLE\n"
+        '#define WL_STA_SLEEP\t1//2\n'
+        "#else\n"
+        '#define WL_STA_SLEEP\t0\n'
+        "#endif\n"
+        "static const char WL_STA_DAT[] = {\n"
+        '#if WL_STA_SLEEP == 1\n'
+        '    "PSMode=Legacy_PSP\\n"\n'
+        "#elif WL_STA_SLEEP == 2\n"
+        '    "PSMode=Fast_PSP\\n"\n'
+        "#else\n"
+        '    "PSMode=CAM\\n"\n'
+        "#endif\n"
+        "};\n"
+    )
+
+    # wl83 (wifi_conf.c:565-575, :610-616): the STA mode comes from the same
+    # macro as the chip's sleep level, through an integer comparison. The enum
+    # is part of the fixture on purpose: the comparison only means what the
+    # vendor thinks it means if LOWPOWER_CLOSE is known to the preprocessor,
+    # and the real board header chain reaches it through power_api.h.
+    WL83_WIFI_CONF = (
+        "typedef enum { LOWPOWER_CLOSE, SLEEP_EN, DEEP_SLEEP_EN } lowpower_config_t;\n"
+        "#if TCFG_LOWPOWER_FUNCTION != LOWPOWER_CLOSE\n"
+        '#define WL_STA_SLEEP\t1\n'
+        "#else\n"
+        '#define WL_STA_SLEEP\t0\n'
+        "#endif\n"
+        "static const char WL_STA_DAT[] = {\n"
+        '#if WL_STA_SLEEP == 1\n'
+        '    "PSMode=Legacy_PSP\\n"\n'
+        "#elif WL_STA_SLEEP == 2\n"
+        '    "PSMode=Fast_PSP\\n"\n'
+        "#else\n"
+        '    "PSMode=CAM\\n"\n'
+        "#endif\n"
+        "};\n"
+    )
+
     def _staged(self, temp_dir, name, text) -> Path:
         path = Path(temp_dir) / name
         path.write_text(text, encoding="utf-8")
         return path
 
-    def test_wl82_opens_the_vendor_mask_and_keeps_the_rest_of_the_block(self):
+    def _run(self, chip, app_config_text, header_text, wifi_conf_text):
+        """Stage the three files and run the hook, inside a temp dir."""
         with tempfile.TemporaryDirectory() as temp_dir:
-            app_config = self._staged(temp_dir, "app_config.h", self.WL82_APP_CONFIG)
-            header = self._staged(temp_dir, "board_demo.h", self.WL83_BOARD_HEADER)
-
-            configure_lowpower("wl82", app_config, header)
-
-            content = app_config.read_text(encoding="utf-8")
-            self.assertIn(
-                "#define TCFG_LOWPOWER_LOWPOWER_SEL "
-                "SYS_SLEEP_EN|SYS_SLEEP_BY_IDLE|RF_SLEEP_EN|RF_FORCE_SYS_SLEEP_EN",
-                content,
+            app_config = self._staged(temp_dir, "app_config.h", app_config_text)
+            header = self._staged(temp_dir, "board_demo.h", header_text)
+            wifi_conf = self._staged(temp_dir, "wifi_conf.c", wifi_conf_text)
+            configure_lowpower(chip, app_config, header, wifi_conf=wifi_conf,
+                               compiler=shutil.which("clang"))
+            return (
+                app_config.read_text(encoding="utf-8"),
+                header.read_text(encoding="utf-8"),
             )
-            self.assertEqual(content.count("TCFG_LOWPOWER_LOWPOWER_SEL"), 1)
-            self.assertIn("#define TCFG_LOWPOWER_VDDIOM_LEVEL\t\t\tVDDIOM_VOL_32V", content)
-            # The other chip's file is untouched.
-            self.assertIn("LOWPOWER_CLOSE", header.read_text(encoding="utf-8"))
+
+    def test_wl82_opens_the_vendor_mask_and_keeps_the_rest_of_the_block(self):
+        content, header = self._run(
+            "wl82", self.WL82_APP_CONFIG, self.WL83_BOARD_HEADER, self.WL82_WIFI_CONF
+        )
+        self.assertIn(
+            "#define TCFG_LOWPOWER_LOWPOWER_SEL "
+            "SYS_SLEEP_EN|SYS_SLEEP_BY_IDLE|RF_SLEEP_EN|RF_FORCE_SYS_SLEEP_EN",
+            content,
+        )
+        self.assertEqual(content.count("TCFG_LOWPOWER_LOWPOWER_SEL"), 1)
+        self.assertIn("#define TCFG_LOWPOWER_VDDIOM_LEVEL\t\t\tVDDIOM_VOL_32V", content)
+        # The other chip's file is untouched.
+        self.assertIn("LOWPOWER_CLOSE", header)
 
     def test_wl82_mask_is_the_value_the_vendor_boards_ship(self):
         # SYS_SLEEP_EN|SYS_SLEEP_BY_IDLE|RF_SLEEP_EN|RF_FORCE_SYS_SLEEP_EN is
@@ -219,22 +279,23 @@ class LowPowerTest(unittest.TestCase):
             "SYS_SLEEP_EN|SYS_SLEEP_BY_IDLE|RF_SLEEP_EN|RF_FORCE_SYS_SLEEP_EN",
         )
 
+    def test_wl82_turns_on_station_power_save(self):
+        content, _ = self._run(
+            "wl82", self.WL82_APP_CONFIG, self.WL83_BOARD_HEADER, self.WL82_WIFI_CONF
+        )
+        # Without this the station compiles to PSMode=CAM: the sleep mask would
+        # only apply to moments the radio is idle anyway.
+        self.assertIn(f"#define {WL82_STA_PS_MACRO}", content)
+        self.assertEqual(content.count(f"#define {WL82_STA_PS_MACRO}"), 1)
+
     def test_wl83_selects_plain_sleep_as_a_literal(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            app_config = self._staged(temp_dir, "app_config.h", self.WL82_APP_CONFIG)
-            header = self._staged(temp_dir, "board_demo.h", self.WL83_BOARD_HEADER)
-
-            configure_lowpower("wl83", app_config, header)
-
-            content = header.read_text(encoding="utf-8")
-            self.assertIn("#define TCFG_LOWPOWER_FUNCTION 1 /* SLEEP_EN */", content)
-            self.assertNotIn("LOWPOWER_CLOSE", content)
-            self.assertEqual(content.count("TCFG_LOWPOWER_FUNCTION"), 1)
-            self.assertIn("#define TCFG_LOWPOWER_OSC_TYPE              OSC_TYPE_LRC", content)
-            # The AC791 profile is a different chip's file and stays as it was.
-            self.assertEqual(
-                app_config.read_text(encoding="utf-8"), self.WL82_APP_CONFIG
-            )
+        _, content = self._run(
+            "wl83", self.WL82_APP_CONFIG, self.WL83_BOARD_HEADER, self.WL83_WIFI_CONF
+        )
+        self.assertIn("#define TCFG_LOWPOWER_FUNCTION 1 /* SLEEP_EN */", content)
+        self.assertNotIn("LOWPOWER_CLOSE", content)
+        self.assertEqual(content.count("TCFG_LOWPOWER_FUNCTION"), 1)
+        self.assertIn("#define TCFG_LOWPOWER_OSC_TYPE              OSC_TYPE_LRC", content)
 
     def test_wl83_value_must_be_a_literal_not_the_enum_name(self):
         # apps/common/net/wifi_conf.c gates config_wifi_lowpower_enable and
@@ -245,13 +306,38 @@ class LowPowerTest(unittest.TestCase):
         self.assertTrue(WL83_LOWPOWER_FUNCTION.startswith("1 "))
         self.assertNotIn("SLEEP_EN|", WL83_LOWPOWER_FUNCTION.replace("/* SLEEP_EN */", ""))
 
+    def test_a_config_that_still_compiles_to_cam_is_rejected(self):
+        # The enum-name spelling is exactly the failure the real SDK has, so it
+        # must fail the check rather than ship. Written by hand because the
+        # hook itself never produces it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            header = self._staged(
+                temp_dir, "board_demo.h",
+                self.WL83_BOARD_HEADER.replace("LOWPOWER_CLOSE\n#define TCFG_LOWPOWER_OSC",
+                                               "SLEEP_EN\n#define TCFG_LOWPOWER_OSC"),
+            )
+            wifi_conf = self._staged(temp_dir, "wifi_conf.c", self.WL83_WIFI_CONF)
+
+            with self.assertRaisesRegex(BuildError, "PSMode=CAM.*Legacy_PSP"):
+                _check_ps_mode(header, wifi_conf, WL83_STA_PS_VALUE,
+                               compiler=shutil.which("clang"))
+
+    def test_a_missing_wifi_conf_is_a_build_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_config = self._staged(temp_dir, "app_config.h", self.WL82_APP_CONFIG)
+            header = self._staged(temp_dir, "board_demo.h", self.WL83_BOARD_HEADER)
+
+            with self.assertRaisesRegex(BuildError, "wifi_conf.c is required"):
+                configure_lowpower("wl82", app_config, header)
+
     def test_a_missing_macro_is_a_build_error(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_config = self._staged(temp_dir, "app_config.h", "#ifndef A\n#endif\n")
             header = self._staged(temp_dir, "board_demo.h", self.WL83_BOARD_HEADER)
+            wifi_conf = self._staged(temp_dir, "wifi_conf.c", self.WL82_WIFI_CONF)
 
             with self.assertRaisesRegex(BuildError, "no #define TCFG_LOWPOWER_LOWPOWER_SEL"):
-                configure_lowpower("wl82", app_config, header)
+                configure_lowpower("wl82", app_config, header, wifi_conf=wifi_conf)
 
     def test_an_unknown_chip_is_a_build_error(self):
         with tempfile.TemporaryDirectory() as temp_dir:

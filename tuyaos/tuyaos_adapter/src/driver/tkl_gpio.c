@@ -176,6 +176,14 @@ static OPERATE_RET tkl_gpio_wl82_register(TUYA_GPIO_NUM_E pin_id, int edge)
         return OPRT_EXCEED_UPPER_LIMIT;
     }
 
+    /* Publish the slot before registering: port_wakeup_reg enables the event
+     * as part of the call, so an edge arriving on the way out would otherwise
+     * find the slot still marked free and drop the callback. The dispatch
+     * checks the used flag, so an interrupt in that window either finds a
+     * fully published slot or (before this store) returns harmlessly. */
+    s_wl82_slot_pin[slot] = pin_id;
+    s_wl82_slot_used[slot] = 1;
+
     /* Note: port_wakeup_reg drives the pin to input and, for a plain io event,
      * sets the pull resistor to match the trigger edge (down for a rising edge,
      * up for a falling one). That is inside the vendor driver and cannot be
@@ -185,12 +193,11 @@ static OPERATE_RET tkl_gpio_wl82_register(TUYA_GPIO_NUM_E pin_id, int edge)
                           s_wl82_isr[slot]);
     if (hdl == NULL) {
         /* The pin is not in the driver's remap table - ports D and F are not
-         * listed at all, and A/B/C/E/G/H only partially. */
+         * listed at all, and A/B/C/E/G/H only partially. Give the slot back. */
+        s_wl82_slot_used[slot] = 0;
         return OPRT_NOT_SUPPORTED;
     }
 
-    s_wl82_slot_used[slot] = 1;
-    s_wl82_slot_pin[slot] = pin_id;
     s_irq[pin_id].hdl = hdl;
     return OPRT_OK;
 }
@@ -336,6 +343,12 @@ OPERATE_RET tkl_gpio_irq_init(TUYA_GPIO_NUM_E pin_id, const TUYA_GPIO_IRQ_T *cfg
      * caller enables the interrupt. Nothing is written to the vendor driver
      * here, which is also what keeps the "init does not enable" promise on
      * hardware where registering and enabling are the same operation. */
+    if (s_irq[pin_id].hdl != NULL) {
+        /* Re-initialising an armed pin: hand the old registration back first,
+         * or the vendor slot would leak and the new configuration would be
+         * silently ignored until a disable. */
+        (void)tkl_gpio_irq_disable(pin_id);
+    }
     s_irq[pin_id].cb = cfg->cb;
     s_irq[pin_id].arg = cfg->arg;
     s_irq[pin_id].mode = cfg->mode;

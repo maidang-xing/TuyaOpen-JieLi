@@ -516,6 +516,74 @@ def _insert_before_final_endif(
     config_file.write_text(content[:insert_at] + block + content[insert_at:], encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Low power
+# ---------------------------------------------------------------------------
+
+# The sleep sources AC791 may use, from asm/power_interface.h. The set is the
+# vendor's own: apps/demo/demo_ble/include/app_config.h:24 and
+# apps/demo/demo_edr/include/app_config.h:47 ship exactly these four behind
+# CONFIG_LOW_POWER_ENABLE, and demo_ble registers no power callbacks, so the
+# mask is known to stand on its own. The commented-out value beside the demo
+# profile's zero names the same sources minus SYS_SLEEP_BY_IDLE.
+WL82_LOWPOWER_SEL = "SYS_SLEEP_EN|SYS_SLEEP_BY_IDLE|RF_SLEEP_EN|RF_FORCE_SYS_SLEEP_EN"
+
+# AC792's equivalent, from lowpower_config_t in asm/power/power_api.h. Only the
+# plain sleep level is used: DEEP_SLEEP_EN powers the chip down and reboots on
+# wake, which is a different thing from anything TuyaOpen's power manager asks
+# for on this platform.
+#
+# It is written as the literal 1 rather than the enum name SLEEP_EN, and that
+# is load-bearing. The SDK compares this macro inside #if
+# (apps/common/net/wifi_conf.c:55 and :570, audio/log_config/lib_media_config.c
+# :57), where an identifier that is not a macro expands to 0 - so with the enum
+# name both sides of "TCFG_LOWPOWER_FUNCTION != LOWPOWER_CLOSE" read as 0 and
+# the low-power branches stay compiled out. A literal is the only spelling that
+# reaches both the struct initialiser and the preprocessor. The same reason
+# applies in reverse to the stock LOWPOWER_CLOSE, which is why
+# config_wifi_lowpower_enable is 0 in every shipped AC792 board.
+WL83_LOWPOWER_FUNCTION = "1 /* SLEEP_EN */"
+
+
+def _redefine_macro(config_file: Path, name: str, value: str) -> None:
+    """Rewrite an existing ``#define <name> ...`` in a staged header.
+
+    The low-power macros are already defined by the vendor profile, so this
+    replaces the definition instead of appending a second one: a later #define
+    would warn on redefinition and leave the earlier value in force for every
+    line above it. A missing macro is a hard error - it means the vendor
+    profile moved, and a silent no-op here would ship a build that claims to
+    have low power and does not.
+    """
+    if not config_file.is_file():
+        raise BuildError(f"Jieli config not found: {config_file}")
+    content = config_file.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^#define\s+{re.escape(name)}\s+.*$", re.MULTILINE)
+    updated, count = pattern.subn(f"#define {name} {value}", content, count=1)
+    if count == 0:
+        raise BuildError(f"Jieli config has no #define {name}: {config_file}")
+    config_file.write_text(updated, encoding="utf-8")
+
+
+def configure_lowpower(chip_name: str, app_config_file: Path, board_header: Path) -> None:
+    """Open the chip's sleep path in the staged board profile.
+
+    Only called for builds that ask for TuyaOpen's power manager, so a build
+    without it keeps the vendor profile exactly as it ships. That is what makes
+    "the power component is off" mean "the firmware behaves as it did before".
+
+    Which file carries the macro is a chip-layout fact: the AC791 demo profile
+    keeps its TCFG_LOWPOWER_* block in app_config.h, the AC792 one in the board
+    header reached through app_config.h -> board_config.h -> board_demo.h.
+    """
+    if chip_name == "wl82":
+        _redefine_macro(app_config_file, "TCFG_LOWPOWER_LOWPOWER_SEL", WL82_LOWPOWER_SEL)
+    elif chip_name == "wl83":
+        _redefine_macro(board_header, "TCFG_LOWPOWER_FUNCTION", WL83_LOWPOWER_FUNCTION)
+    else:
+        raise BuildError(f"no Jieli low-power profile for chip '{chip_name}'")
+
+
 def configure_usb_download_app_config(app_config_file: Path) -> None:
     """Enable the AC79 USB slave/MSD stack that serves download-mode requests.
 

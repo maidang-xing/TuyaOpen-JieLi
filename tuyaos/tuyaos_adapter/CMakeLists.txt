@@ -95,6 +95,7 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${TOP_SOURCE_DIR}/tools/porting/adapter/bluetooth
         ${TOP_SOURCE_DIR}/tools/porting/adapter/timer
         ${TOP_SOURCE_DIR}/tools/porting/adapter/gpio
+        ${TOP_SOURCE_DIR}/tools/porting/adapter/pinmux
         ${TOP_SOURCE_DIR}/src/common/include
         ${JIELI_SDK_ROOT}/include_lib
         ${JIELI_SDK_ROOT}/include_lib/btstack

@@ -53,7 +53,6 @@ typedef struct {
     TUYA_TIMER_MODE_E mode;
     TUYA_TIMER_ISR_CB cb;
     void *args;
-    uint32_t period_us;
     uint32_t started_us;
 } tkl_timer_ctx_t;
 
@@ -92,7 +91,6 @@ static void jieli_timer_reset_table(void)
         s_timer[i].mode = TUYA_TIMER_MODE_ONCE;
         s_timer[i].cb = NULL;
         s_timer[i].args = NULL;
-        s_timer[i].period_us = 0u;
         s_timer[i].started_us = local_timer_us_time();
     }
     s_timer_ready = 1;
@@ -125,7 +123,6 @@ OPERATE_RET tkl_timer_init(TUYA_TIMER_NUM_E timer_id, TUYA_TIMER_BASE_CFG_T *cfg
     ctx->mode = cfg->mode;
     ctx->cb = cfg->cb;
     ctx->args = cfg->args;
-    ctx->period_us = 0u;
     return OPRT_OK;
 }
 
@@ -146,7 +143,6 @@ OPERATE_RET tkl_timer_start(TUYA_TIMER_NUM_E timer_id, uint32_t us)
         /* Already armed: change the period in place, which is what the vendor
          * exposes, rather than creating a second timer on the same slot. */
         sys_usec_timer_set(ctx->id, us);
-        ctx->period_us = us;
         ctx->started_us = local_timer_us_time();
         return OPRT_OK;
     }
@@ -157,7 +153,6 @@ OPERATE_RET tkl_timer_start(TUYA_TIMER_NUM_E timer_id, uint32_t us)
         return OPRT_RESOURCE_NOT_READY;
     }
     ctx->id = id;
-    ctx->period_us = us;
     ctx->started_us = local_timer_us_time();
     return OPRT_OK;
 }
@@ -186,7 +181,6 @@ OPERATE_RET tkl_timer_deinit(TUYA_TIMER_NUM_E timer_id)
     }
     s_timer[timer_id].cb = NULL;
     s_timer[timer_id].args = NULL;
-    s_timer[timer_id].period_us = 0u;
     return OPRT_OK;
 }
 

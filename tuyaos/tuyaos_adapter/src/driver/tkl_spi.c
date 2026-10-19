@@ -37,7 +37,6 @@
 #define TKL_SPI_PORT_MAX 3
 
 static void *s_spi_handles[TKL_SPI_PORT_MAX];
-static uint32_t s_spi_freq[TKL_SPI_PORT_MAX];
 
 static const char *jieli_spi_device_name(TUYA_SPI_NUM_E port)
 {
@@ -92,7 +91,6 @@ OPERATE_RET tkl_spi_init(TUYA_SPI_NUM_E port, const TUYA_SPI_BASE_CFG_T *cfg)
      * the TKL contract has no completion callback to wait on. */
     (void)dev_ioctl(s_spi_handles[port], IOCTL_SPI_SET_ASYNC_SEND, 0u);
 #endif
-    s_spi_freq[port] = cfg->freq_hz;
     return OPRT_OK;
 }
 

@@ -36,6 +36,10 @@ enum jieli_uart_ioctl_cmd {
 
 static void *s_uart_handles[TKL_UART_PORT_MAX];
 
+/* Set while the receive task should keep running; shared by both chips because
+ * tkl_uart_deinit() clears it whichever backend is built. */
+static volatile uint8_t s_uart_rx_active[TKL_UART_PORT_MAX];
+
 #if defined(JIELI_SELECTED_CHIP_WL83)
 /* The vendor ISR must not call dev_read(): that path takes a mutex and the SDK
  * asserts with "os_mutex_pend: in_irq". So the ISR only posts a semaphore and a
@@ -76,14 +80,19 @@ static void jieli_uart_rx_task(void *arg)
 {
     uint8_t port_id = (uint8_t)(uintptr_t)arg;
 
-    for (;;) {
+    while (s_uart_rx_active[port_id]) {
         if (tkl_semaphore_wait(s_uart_rx_sem[port_id], TKL_SEM_WAIT_FOREVER) != OPRT_OK) {
             continue;
+        }
+        if (!s_uart_rx_active[port_id]) {
+            break;
         }
         if (s_uart_rx_cb[port_id] != NULL) {
             s_uart_rx_cb[port_id]((TUYA_UART_NUM_E)port_id);
         }
     }
+    /* Allow a later init/registration to start a fresh task. */
+    s_uart_rx_thread[port_id] = NULL;
 }
 #else /* JIELI_SELECTED_CHIP_WL82 */
 /* wl82 has no receive interrupt-event callback, but TAL cannot receive without
@@ -127,7 +136,6 @@ static void jieli_uart_rx_task(void *arg)
 
 static TUYA_UART_IRQ_CB s_uart_rx_cb[TKL_UART_PORT_MAX];
 static TKL_THREAD_HANDLE s_uart_rx_thread[TKL_UART_PORT_MAX];
-static volatile uint8_t s_uart_rx_poll_active[TKL_UART_PORT_MAX];
 
 /* jieli_uart_wl82_recv_cnt() and jieli_uart_poll_task() are defined after
  * jieli_uart_ioctl(), which they call. */
@@ -204,7 +212,7 @@ static void jieli_uart_poll_task(void *arg)
     uint8_t port_id = (uint8_t)(uintptr_t)arg;
     uint32_t last = 0;
 
-    while (s_uart_rx_poll_active[port_id]) {
+    while (s_uart_rx_active[port_id]) {
         uint32_t cnt = 0;
 
         if (jieli_uart_wl82_recv_cnt((TUYA_UART_NUM_E)port_id, &cnt) != 0) {
@@ -272,6 +280,24 @@ OPERATE_RET tkl_uart_deinit(TUYA_UART_NUM_E port_id)
     if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX || s_uart_handles[port_id] == NULL) {
         return OPRT_INVALID_PARM;
     }
+
+    /* Stop the receive task before the handle goes away. Without this the wl83
+     * task waits forever on a semaphore the closed port can no longer post,
+     * and the wl82 poll task keeps waking every 10 ms against a NULL handle -
+     * a leaked thread in both cases, and a callback that could still fire into
+     * a caller that believes it has deinitialised. */
+    s_uart_rx_active[port_id] = 0;
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    /* The task is blocked in tkl_semaphore_wait(); post once so it wakes, sees
+     * the flag and exits. The vendor callback is cleared too, so no further
+     * posts arrive after close. */
+    if (s_uart_rx_sem[port_id] != NULL) {
+        (void)tkl_semaphore_post(s_uart_rx_sem[port_id]);
+    }
+    (void)dev_ioctl(s_uart_handles[port_id], jieli_uart_ioctl(JIELI_UART_IOCTL_SET_IRQ_EVENT_CB), 0u);
+#endif
+    s_uart_rx_cb[port_id] = NULL;
+
     dev_close(s_uart_handles[port_id]);
     s_uart_handles[port_id] = NULL;
     return OPRT_OK;
@@ -307,8 +333,13 @@ void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
         return;
     }
     if (s_uart_rx_thread[port_id] == NULL) {
-        (void)tkl_thread_create(&s_uart_rx_thread[port_id], "tuya_uart_rx", TKL_UART_RX_TASK_STACK, 3u,
-                                jieli_uart_rx_task, (void *)(uintptr_t)port_id);
+        s_uart_rx_active[port_id] = 1;
+        if (tkl_thread_create(&s_uart_rx_thread[port_id], "tuya_uart_rx", TKL_UART_RX_TASK_STACK, 3u,
+                              jieli_uart_rx_task, (void *)(uintptr_t)port_id) != OPRT_OK) {
+            s_uart_rx_active[port_id] = 0;
+            s_uart_rx_thread[port_id] = NULL;
+            return;
+        }
     }
     (void)dev_ioctl(s_uart_handles[port_id], jieli_uart_ioctl(JIELI_UART_IOCTL_SET_IRQ_EVENT_CB),
                     (u32)(uintptr_t)s_uart_irq_event_cb[port_id]);
@@ -318,10 +349,10 @@ void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
         return;
     }
     if (s_uart_rx_thread[port_id] == NULL) {
-        s_uart_rx_poll_active[port_id] = 1;
+        s_uart_rx_active[port_id] = 1;
         if (tkl_thread_create(&s_uart_rx_thread[port_id], "tuya_uart_rx", TKL_UART_RX_TASK_STACK, 4u,
                               jieli_uart_poll_task, (void *)(uintptr_t)port_id) != OPRT_OK) {
-            s_uart_rx_poll_active[port_id] = 0;
+            s_uart_rx_active[port_id] = 0;
             s_uart_rx_thread[port_id] = NULL;
         }
     }

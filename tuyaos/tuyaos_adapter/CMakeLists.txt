@@ -98,6 +98,7 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${TOP_SOURCE_DIR}/tools/porting/adapter/pinmux
         ${TOP_SOURCE_DIR}/tools/porting/adapter/i2c
         ${TOP_SOURCE_DIR}/tools/porting/adapter/pwm
+        ${TOP_SOURCE_DIR}/tools/porting/adapter/spi
         ${TOP_SOURCE_DIR}/src/common/include
         ${JIELI_SDK_ROOT}/include_lib
         ${JIELI_SDK_ROOT}/include_lib/btstack

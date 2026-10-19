@@ -710,14 +710,20 @@ OPERATE_RET tkl_wifi_set_rf_calibrated(void) { return OPRT_OK; }
  * sdk/apps/common/net/wifi_conf.c. Both sets are declared here from those two
  * sources; neither signature is guessed.
  *
- * The dtim argument is accepted but NOT applied. TuyaOpen's dtim counts DTIM
- * beacons; the SDK's other knob is the listen interval - how many beacon
+ * Power save is on or off; the DTIM value is not applied. TuyaOpen's dtim counts
+ * DTIM beacons; the SDK's other knob is the listen interval - how many beacon
  * intervals the station tells the AP it may doze for. Those are different
  * 802.11 dimensions (the AP chooses the DTIM period, the station chooses the
- * listen interval), and no mapping between them is established by the SDK or
- * by any vendor call site, so the radio stays on the default policy of waking
- * for DTIM, which is what dtim <= 1 asks for. Raising the listen interval to
- * chase lower current is deliberately left out until it can be measured.
+ * listen interval), and no mapping between them is established by the SDK or by
+ * any vendor call site. dtim <= 1 therefore selects the SDK's default policy,
+ * waking for DTIM, which is exactly what it asks for.
+ *
+ * A larger dtim is refused with OPRT_NOT_SUPPORTED rather than swallowed. The
+ * power manager's schemes ask for 1 and 10, so answering OPRT_OK to both would
+ * tell it that ULP_ONLINE reached a deeper sleep than CEC_T20 when the two are
+ * running the same strategy - the software state would say the knob worked
+ * while the radio did the same thing. Raising the listen interval is left to a
+ * change that can measure it.
  */
 #if defined(JIELI_SELECTED_CHIP_WL82)
 #include "asm/power_interface.h"
@@ -730,6 +736,9 @@ extern void wl_enable_listen_each_tim(void);
 #else
 #error "Jieli Wi-Fi power save requires a selected chip"
 #endif
+
+/* The largest dtim this adapter applies: 1 means "wake on every DTIM". */
+#define JIELI_WIFI_LP_MAX_DTIM 1
 
 static TKL_MUTEX_HANDLE s_lp_mutex = NULL;
 #if defined(JIELI_SELECTED_CHIP_WL82)
@@ -744,7 +753,11 @@ OPERATE_RET tkl_wifi_set_lp_mode(const BOOL_T enable, const uint8_t dtim)
 {
     OPERATE_RET rt;
 
-    (void)dtim; /* see the block comment above: no verified listen-interval mapping */
+    /* Refused before any state is touched: a request this adapter cannot honour
+     * must not leave the radio in a mode the caller was told about. */
+    if (enable && dtim > JIELI_WIFI_LP_MAX_DTIM) {
+        return OPRT_NOT_SUPPORTED;
+    }
 
     if (NULL == s_lp_mutex) {
         rt = tkl_mutex_create_init(&s_lp_mutex);

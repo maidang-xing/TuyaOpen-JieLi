@@ -32,6 +32,7 @@ from .board_config import (
 from .board_facts import BoardFacts, board_facts_digest
 from .chip_profiles import JIELI_CHIPS, PLATFORM_ROOT, resolve_chip
 from .errors import BuildError
+from .toolchain import resolve_tool_path
 from .feature_map import (
     FEATURES,
     enabled_features,
@@ -613,6 +614,7 @@ def create_staging_tree(
     chip=None,
     facts: Optional[BoardFacts] = None,
     features: Optional[Iterable[str]] = None,
+    tool_dir: Optional[Path] = None,
 ) -> Path:
     """Create a small overlay tree without modifying the vendor checkout.
 
@@ -681,8 +683,19 @@ def create_staging_tree(
     # Only when the product asked for the power manager: without it the board
     # profile keeps the vendor's sleep-closed macro, and the firmware behaves
     # exactly as it did before this feature existed.
+    #
+    # The STA power mode is checked against the staged wifi_conf.c, because
+    # that is the file that turns these macros into PSMode= - a sleep mask
+    # alone leaves the station in CAM.
     if "power" in features:
-        configure_lowpower(chip.name, app_config_file, board_header)
+        configure_lowpower(
+            chip.name,
+            app_config_file,
+            board_header,
+            wifi_conf=source_overlay_root / "apps/common/net/wifi_conf.c",
+            compiler=resolve_tool_path(tool_dir, "clang") if tool_dir is not None else None,
+            sdk_root=sdk_root,
+        )
     if facts.service_uart is not None:
         configure_service_uart(board_file, facts)
     reference_board_file = (

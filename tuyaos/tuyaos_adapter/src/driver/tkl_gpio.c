@@ -18,10 +18,10 @@
  *         One shared ISR on IRQ_PORT_IDX walks a fixed table of handlers. The
  *         handler takes no argument, and only a fixed set of "events" exists:
  *         EVENT_IO_0 and EVENT_IO_1 can be remapped to an arbitrary pin through
- *         the io map, the rest are tied to particular pins. PORT_WAKED_ID_NUM
- *         is 3, so at most three registrations are live at once, and the remap
- *         accepts only pins the driver lists in its own port_table (ports D and
- *         F are absent from it entirely).
+ *         the io map, the rest are tied to particular pins. Since each of those
+ *         two owns its own remap field, only TWO arbitrary-pin interrupts can be
+ *         live at once; the remap also accepts only pins the driver lists in
+ *         its own port_table (ports D and F are absent from it entirely).
  *
  *   wl83  asm/exti.h
  *           exti_init(gpio, edge, cb(priv, gpio), priv) / exti_uninit(index)
@@ -53,16 +53,23 @@
  */
 #define TKL_GPIO_PIN_MAX 64
 
-/* How many external interrupts the wl82 port driver can hold at once.
- * PORT_WAKED_ID_NUM is 3 in cpu/wl82/port_waked_up.c; a fourth registration
- * returns NULL there, which this file reports as OPRT_EXCEED_UPPER_LIMIT. */
-#define TKL_GPIO_WL82_IRQ_MAX 3
+/* How many external interrupts this backend can hold at once.
+ *
+ * The vendor table has PORT_WAKED_ID_NUM == 3 slots, but only EVENT_IO_0 and
+ * EVENT_IO_1 can be remapped to an arbitrary pin - and each of those owns a
+ * single io-map field, so two pins cannot share one. That makes two the real
+ * ceiling for general-purpose pins; the third vendor slot is only useful for
+ * its fixed-pin events, which this contract does not hand out. A third request
+ * returns OPRT_EXCEED_UPPER_LIMIT rather than silently colliding. */
+#define TKL_GPIO_WL82_IRQ_MAX 2
 
 typedef struct {
     TUYA_GPIO_IRQ_CB cb;
     void *arg;
     TUYA_GPIO_IRQ_E mode;
-    void *hdl; /* wl82: the port_wakeup handle. wl83: the exti index as an int. */
+    void *hdl;   /* wl82: the port_wakeup handle. wl83: unused. */
+    int exti;    /* wl83: the exti index, which may legitimately be 0. */
+    u8 armed;    /* registration is live; NOT deriveable from the values above */
 } tkl_gpio_irq_ctx_t;
 
 static tkl_gpio_irq_ctx_t s_irq[TKL_GPIO_PIN_MAX];
@@ -151,12 +158,10 @@ static void tkl_gpio_wl82_dispatch(int slot)
 
 static void tkl_gpio_wl82_isr_0(void) { tkl_gpio_wl82_dispatch(0); }
 static void tkl_gpio_wl82_isr_1(void) { tkl_gpio_wl82_dispatch(1); }
-static void tkl_gpio_wl82_isr_2(void) { tkl_gpio_wl82_dispatch(2); }
 
 static void (*const s_wl82_isr[TKL_GPIO_WL82_IRQ_MAX])(void) = {
     tkl_gpio_wl82_isr_0,
     tkl_gpio_wl82_isr_1,
-    tkl_gpio_wl82_isr_2,
 };
 
 static OPERATE_RET tkl_gpio_wl82_register(TUYA_GPIO_NUM_E pin_id, int edge)
@@ -184,13 +189,14 @@ static OPERATE_RET tkl_gpio_wl82_register(TUYA_GPIO_NUM_E pin_id, int edge)
     s_wl82_slot_pin[slot] = pin_id;
     s_wl82_slot_used[slot] = 1;
 
-    /* Note: port_wakeup_reg drives the pin to input and, for a plain io event,
-     * sets the pull resistor to match the trigger edge (down for a rising edge,
-     * up for a falling one). That is inside the vendor driver and cannot be
-     * avoided from here, so a conflicting pull requested through tkl_gpio_init
-     * is overridden by the vendor once the interrupt is enabled. */
-    hdl = port_wakeup_reg(EVENT_IO_0, (unsigned int)pin_id, (PORT_EDGE_E)edge,
-                          s_wl82_isr[slot]);
+    /* One event per slot. EVENT_IO_0 and EVENT_IO_1 each own a separate
+     * io-map remap field and a separate enable/edge/pending bit, so two pins
+     * must use different events: registering both on EVENT_IO_0 would make the
+     * second overwrite the first's remap (so the first pin stops firing) and
+     * would make the vendor ISR dispatch BOTH handlers on either pin's edge,
+     * because it walks every table entry whose stored event is pended. */
+    hdl = port_wakeup_reg(slot == 0 ? EVENT_IO_0 : EVENT_IO_1, (unsigned int)pin_id,
+                          (PORT_EDGE_E)edge, s_wl82_isr[slot]);
     if (hdl == NULL) {
         /* The pin is not in the driver's remap table - ports D and F are not
          * listed at all, and A/B/C/E/G/H only partially. Give the slot back. */
@@ -199,6 +205,7 @@ static OPERATE_RET tkl_gpio_wl82_register(TUYA_GPIO_NUM_E pin_id, int edge)
     }
 
     s_irq[pin_id].hdl = hdl;
+    s_irq[pin_id].armed = 1u;
     return OPRT_OK;
 }
 
@@ -206,7 +213,7 @@ static void tkl_gpio_wl82_unregister(TUYA_GPIO_NUM_E pin_id)
 {
     int slot;
 
-    if (s_irq[pin_id].hdl == NULL) {
+    if (!s_irq[pin_id].armed) {
         return;
     }
     for (slot = 0; slot < TKL_GPIO_WL82_IRQ_MAX; slot++) {
@@ -217,6 +224,7 @@ static void tkl_gpio_wl82_unregister(TUYA_GPIO_NUM_E pin_id)
     }
     port_wakeup_unreg(s_irq[pin_id].hdl);
     s_irq[pin_id].hdl = NULL;
+    s_irq[pin_id].armed = 0u;
 }
 #else /* JIELI_SELECTED_CHIP_WL83 */
 /* wl83 hands the private pointer and the pin back to the callback, so a single
@@ -238,17 +246,23 @@ static OPERATE_RET tkl_gpio_wl83_register(TUYA_GPIO_NUM_E pin_id, int edge)
         /* exti_init refuses a pin with no external-interrupt capability. */
         return OPRT_NOT_SUPPORTED;
     }
-    s_irq[pin_id].hdl = (void *)(intptr_t)index;
+    /* The index is documented as non-negative, so 0 is a valid registration and
+     * cannot be used as the "not armed" sentinel - that would make the first
+     * pin's registration invisible to disable/deinit and leave its callback
+     * firing after the caller disabled it. exti_armed is the source of truth. */
+    s_irq[pin_id].exti = index;
+    s_irq[pin_id].armed = 1u;
     return OPRT_OK;
 }
 
 static void tkl_gpio_wl83_unregister(TUYA_GPIO_NUM_E pin_id)
 {
-    if (s_irq[pin_id].hdl == NULL) {
+    if (!s_irq[pin_id].armed) {
         return;
     }
-    (void)exti_uninit((int)(intptr_t)s_irq[pin_id].hdl);
-    s_irq[pin_id].hdl = NULL;
+    (void)exti_uninit(s_irq[pin_id].exti);
+    s_irq[pin_id].armed = 0u;
+    s_irq[pin_id].exti = -1;
 }
 #endif
 
@@ -343,7 +357,7 @@ OPERATE_RET tkl_gpio_irq_init(TUYA_GPIO_NUM_E pin_id, const TUYA_GPIO_IRQ_T *cfg
      * caller enables the interrupt. Nothing is written to the vendor driver
      * here, which is also what keeps the "init does not enable" promise on
      * hardware where registering and enabling are the same operation. */
-    if (s_irq[pin_id].hdl != NULL) {
+    if (s_irq[pin_id].armed) {
         /* Re-initialising an armed pin: hand the old registration back first,
          * or the vendor slot would leak and the new configuration would be
          * silently ignored until a disable. */
@@ -353,6 +367,8 @@ OPERATE_RET tkl_gpio_irq_init(TUYA_GPIO_NUM_E pin_id, const TUYA_GPIO_IRQ_T *cfg
     s_irq[pin_id].arg = cfg->arg;
     s_irq[pin_id].mode = cfg->mode;
     s_irq[pin_id].hdl = NULL;
+    s_irq[pin_id].exti = -1;
+    s_irq[pin_id].armed = 0u;
     return OPRT_OK;
 }
 
@@ -366,7 +382,7 @@ OPERATE_RET tkl_gpio_irq_enable(TUYA_GPIO_NUM_E pin_id)
     if (s_irq[pin_id].cb == NULL) {
         return OPRT_INVALID_PARM;
     }
-    if (s_irq[pin_id].hdl != NULL) {
+    if (s_irq[pin_id].armed) {
         return OPRT_OK; /* already armed */
     }
     if (tkl_irq_edge(s_irq[pin_id].mode, &edge) != 0) {

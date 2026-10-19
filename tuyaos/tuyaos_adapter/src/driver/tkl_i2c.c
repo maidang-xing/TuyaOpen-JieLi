@@ -12,9 +12,11 @@
  * stop - but not on a single name in the ioctl set, so the mapping is per chip
  * and lives in jieli_i2c_ioctl_cmd(). Neither is a wrapper over the other:
  *
- *   wl82  IIC_IOCTL_TX_START_BIT / IIC_IOCTL_TX_WITH_START_BIT /
- *         IIC_IOCTL_TX_WITH_STOP_BIT / IIC_IOCTL_RX_* / IIC_IOCTL_TX_STOP_BIT
- *         The device layer takes no mutex; the TKL serialises a transaction.
+ *   wl82  IIC_IOCTL_START / IIC_IOCTL_TX / IIC_IOCTL_TX_WITH_START_BIT /
+ *         IIC_IOCTL_TX_WITH_STOP_BIT / IIC_IOCTL_RX_* / IIC_IOCTL_STOP
+ *         IIC_IOCTL_START and IIC_IOCTL_STOP are the device layer's mutex
+ *         pend/post; the bus start/stop conditions come from the
+ *         *_WITH_START_BIT / *_WITH_STOP_BIT byte commands.
  *
  *   wl83  IOCTL_IIC_START / IOCTL_IIC_TX_BYTE_WITH_START_BIT /
  *         IOCTL_IIC_TX_BYTE_WITH_STOP_BIT / IOCTL_IIC_RX_BYTE_* / IOCTL_IIC_STOP
@@ -77,6 +79,7 @@ static const char *jieli_i2c_device_name(TUYA_I2C_NUM_E port)
 enum jieli_i2c_cmd {
     JIELI_I2C_CMD_START,
     JIELI_I2C_CMD_STOP,
+    JIELI_I2C_CMD_TX,
     JIELI_I2C_CMD_TX_WITH_START,
     JIELI_I2C_CMD_TX_WITH_STOP,
     JIELI_I2C_CMD_RX_WITH_ACK,
@@ -90,6 +93,7 @@ static uint32_t jieli_i2c_ioctl_cmd(enum jieli_i2c_cmd cmd)
     switch (cmd) {
     case JIELI_I2C_CMD_START:         return IOCTL_IIC_START;
     case JIELI_I2C_CMD_STOP:          return IOCTL_IIC_STOP;
+    case JIELI_I2C_CMD_TX:            return IOCTL_IIC_TX_BYTE;
     case JIELI_I2C_CMD_TX_WITH_START: return IOCTL_IIC_TX_BYTE_WITH_START_BIT;
     case JIELI_I2C_CMD_TX_WITH_STOP:  return IOCTL_IIC_TX_BYTE_WITH_STOP_BIT;
     case JIELI_I2C_CMD_RX_WITH_ACK:   return IOCTL_IIC_RX_BYTE_WITH_ACK;
@@ -103,7 +107,11 @@ static uint32_t jieli_i2c_ioctl_cmd(enum jieli_i2c_cmd cmd)
 {
     switch (cmd) {
     case JIELI_I2C_CMD_START:         return IIC_IOCTL_START;
-    case JIELI_I2C_CMD_STOP:          return IIC_IOCTL_TX_STOP_BIT;
+    /* The device layer pends its mutex on IIC_IOCTL_START and posts it only on
+     * IIC_IOCTL_STOP. IIC_IOCTL_TX_STOP_BIT is a bus condition, not the unlock,
+     * so using it here would take the lock and never give it back. */
+    case JIELI_I2C_CMD_STOP:          return IIC_IOCTL_STOP;
+    case JIELI_I2C_CMD_TX:            return IIC_IOCTL_TX;
     case JIELI_I2C_CMD_TX_WITH_START: return IIC_IOCTL_TX_WITH_START_BIT;
     case JIELI_I2C_CMD_TX_WITH_STOP:  return IIC_IOCTL_TX_WITH_STOP_BIT;
     case JIELI_I2C_CMD_RX_WITH_ACK:   return IIC_IOCTL_RX_WITH_ACK;
@@ -229,12 +237,15 @@ OPERATE_RET tkl_i2c_master_send(TUYA_I2C_NUM_E port, uint16_t dev_addr, const vo
     }
     for (i = 0; i < size; i++) {
         BOOL_T last = (i + 1 == size);
-        /* Hold off the stop when the caller asked for a repeated start. */
+        /* Only the FIRST byte follows the start condition and only the LAST may
+         * carry the stop. Middle bytes must be plain writes: *_WITH_START_BIT
+         * really does assert a START on the wire, which would make a multi-byte
+         * payload look like a sequence of new address phases (the vendor's own
+         * iic_api.c writes middle bytes with IOCTL_IIC_TX_BYTE / plain TX). */
         if (last && !xfer_pending) {
             rt = jieli_i2c_ioctl(s_i2c_handles[port], jieli_i2c_ioctl_cmd(JIELI_I2C_CMD_TX_WITH_STOP), p[i]);
         } else {
-            rt = jieli_i2c_ioctl(s_i2c_handles[port],
-                                 jieli_i2c_ioctl_cmd(JIELI_I2C_CMD_TX_WITH_START), p[i]);
+            rt = jieli_i2c_ioctl(s_i2c_handles[port], jieli_i2c_ioctl_cmd(JIELI_I2C_CMD_TX), p[i]);
         }
         if (rt != OPRT_OK) {
             /* Release the vendor bus lock: an abandoned transfer would keep
@@ -365,8 +376,10 @@ OPERATE_RET tkl_i2c_reset(TUYA_I2C_NUM_E port)
         return OPRT_INVALID_PARM;
     }
     /* The only bus recovery the device layer offers is closing and reopening
-     * the port, which re-runs iic_open() and re-initialises the controller. */
+     * the port, which re-runs iic_open() and re-initialises the controller.
+     * Any lock this layer was holding went with the old handle. */
     dev_close(s_i2c_handles[port]);
+    s_i2c_bus_held[port] = 0u;
     s_i2c_handles[port] = dev_open(jieli_i2c_device_name(port), NULL);
     return s_i2c_handles[port] != NULL ? OPRT_OK : OPRT_OS_ADAPTER_I2C_TRANS_ERR;
 }

@@ -298,6 +298,19 @@ OPERATE_RET tkl_uart_deinit(TUYA_UART_NUM_E port_id)
 #endif
     s_uart_rx_cb[port_id] = NULL;
 
+    /* Wait (bounded) for the task to actually exit before the handle goes away.
+     * Without a join, a quick init+register inside the task's exit window sees
+     * a non-NULL thread handle, skips creating a new task, and leaves the port
+     * with a callback registered but no task to service it - received bytes are
+     * then silently dropped. The task clears its own handle on the way out. */
+    {
+        uint32_t spins = 0;
+        while (s_uart_rx_thread[port_id] != NULL && spins < 20u) {
+            (void)tkl_system_sleep(5);
+            spins++;
+        }
+    }
+
     dev_close(s_uart_handles[port_id]);
     s_uart_handles[port_id] = NULL;
     return OPRT_OK;
@@ -327,13 +340,17 @@ void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
     if (rx_cb == NULL || s_uart_handles[port_id] == NULL) {
         return;
     }
+    /* Publish "should run" before anything else: if a previous task is still
+     * exiting, it re-reads this flag and keeps running rather than leaving the
+     * port with no consumer. */
+    s_uart_rx_active[port_id] = 1;
     if (s_uart_rx_sem[port_id] == NULL &&
         tkl_semaphore_create_init(&s_uart_rx_sem[port_id], 0u, 1u) != OPRT_OK) {
         s_uart_rx_sem[port_id] = NULL;
+        s_uart_rx_active[port_id] = 0;
         return;
     }
     if (s_uart_rx_thread[port_id] == NULL) {
-        s_uart_rx_active[port_id] = 1;
         if (tkl_thread_create(&s_uart_rx_thread[port_id], "tuya_uart_rx", TKL_UART_RX_TASK_STACK, 3u,
                               jieli_uart_rx_task, (void *)(uintptr_t)port_id) != OPRT_OK) {
             s_uart_rx_active[port_id] = 0;
@@ -355,6 +372,10 @@ void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
             s_uart_rx_active[port_id] = 0;
             s_uart_rx_thread[port_id] = NULL;
         }
+    } else {
+        /* A previous task is still winding down; keep it alive rather than
+         * leaving the port with a callback and no poller. */
+        s_uart_rx_active[port_id] = 1;
     }
 #endif
 }

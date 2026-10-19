@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -514,6 +516,300 @@ def _insert_before_final_endif(
     if insert_at < 0:
         raise BuildError(f"Jieli config has no final #endif: {config_file}")
     config_file.write_text(content[:insert_at] + block + content[insert_at:], encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Low power
+# ---------------------------------------------------------------------------
+
+# The sleep sources AC791 may use, from asm/power_interface.h. The set is the
+# vendor's own: apps/demo/demo_ble/include/app_config.h:24 and
+# apps/demo/demo_edr/include/app_config.h:47 ship exactly these four behind
+# CONFIG_LOW_POWER_ENABLE, and demo_ble registers no power callbacks, so the
+# mask is known to stand on its own. The commented-out value beside the demo
+# profile's zero names the same sources minus SYS_SLEEP_BY_IDLE.
+WL82_LOWPOWER_SEL = "SYS_SLEEP_EN|SYS_SLEEP_BY_IDLE|RF_SLEEP_EN|RF_FORCE_SYS_SLEEP_EN"
+
+# A sleep mask on its own does not put the station into power save: the shared
+# apps/common/net/wifi_conf.c picks the STA's 802.11 power mode from its own
+# macros, and with neither set it writes "PSMode=CAM" into the WLAN config it
+# hands the driver (wifi_conf.c:519-525 and :561-567). CAM is continuous awake.
+#
+# CONFIG_LOW_POWER_ENABLE is the switch the vendor uses for exactly this
+# combination. The AC791 power measurement that produced the reference figures
+# builds P1_LEGACY/P1_FAST as "mask 30 + CONFIG_LOW_POWER_ENABLE" (see
+# ac791_wifi_power_test, docs/AC791_烧录与iperf测试.md and its demo_wifi
+# app_config.h), and both modes are used there: CONFIG_LOW_POWER_ENABLE ->
+# WL_STA_SLEEP 2 -> Fast_PSP, CONFIG_WIFI_IDLE_RESUME_BASEBAND_ENABLE ->
+# WL_STA_SLEEP 1 -> Legacy_PSP.
+#
+# Fast PSP is the mode this platform selects, because it is the low-power
+# probe's own P1_FAST arm and the more aggressive of the two. The macro's
+# other consumers in the staged tree are inert here:
+#   apps/common/net/config_network.c:97,170 holds the RF awake across
+#     provisioning - the correct behaviour, since the driver would otherwise
+#     doze during netcfg;
+#   apps/common/audio_music/audio_config.c:30 only changes a mix buffer size
+#     inside CONFIG_AUDIO_MIX_ENABLE, which nothing in this build defines.
+WL82_STA_PS_MACRO = "CONFIG_LOW_POWER_ENABLE"
+# The STA power mode this configuration must compile to. wifi_conf.c derives it
+# as CONFIG_LOW_POWER_ENABLE -> 2, CONFIG_WIFI_IDLE_RESUME_BASEBAND_ENABLE -> 1,
+# else 0, and prints it as a PSMode= line.
+WL82_STA_PS_VALUE = 2  # Fast_PSP
+
+# AC792's equivalent, from lowpower_config_t in asm/power/power_api.h. Only the
+# plain sleep level is used: DEEP_SLEEP_EN powers the chip down and reboots on
+# wake, which is a different thing from anything TuyaOpen's power manager asks
+# for on this platform.
+#
+# It is written as the literal 1 rather than the enum name SLEEP_EN, and that
+# is load-bearing. The SDK compares this macro inside #if
+# (apps/common/net/wifi_conf.c:55 and :570, audio/log_config/lib_media_config.c
+# :57), where an identifier that is not a macro expands to 0 - so with the enum
+# name both sides of "TCFG_LOWPOWER_FUNCTION != LOWPOWER_CLOSE" read as 0 and
+# the low-power branches stay compiled out. A literal is the only spelling that
+# reaches both the struct initialiser and the preprocessor. The same reason
+# applies in reverse to the stock LOWPOWER_CLOSE, which is why
+# config_wifi_lowpower_enable is 0 in every shipped AC792 board.
+#
+# That comparison is also what selects the STA power mode here
+# (wifi_conf.c:565-575): the same evaluation yields WL_STA_SLEEP 1, i.e.
+# PSMode=Legacy_PSP. Without the literal the station would stay in CAM there
+# too, and the wifi_psmode_* listen-policy calls in the TKL would switch the
+# policy of a radio that never entered power save.
+WL83_LOWPOWER_FUNCTION = "1 /* SLEEP_EN */"
+# wl83 derives the STA mode from the same macro, through an integer only, so
+# the expected value is asserted rather than named a second time.
+WL83_STA_PS_VALUE = 1  # Legacy_PSP
+
+
+def _redefine_macro(config_file: Path, name: str, value: str) -> None:
+    """Rewrite an existing ``#define <name> ...`` in a staged header.
+
+    The low-power macros are already defined by the vendor profile, so this
+    replaces the definition instead of appending a second one: a later #define
+    would warn on redefinition and leave the earlier value in force for every
+    line above it. A missing macro is a hard error - it means the vendor
+    profile moved, and a silent no-op here would ship a build that claims to
+    have low power and does not.
+    """
+    if not config_file.is_file():
+        raise BuildError(f"Jieli config not found: {config_file}")
+    content = config_file.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^#define\s+{re.escape(name)}\s+.*$", re.MULTILINE)
+    updated, count = pattern.subn(f"#define {name} {value}", content, count=1)
+    if count == 0:
+        raise BuildError(f"Jieli config has no #define {name}: {config_file}")
+    config_file.write_text(updated, encoding="utf-8")
+
+
+def _define_macro(config_file: Path, name: str) -> None:
+    """Append ``#define <name>`` before the final ``#endif`` of a staged header.
+
+    Used for switches the vendor profile does not define at all. Idempotent:
+    a header that already carries the define is left alone.
+    """
+    _insert_before_final_endif(config_file, f"#define {name}\n", marker=f"#define {name}")
+
+
+# The vendor file that decides the station's power mode. Both SDKs put the same
+# three-way choice in their copy of apps/common/net/wifi_conf.c, which this
+# platform stages and compiles as part of the Wi-Fi feature.
+_WIFI_CONF_RELATIVE = "apps/common/net/wifi_conf.c"
+
+
+def _ps_mode_decision_block(wifi_conf: Path) -> str:
+    """Cut the vendor's PSMode selection out of wifi_conf.c.
+
+    The decision is a group of #if/#elif/#else branches that end in the value
+    of ``PSMode=``. Reproducing the branches here would be a second copy of
+    vendor logic that diverges the moment the SDK changes, so the block is
+    located by its surrounding markers and returned verbatim. A missing marker
+    is an error: it means the vendor moved the decision and the check must be
+    re-pointed rather than silently passing on nothing.
+    """
+    if not wifi_conf.is_file():
+        raise BuildError(f"Jieli Wi-Fi config not found: {wifi_conf}")
+    text = wifi_conf.read_text(encoding="utf-8", errors="replace")
+
+    marker = text.find("PSMode=")
+    if marker < 0:
+        raise BuildError(f"{wifi_conf} has no PSMode selection to check")
+
+    # The vendor splits the decision over two sibling blocks: one defines
+    # WL_STA_SLEEP from the mode switches, the next turns WL_STA_SLEEP into the
+    # PSMode= string. Both are needed - the second alone would report CAM for
+    # every configuration because WL_STA_SLEEP would be undefined.
+    markers = ("#define WL_STA_SLEEP", "PSMode=")
+    spans = []
+    for marker in markers:
+        offset = text.find(marker)
+        if offset < 0:
+            raise BuildError(f"{wifi_conf} has no {marker!r} selection to check")
+        span = _enclosing_directive_span(text, offset)
+        if span is None:
+            raise BuildError(f"{wifi_conf}: {marker!r} is not guarded by an #if")
+        spans.append(span)
+
+    start = min(begin for begin, _ in spans)
+    end = max(finish for _, finish in spans)
+    return text[start:end]
+
+
+def _enclosing_directive_span(text: str, offset: int) -> Optional[tuple[int, int]]:
+    """Return the outermost #if..#endif span that contains ``offset``."""
+    chosen = None
+    start = text.find("#if")
+    while start >= 0:
+        end = _directive_block_end(text, start)
+        if start < offset < end:
+            chosen = (start, end)
+        start = text.find("#if", start + 1)
+    return chosen
+
+
+def _directive_block_end(text: str, start: int) -> int:
+    """Return the offset just past the #endif that closes the #if at ``start``."""
+    depth = 0
+    end = start
+    for line in text[start:].splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("#if"):
+            depth += 1
+        elif stripped.startswith("#endif"):
+            depth -= 1
+            if depth == 0:
+                return end + len(line)
+        end += len(line)
+    raise BuildError("the PSMode= selection in wifi_conf.c is not closed")
+
+
+def _check_ps_mode(
+    config_file: Path,
+    wifi_conf: Path,
+    expected: int,
+    compiler: Optional[str] = None,
+    sdk_root: Optional[Path] = None,
+) -> None:
+    """Assert the STA power mode the staged profile actually compiles to.
+
+    The expected value is checked on preprocessor output, not on the text this
+    code just wrote: the staged profile is scanned first, then the vendor's own
+    PSMode branches are run against it. A macro that cannot reach the #if (the
+    AC792 enum case, where the comparison reads as 0 on both sides) fails here
+    instead of silently shipping CAM, and a future SDK that adds a fourth
+    branch is caught rather than assumed compatible.
+
+    ``config_file`` is the vendor profile the macros are defined in - the wl82
+    app_config.h or the wl83 board header - and it is deliberately scanned on
+    its own: the decision depends only on the macros it defines, so the check
+    stays valid even if the rest of the SDK include path changes.
+
+    ``expected`` is 0 (CAM), 1 (Legacy_PSP) or 2 (Fast_PSP).
+    """
+    mode_names = {0: "CAM", 1: "Legacy_PSP", 2: "Fast_PSP"}
+    if expected not in mode_names:
+        raise BuildError(f"unsupported expected STA power mode {expected}")
+
+    # The staged header is not self-contained, and the check has to reproduce
+    # the chain the real build uses or it evaluates a different program:
+    # board_demo.h is wrapped in #ifdef CONFIG_BOARD_DEMO, which board_config.h
+    # defines *before* including it. Including board_config.h instead of the
+    # header is what the real app_config.h does. Without it every macro in
+    # board_demo.h stays unexpanded and the comparison reads as "CAM".
+    include = config_file
+    if config_file.name == "board_demo.h":
+        chain = config_file.parent / "board_config.h"
+        if chain.is_file():
+            include = chain
+
+    source = f'#include "{include.as_posix()}"\n'
+    # The wl83 comparison names an enum constant, and an unknown identifier in
+    # #if is 0; wifi_conf.c includes the header that declares it, so the check
+    # includes the same one.
+    if sdk_root is not None:
+        power_api = sdk_root / "include_lib/driver/cpu/wl83/asm/power/power_api.h"
+        if power_api.is_file():
+            source += f'#include "{power_api.as_posix()}"\n'
+    source += _ps_mode_decision_block(wifi_conf)
+    compiler = compiler or os.environ.get("CC") or "clang"
+
+    try:
+        result = subprocess.run(
+            [compiler, "-E", "-P", "-x", "c", "-"],
+            input=source,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise BuildError(f"cannot run {compiler} to check the STA power mode: {error}")
+
+    if result.returncode != 0:
+        raise BuildError(
+            f"cannot check the STA power mode of {config_file}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+
+    # Exactly one literal survives the preprocessor; whichever it is, that is
+    # the PSMode the driver will be configured with.
+    found = re.findall(r"PSMode=([A-Za-z_]+)", result.stdout)
+    if len(set(found)) != 1:
+        raise BuildError(
+            f"{config_file} does not compile the station to a single power mode: {found}"
+        )
+
+    got_name = found[0]
+    want_name = mode_names[expected]
+    if got_name != want_name:
+        raise BuildError(
+            f"{config_file} compiles the station to PSMode={got_name}, but this "
+            f"build must use {want_name}; the switch that selects it is not "
+            f"reaching the #if in {_WIFI_CONF_RELATIVE}"
+        )
+
+
+def configure_lowpower(
+    chip_name: str,
+    app_config_file: Path,
+    board_header: Path,
+    wifi_conf: Optional[Path] = None,
+    compiler: Optional[str] = None,
+    sdk_root: Optional[Path] = None,
+) -> None:
+    """Open the chip's sleep path in the staged board profile.
+
+    Only called for builds that ask for TuyaOpen's power manager, so a build
+    without it keeps the vendor profile exactly as it ships. That is what makes
+    "the power component is off" mean "the firmware behaves as it did before".
+
+    Which file carries the macro is a chip-layout fact: the AC791 demo profile
+    keeps its TCFG_LOWPOWER_* block in app_config.h, the AC792 one in the board
+    header reached through app_config.h -> board_config.h -> board_demo.h.
+
+    Opening the sleep mask is only half of it. Both chips pick the station's
+    802.11 power mode from a separate compile-time switch in the shared
+    wifi_conf.c, and neither demo profile sets it, so the station would stay in
+    CAM: awake continuously, with the sleep mask applying only to moments the
+    radio is idle anyway. Both are written here, and the result is read back
+    out of the preprocessor.
+    """
+    if chip_name not in ("wl82", "wl83"):
+        raise BuildError(f"no Jieli low-power profile for chip '{chip_name}'")
+    if wifi_conf is None:
+        raise BuildError("the staged wifi_conf.c is required to check the STA power mode")
+
+    if chip_name == "wl82":
+        _redefine_macro(app_config_file, "TCFG_LOWPOWER_LOWPOWER_SEL", WL82_LOWPOWER_SEL)
+        _define_macro(app_config_file, WL82_STA_PS_MACRO)
+        _check_ps_mode(
+            app_config_file, wifi_conf, WL82_STA_PS_VALUE, compiler, sdk_root
+        )
+    elif chip_name == "wl83":
+        _redefine_macro(board_header, "TCFG_LOWPOWER_FUNCTION", WL83_LOWPOWER_FUNCTION)
+        _check_ps_mode(board_header, wifi_conf, WL83_STA_PS_VALUE, compiler, sdk_root)
+    else:
+        raise BuildError(f"no Jieli low-power profile for chip '{chip_name}'")
 
 
 def configure_usb_download_app_config(app_config_file: Path) -> None:

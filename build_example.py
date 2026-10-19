@@ -348,6 +348,9 @@ def build(param_dir: Path, params: dict[str, str]) -> Path:
         # the board catalog decide what gets staged.
         facts=facts,
         features=enabled_features(params, has_display=facts.display is not None),
+        # The staging step runs the chip toolchain's preprocessor to prove the
+        # profile it just wrote really selects the station's power mode.
+        tool_dir=tool_dir,
     )
     # The vendor Makefile builds serially at -j1, which leaves most cores idle
     # on the ~130 vendor objects every staging rebuild has to recompile. Default

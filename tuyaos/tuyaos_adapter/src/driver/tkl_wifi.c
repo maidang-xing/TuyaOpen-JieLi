@@ -1,5 +1,6 @@
 #include "tkl_wifi.h"
 #include "tkl_memory.h"
+#include "tkl_mutex.h"
 #include "tkl_system.h"
 #include "tkl_thread.h"
 #include "tkl_queue.h"
@@ -678,10 +679,123 @@ OPERATE_RET tkl_wifi_set_country_code(const COUNTRY_CODE_E ccode)
 
 OPERATE_RET tkl_wifi_set_rf_calibrated(void) { return OPRT_OK; }
 
+/*
+ * Wi-Fi station power save.
+ *
+ * tkl_wifi_set_lp_mode() is the hook tuya_pm/lpmgr use to let the radio doze
+ * between beacons, and examples/lowpower/wifi_ps calls it directly. The two
+ * SDKs offer different runtime controls, so the mapping is chip-specific:
+ *
+ *   WL82  low_power_hw_unsleep_lock()/_unlock(), declared in
+ *         asm/power_interface.h and defined in cpu/wl82/liba/cpu.a. This is
+ *         the SDK's own Wi-Fi sleep gate - apps/common/example/wifi/low_power/
+ *         main.c toggles exactly this pair, commented "调用这句话以后开始不允许
+ *         WIFI进入休眠" (no Wi-Fi sleep) and "开始允许WIFI进入休眠" (Wi-Fi sleep
+ *         allowed). The pair is counted inside the SDK, so it is only called on
+ *         a state change.
+ *
+ *   WL83  has no RF keep-awake symbol at all: the whole cpu/wl83/liba set was
+ *         searched with llvm-nm and no low_power_*unsleep* exists. Wi-Fi low
+ *         power is decided at build time by TCFG_LOWPOWER_FUNCTION, which
+ *         drives config_wifi_lowpower_enable in apps/common/net/wifi_conf.c.
+ *         What the SDK does expose at run time is the beacon listening policy,
+ *         defined in cpu/wl83/liba/wl_wifi_sta.a, so "awake" is expressed
+ *         there as the vendor's highest-priority policy: listen to every TIM
+ *         (every beacon) instead of only to DTIM.
+ *
+ * The listen-policy setters are not declared in any header - the WL82 ones are
+ * plain functions in apps/common/net/wifi_conf.c, which this platform stages
+ * and compiles (sdk_overlay.py injects it into the staged Makefile), and the
+ * WL83 ones are library symbols the vendor documents only in an API comment at
+ * sdk/apps/common/net/wifi_conf.c. Both sets are declared here from those two
+ * sources; neither signature is guessed.
+ *
+ * Power save is on or off; the DTIM value is not applied. TuyaOpen's dtim counts
+ * DTIM beacons; the SDK's other knob is the listen interval - how many beacon
+ * intervals the station tells the AP it may doze for. Those are different
+ * 802.11 dimensions (the AP chooses the DTIM period, the station chooses the
+ * listen interval), and no mapping between them is established by the SDK or by
+ * any vendor call site. dtim <= 1 therefore selects the SDK's default policy,
+ * waking for DTIM, which is exactly what it asks for.
+ *
+ * A larger dtim is refused with OPRT_NOT_SUPPORTED rather than swallowed. The
+ * power manager's schemes ask for 1 and 10, so answering OPRT_OK to both would
+ * tell it that ULP_ONLINE reached a deeper sleep than CEC_T20 when the two are
+ * running the same strategy - the software state would say the knob worked
+ * while the radio did the same thing. Raising the listen interval is left to a
+ * change that can measure it.
+ */
+#if defined(JIELI_SELECTED_CHIP_WL82)
+#include "asm/power_interface.h"
+
+extern void wl_enabled_listen_dtim(void);
+extern void wl_enabled_listen_each_tim(void);
+#elif defined(JIELI_SELECTED_CHIP_WL83)
+extern void wifi_psmode_enable_listen_dtim(void);
+extern void wl_enable_listen_each_tim(void);
+#else
+#error "Jieli Wi-Fi power save requires a selected chip"
+#endif
+
+/* The largest dtim this adapter applies: 1 means "wake on every DTIM". */
+#define JIELI_WIFI_LP_MAX_DTIM 1
+
+static TKL_MUTEX_HANDLE s_lp_mutex = NULL;
+#if defined(JIELI_SELECTED_CHIP_WL82)
+/* Whether this adapter is currently holding the SDK's Wi-Fi sleep gate. FALSE
+ * at boot, because the gate starts open: the first request to sleep has
+ * nothing to release, and releasing an unheld lock would drive the SDK's
+ * counter below zero. */
+static BOOL_T s_rf_awake_held = FALSE;
+#endif
+
 OPERATE_RET tkl_wifi_set_lp_mode(const BOOL_T enable, const uint8_t dtim)
 {
-    (void)enable;
-    (void)dtim;
+    OPERATE_RET rt;
+
+    /* Refused before any state is touched: a request this adapter cannot honour
+     * must not leave the radio in a mode the caller was told about. */
+    if (enable && dtim > JIELI_WIFI_LP_MAX_DTIM) {
+        return OPRT_NOT_SUPPORTED;
+    }
+
+    if (NULL == s_lp_mutex) {
+        rt = tkl_mutex_create_init(&s_lp_mutex);
+        if (OPRT_OK != rt) {
+            return rt;
+        }
+    }
+
+    tkl_mutex_lock(s_lp_mutex);
+
+#if defined(JIELI_SELECTED_CHIP_WL82)
+    if (enable) {
+        if (s_rf_awake_held) {
+            low_power_hw_unsleep_unlock();
+            s_rf_awake_held = FALSE;
+        }
+        /* Dozing from here on, and waking for DTIM is the policy the SDK
+         * starts from; set it explicitly so the state does not depend on what
+         * a previous caller left behind. */
+        wl_enabled_listen_dtim();
+    } else {
+        if (!s_rf_awake_held) {
+            low_power_hw_unsleep_lock();
+            s_rf_awake_held = TRUE;
+        }
+        /* The sleep gate above is what keeps the radio awake on WL82; the
+         * listening policy is left where the SDK has it. */
+    }
+#else
+    if (enable) {
+        wifi_psmode_enable_listen_dtim();
+    } else {
+        wl_enable_listen_each_tim();
+    }
+#endif
+
+    tkl_mutex_unlock(s_lp_mutex);
+
     return OPRT_OK;
 }
 

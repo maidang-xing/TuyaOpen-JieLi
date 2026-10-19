@@ -790,6 +790,7 @@ def create_staging_tree(
     # tkl_i2c.c compiles on both chips; its contract is likewise not under a
     # per-chip profile.
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/i2c \\\n"
+    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/pwm \\\n"
     if chip.name == "wl83":
         # tkl_gpio.c includes the shared GPIO contract from this domain. The
         # MIPI-DSI contract is not here: it ships with this platform under

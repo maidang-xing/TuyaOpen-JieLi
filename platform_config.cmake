@@ -70,6 +70,7 @@ list(APPEND PLATFORM_PUBINC
     "${TOP_SOURCE_DIR}/tools/porting/adapter/pinmux"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/i2c"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/pwm"
+    "${TOP_SOURCE_DIR}/tools/porting/adapter/spi"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/network"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/wifi"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/bluetooth"

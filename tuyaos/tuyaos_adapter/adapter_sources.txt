@@ -6,6 +6,7 @@ src/driver/tkl_gpio.c
 src/driver/tkl_pinmux.c
 src/driver/tkl_i2c.c
 src/driver/tkl_pwm.c
+src/driver/tkl_timer.c
 src/system/tkl_thread.c
 src/system/tkl_mutex.c
 src/system/tkl_semaphore.c

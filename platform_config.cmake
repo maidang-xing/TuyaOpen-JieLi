@@ -63,6 +63,11 @@ list(APPEND PLATFORM_PUBINC
     # header is unreachable is a claim the build cannot honour.
     "${TOP_SOURCE_DIR}/tools/porting/adapter/adc"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/gpio"
+    # pinmux is not a declared capability here (wl82 cannot back it, and a
+    # platform-level switch has no chip dimension), but the examples that do
+    # call tkl_io_pinmux_config - the i2c and uart ones - need the contract on
+    # the include path to compile at all.
+    "${TOP_SOURCE_DIR}/tools/porting/adapter/pinmux"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/network"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/wifi"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/bluetooth"

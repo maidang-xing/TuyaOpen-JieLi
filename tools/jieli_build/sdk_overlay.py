@@ -784,6 +784,9 @@ def create_staging_tree(
     # tkl_adc.h lives beside the other TKL domain headers, not under any
     # per-chip profile, so every chip's staged Makefile needs it.
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/adc \\\n"
+    # tkl_pinmux.c compiles for both chips - it refuses everything on wl82 -
+    # so its contract has to be on the include path either way.
+    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/pinmux \\\n"
     if chip.name == "wl83":
         # tkl_gpio.c includes the shared GPIO contract from this domain. The
         # MIPI-DSI contract is not here: it ships with this platform under

@@ -4,6 +4,8 @@
 #include "asm/cpu.h"
 #include "gpio.h"
 
+#include "jieli_pin.h"
+
 /* Peripheral pin muxing, as opposed to driving a pin as plain GPIO.
  *
  * Only wl83 has an API for this. Its gpio_function_t is a per-pin function
@@ -95,6 +97,14 @@ static int tkl_pinmux_lookup(TUYA_PIN_FUNC_E pin_func, gpio_function_t *fn)
 
 OPERATE_RET tkl_io_pinmux_config(TUYA_PIN_NAME_E pin, TUYA_PIN_FUNC_E pin_func)
 {
+    /* The upper bound alone is not enough: IO_MAX_NUM is derived from the last
+     * defined macro, so the range contains holes. wl83 has no PC14/PC15, no
+     * PF6..PF15 and no 98..111, and handing one of those to
+     * gpio_enable_function() would mean writing an io-map field for a pin that
+     * does not exist. */
+    if (!jieli_pin_exists((uint32_t)pin)) {
+        return OPRT_INVALID_PARM;
+    }
 #if defined(JIELI_SELECTED_CHIP_WL83)
     if (pin >= TKL_PINMUX_PIN_MAX) {
         return OPRT_INVALID_PARM;

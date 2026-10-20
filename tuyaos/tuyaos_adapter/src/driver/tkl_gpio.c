@@ -10,6 +10,11 @@
 #include "asm/cpu.h"
 #include "gpio.h"
 
+/* Maps "PA7"-style vendor names onto Tuya's flat numeric pin, and encodes which
+ * of those numbers actually exist on each chip. See the header for the SDK
+ * evidence behind the per-port widths. */
+#include "jieli_pin.h"
+
 /* The two chips reach the external interrupt through different drivers, and
  * neither is a thin wrapper over the other:
  *
@@ -76,7 +81,12 @@ static tkl_gpio_irq_ctx_t s_irq[TKL_GPIO_PIN_MAX];
 
 static int tkl_gpio_valid(TUYA_GPIO_NUM_E pin_id)
 {
-    return (pin_id < TUYA_GPIO_NUM_MAX) && (pin_id < TKL_GPIO_PIN_MAX);
+    /* Range alone is not enough: the chips do not populate every bit of every
+     * port. wl83's PORTC is 14 bits wide, so PC14/PC15 (46, 47) are not pins -
+     * without this check tkl_gpio_init() would report OPRT_OK for a pin that
+     * cannot work. */
+    return (pin_id < TUYA_GPIO_NUM_MAX) && (pin_id < TKL_GPIO_PIN_MAX) &&
+           jieli_pin_exists((uint32_t)pin_id);
 }
 
 /* Map a Tuya trigger mode onto the vendor's two-edge enum. Both chips spell the

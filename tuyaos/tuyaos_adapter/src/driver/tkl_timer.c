@@ -25,11 +25,18 @@ extern u32 local_timer_us_time(void);
  * Two things about it matter for the TKL contract and are stated rather than
  * glossed:
  *
- *   Context. sys_usec_timer_add takes call_in_irq explicitly. TAL's timer
- *   callback (e.g. the IR driver's) is written for an interrupt context, so it
- *   is registered with call_in_irq = 1. A caller whose callback blocks must not
- *   use this TKL on these parts; the flag is the vendor's own contract and is
- *   chosen here for the consumers that exist.
+ *   Context. sys_usec_timer_add takes call_in_irq explicitly and this backend
+ *   passes 0, so the callback runs in the SDK's timer task rather than in the
+ *   interrupt. That is deliberate:
+ *     - the in-tree consumers of tkl_timer (tdd_ir_driver_*) are written for
+ *       other SoCs and are not built for Jieli, so nothing here needs
+ *       interrupt latency;
+ *     - examples/peripherals/timer calls tkl_timer_stop() and
+ *       tkl_timer_deinit() from inside its callback, which would mean deleting
+ *       the running timer from its own ISR, and it also logs. Both are unsafe
+ *       in interrupt context.
+ *   The cost is that callback latency is a scheduler tick rather than the
+ *   interrupt latency, and it is the vendor's flag, not an accident.
  *
  *   Expiry vs capture. local_timer_us_time() reads a free-running counter, so
  *   tkl_timer_get() reports elapsed time since the timer was started, which is
@@ -147,7 +154,9 @@ OPERATE_RET tkl_timer_start(TUYA_TIMER_NUM_E timer_id, uint32_t us)
         return OPRT_OK;
     }
 
-    id = sys_usec_timer_add(ctx, jieli_timer_dispatch, us, 1u,
+    /* call_in_irq = 0: task context, so a callback may stop/deinit its own
+     * timer. See the file header. */
+    id = sys_usec_timer_add(ctx, jieli_timer_dispatch, us, 0u,
                             ctx->mode == TUYA_TIMER_MODE_ONCE ? 1u : 0u);
     if (id < 0) {
         return OPRT_RESOURCE_NOT_READY;

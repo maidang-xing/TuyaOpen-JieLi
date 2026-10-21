@@ -713,7 +713,10 @@ def create_staging_tree(
         platform_root / "tuyaos/tuyaos_adapter",
         source_overlay_root / "tuyaos_adapter",
     )
-    utilities_root = tuyaopen_root / "tools/porting/adapter/utilities"
+    # JIELI vendors the utilities module inside the adapter, so the staged
+    # vendor build copies this platform's own tree rather than the shared
+    # tools/porting one.
+    utilities_root = platform_root / "tuyaos" / "tuyaos_adapter" / "include" / "utilities"
     if utilities_root.is_dir():
         shutil.copytree(utilities_root, source_overlay_root / "tuya_utilities")
 
@@ -774,7 +777,7 @@ def create_staging_tree(
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/system \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/uart \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/init/include \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/utilities/include \\\n"
+    content += f"    -I{_make_path(platform_root)}/tuyaos/tuyaos_adapter/include/utilities/include \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/flash \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/network \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/wifi \\\n"

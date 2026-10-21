@@ -51,6 +51,10 @@
  * Note also that the ADC channel numbering is a DIFFERENT namespace and is not
  * derived from this one - AD_CH_PB01 is channel 3 while IO_PORTB_01 is pin 17.
  * tkl_adc.c takes vendor channel numbers directly.
+ *
+ * The Tuya contract reaches as far as TUYA_GPIO_NUM_MAX, which is 128: ports
+ * A..H on wl82 and, on wl83, A..F plus the sparse USB pairs. Pins above each
+ * chip's populated set are still refused by jieli_pin_exists() below.
  */
 
 #define JIELI_PORT_WIDTH 16u

@@ -52,7 +52,10 @@ list(APPEND PLATFORM_PUBINC
     "${TOP_SOURCE_DIR}/tools/porting/adapter/system"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/uart"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/init/include"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/utilities/include"
+    # JIELI vendors the utilities module - tuya_cloud_types.h and its siblings -
+    # inside the adapter, the way the T5AI / ESP32 / GD32 platforms do. The
+    # shared tools/porting tree stays untouched; see the note beside the copy.
+    "${JIELI_ADAPTER_PATH}/include/utilities/include"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/security"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/flash"
     # libtuyaos.a aggregates the components as objects, which drops the

@@ -50,13 +50,15 @@
  * occupies 0..15, B 16..31 and so on, and a Tuya pin index is the vendor pin
  * number directly. No lookup table is needed.
  *
- * The mapping only reaches as far as Tuya's enum does: TUYA_GPIO_NUM_MAX is 64,
- * so PORTE (64..79) and PORTF (80..95) cannot be addressed through this
- * contract. That includes PE11, which this board uses as the console RX. Those
- * ports stay reachable only from the vendor side; widening the contract is a
- * separate change and is not needed by the display path.
+ * TUYA_GPIO_NUM_MAX is 128, which reaches ports A..H on wl82 (0..127) and, on
+ * wl83, ports A..F plus the two sparse USB pairs. PE11 - this board's console
+ * RX - is pin 75 and is now addressable through the contract.
+ *
+ * Which of those numbers is a real pin is a per-chip question and is answered
+ * by jieli_pin_exists(): wl83's PORTC is 14 bits wide and PORTF 6, and wl82 has
+ * no port I register block at all. The bound here is only the contract's.
  */
-#define TKL_GPIO_PIN_MAX 64
+#define TKL_GPIO_PIN_MAX 128
 
 /* How many external interrupts this backend can hold at once.
  *

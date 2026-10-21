@@ -10,11 +10,6 @@
 #include "asm/cpu.h"
 #include "gpio.h"
 
-/* Maps "PA7"-style vendor names onto Tuya's flat numeric pin, and encodes which
- * of those numbers actually exist on each chip. See the header for the SDK
- * evidence behind the per-port widths. */
-#include "jieli_pin.h"
-
 /* The two chips reach the external interrupt through different drivers, and
  * neither is a thin wrapper over the other:
  *
@@ -80,6 +75,58 @@ typedef struct {
 } tkl_gpio_irq_ctx_t;
 
 static tkl_gpio_irq_ctx_t s_irq[TKL_GPIO_PIN_MAX];
+
+/* The vendor pin space is 16 pins per port letter; both chips use that width. */
+#define JIELI_PORT_WIDTH 16u
+
+/* Which of the Tuya pin numbers actually exist on this chip.
+ *
+ * The vendor names a pin IO_PORT<port>_<bit> and defines it arithmetically -
+ * IO_PORTA_07 is (16 * 0 + 7) - which is the same flat layout TUYA_GPIO_NUM_E
+ * uses, so the number needs no translation. What does need a table is the
+ * population, and it is not uniform (all from the chip's asm/gpio.h):
+ *
+ *   wl82  WL82.h defines JL_PORTA..JL_PORTH, 16 bits each. asm/gpio.h also
+ *         names IO_PORTI_00..15 and derives IO_MAX_NUM (144) from them, but no
+ *         JL_PORTI base exists, so port I is not offered.
+ *
+ *   wl83  PORTA/B/D/E are 0xffff, PORTC is 0x3fff and PORTF is 0x003f, so
+ *         PC14/PC15 and PF6..PF15 are not pins. The USB pairs are sparse at
+ *         96/97 and 112/113; R and V sit above IO_MAX_NUM.
+ *
+ * A port mask describes the GPIO controller's width, not whether a package
+ * bonds the pin out - electrical usability is still a schematic question.
+ *
+ * tkl_pinmux.c uses this too, through the extern declaration there, so the
+ * table has exactly one definition.
+ */
+int jieli_pin_exists(uint32_t pin)
+{
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    uint32_t port = pin / JIELI_PORT_WIDTH;
+    uint32_t bit = pin % JIELI_PORT_WIDTH;
+
+    switch (port) {
+    case 0: /* A */
+    case 1: /* B */
+    case 3: /* D */
+    case 4: /* E */
+        return 1;
+    case 2: /* C: PC0..PC13 */
+        return bit < 14u;
+    case 5: /* F: PF0..PF5 */
+        return bit < 6u;
+    case 6: /* FUSB: only DPA/DMA are defined */
+        return bit < 2u;
+    case 7: /* HUSB: only DPB/DMB are defined */
+        return bit < 2u;
+    default:
+        return 0;
+    }
+#else /* JIELI_SELECTED_CHIP_WL82 */
+    return pin < 128u;
+#endif
+}
 
 static int tkl_gpio_valid(TUYA_GPIO_NUM_E pin_id)
 {

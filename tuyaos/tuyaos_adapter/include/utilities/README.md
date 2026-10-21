@@ -31,8 +31,9 @@ unreachable through `tkl_gpio_*`.
 
 The matching platform-side bound is `TKL_GPIO_PIN_MAX` in
 `tuyaos_adapter/src/driver/tkl_gpio.c`; it must stay >= this enum's MAX.
-`jieli_pin.h` still refuses pins a given chip does not populate (wl83 has no
-PC14/PC15 and no PF6..PF15; wl82 has no port I register block).
+`jieli_pin_exists()` in that same file still refuses pins a given chip does not
+populate (wl83 has no PC14/PC15 and no PF6..PF15; wl82 has no port I register
+block), and `tkl_pinmux.c` declares it `extern` so the table has one definition.
 
 ## Refreshing from upstream
 

@@ -4,7 +4,10 @@
 #include "asm/cpu.h"
 #include "gpio.h"
 
-#include "jieli_pin.h"
+/* Defined in tkl_gpio.c. It is the single per-chip table of which Tuya pin
+ * numbers exist, and this file needs the same answer before handing a pin to
+ * gpio_enable_function(), so it is declared rather than duplicated. */
+extern int jieli_pin_exists(uint32_t pin);
 
 /* Peripheral pin muxing, as opposed to driving a pin as plain GPIO.
  *

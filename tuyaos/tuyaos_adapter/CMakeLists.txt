@@ -83,7 +83,9 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${TOP_SOURCE_DIR}/tools/porting/adapter/system
         ${TOP_SOURCE_DIR}/tools/porting/adapter/uart
         ${TOP_SOURCE_DIR}/tools/porting/adapter/init/include
-        ${TOP_SOURCE_DIR}/tools/porting/adapter/utilities/include
+        # Vendored utilities (tuya_cloud_types.h et al), not the shared
+        # tools/porting copy, so contract changes for JIELI stay in this repo.
+        ${CMAKE_CURRENT_LIST_DIR}/include/utilities/include
         ${TOP_SOURCE_DIR}/tools/porting/adapter/security
         ${TOP_SOURCE_DIR}/tools/porting/adapter/flash
         ${TOP_SOURCE_DIR}/tools/porting/adapter/adc
@@ -95,6 +97,10 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${TOP_SOURCE_DIR}/tools/porting/adapter/bluetooth
         ${TOP_SOURCE_DIR}/tools/porting/adapter/timer
         ${TOP_SOURCE_DIR}/tools/porting/adapter/gpio
+        ${TOP_SOURCE_DIR}/tools/porting/adapter/pinmux
+        ${TOP_SOURCE_DIR}/tools/porting/adapter/i2c
+        ${TOP_SOURCE_DIR}/tools/porting/adapter/pwm
+        ${TOP_SOURCE_DIR}/tools/porting/adapter/spi
         ${TOP_SOURCE_DIR}/src/common/include
         ${JIELI_SDK_ROOT}/include_lib
         ${JIELI_SDK_ROOT}/include_lib/btstack

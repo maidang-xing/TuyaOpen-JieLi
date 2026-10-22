@@ -24,6 +24,7 @@ TUYAOPEN_ROOT = PLATFORM_ROOT.parents[1]
 # declare.
 FULL_BOARD = {
     "CONFIG_BOARD_CHOICE": "Test_Board",
+    "CONFIG_CHIP_CHOICE": "wl83",
     "CONFIG_JIELI_BOARD_USB_ROLE": "host",
     "CONFIG_JIELI_BOARD_FLASH_MIB": "8",
     "CONFIG_JIELI_BOARD_SDRAM_MIB": "16",
@@ -146,6 +147,37 @@ class BoardFactsTest(unittest.TestCase):
     def test_a_display_must_name_its_pins(self):
         with self.assertRaisesRegex(BuildError, "DISPLAY_RESET_IO"):
             load_board_facts(config_with(DISPLAY_RESET_IO=None))
+
+    def test_a_pin_the_chip_does_not_have_is_rejected(self):
+        # wl83's PORTC is 14 bits wide (IO_PORTC_MASK 0x3fff in asm/gpio.h), so
+        # PC14/PC15 do not exist. Named as a board fact this would otherwise
+        # reach the staged C as an undefined macro, after the adapters linked.
+        with self.assertRaisesRegex(BuildError, "port C has 14 pins"):
+            load_board_facts(config_with(DISPLAY_RESET_IO="IO_PORTC_15"))
+
+    def test_the_last_real_pin_of_a_narrow_port_is_accepted(self):
+        facts = load_board_facts(config_with(DISPLAY_RESET_IO="IO_PORTC_13"))
+        self.assertEqual(facts.display.reset_io, "IO_PORTC_13")
+
+    def test_the_same_pin_is_fine_on_the_chip_that_has_it(self):
+        # wl82 declares A..I at 16 bits each, so PC15 exists there.
+        facts = load_board_facts(
+            config_with(**{"CONFIG_CHIP_CHOICE": "wl82"},
+                        DISPLAY_RESET_IO="IO_PORTC_15")
+        )
+        self.assertEqual(facts.display.reset_io, "IO_PORTC_15")
+
+    def test_a_port_the_chip_lacks_is_rejected(self):
+        with self.assertRaisesRegex(BuildError, "has no port I"):
+            load_board_facts(config_with(DISPLAY_RESET_IO="IO_PORTI_00"))
+
+    def test_a_pin_that_is_not_in_vendor_spelling_is_rejected(self):
+        with self.assertRaisesRegex(BuildError, "IO_PORT<port letter>_<pin number>"):
+            load_board_facts(config_with(DISPLAY_RESET_IO="PA7"))
+
+    def test_pins_cannot_be_checked_without_a_chip(self):
+        with self.assertRaisesRegex(BuildError, "CONFIG_CHIP_CHOICE"):
+            load_board_facts(config_with(**{"CONFIG_CHIP_CHOICE": None}))
 
     def test_an_unset_flag_means_the_feature_is_absent(self):
         # Kconfig omits a bool the board leaves at n, rather than writing

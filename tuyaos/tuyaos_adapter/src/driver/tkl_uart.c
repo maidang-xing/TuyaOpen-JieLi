@@ -1,5 +1,6 @@
 #include "tkl_uart.h"
 #include "tkl_semaphore.h"
+#include "tkl_system.h"
 #include "tkl_thread.h"
 #include "tuya_error_code.h"
 
@@ -30,9 +31,14 @@ enum jieli_uart_ioctl_cmd {
     JIELI_UART_IOCTL_SET_BAUDRATE,
     JIELI_UART_IOCTL_SET_IRQ_EVENT_CB,
     JIELI_UART_IOCTL_START,
+    JIELI_UART_IOCTL_GET_RECV_CNT,
 };
 
 static void *s_uart_handles[TKL_UART_PORT_MAX];
+
+/* Set while the receive task should keep running; shared by both chips because
+ * tkl_uart_deinit() clears it whichever backend is built. */
+static volatile uint8_t s_uart_rx_active[TKL_UART_PORT_MAX];
 
 #if defined(JIELI_SELECTED_CHIP_WL83)
 /* The vendor ISR must not call dev_read(): that path takes a mutex and the SDK
@@ -74,15 +80,65 @@ static void jieli_uart_rx_task(void *arg)
 {
     uint8_t port_id = (uint8_t)(uintptr_t)arg;
 
-    for (;;) {
+    while (s_uart_rx_active[port_id]) {
         if (tkl_semaphore_wait(s_uart_rx_sem[port_id], TKL_SEM_WAIT_FOREVER) != OPRT_OK) {
             continue;
+        }
+        if (!s_uart_rx_active[port_id]) {
+            break;
         }
         if (s_uart_rx_cb[port_id] != NULL) {
             s_uart_rx_cb[port_id]((TUYA_UART_NUM_E)port_id);
         }
     }
+    /* Allow a later init/registration to start a fresh task. */
+    s_uart_rx_thread[port_id] = NULL;
 }
+#else /* JIELI_SELECTED_CHIP_WL82 */
+/* wl82 has no receive interrupt-event callback, but TAL cannot receive without
+ * a notification.
+ *
+ * Its uart.h defines only the UART_SET_* ioctl set - UART_IRQ_EVENT_* belongs
+ * to the wl83 layout, and there is no "set irq event cb" on this part. The
+ * SDK's own receive consumer (apps/common/key/uart_key.c) therefore polls
+ * getbyte() from a 10 ms key scan rather than waiting on an interrupt.
+ *
+ * TAL cannot do that: its receive ring is filled only from the callback
+ * registered here, and tal_uart_read() blocks on a semaphore that only that
+ * callback posts. So this port needs a notifier of its own.
+ *
+ * The vendor driver still fills the circular buffer - it is handed over in
+ * tkl_uart_init and UART_START enables reception - so the missing piece is only
+ * "there is something to drain". UART_GET_RECV_CNT reports the count of bytes
+ * received and not yet taken, which is exactly that. Its argument convention is
+ * not obvious from the declaration (wl82 says _IOR(...,u32), wl83 says u32 *,
+ * and their ioctl numbers differ), but the SDK's own caller settles it - the
+ * awtk HAL does
+ *
+ *     dev_ioctl(fd, UART_GET_RECV_CNT, (u32)&len);
+ *
+ * so the count comes back through a pointer on wl82. This task polls it from
+ * TAL context rather than an ISR, so the TAL callback's mutex use is not a
+ * hazard here.
+ *
+ * Deliberately not used: UART_SET_RECV_TIMEOUT_CB. It looks like an idle-line
+ * interrupt, but no SDK consumer exercises it, so its call context is unknown,
+ * and calling a mutex-taking callback from an ISR is the exact failure the wl83
+ * path was written to avoid.
+ *
+ * Two honest consequences: latency is one poll period rather than the
+ * interrupt latency, and a burst that is emitted and fully consumed between
+ * two polls is missed. In this design TAL only drains from inside the
+ * callback, so data stays in the ring until the next poll.
+ */
+#define TKL_UART_RX_POLL_PERIOD_MS 10
+#define TKL_UART_RX_TASK_STACK     2048
+
+static TUYA_UART_IRQ_CB s_uart_rx_cb[TKL_UART_PORT_MAX];
+static TKL_THREAD_HANDLE s_uart_rx_thread[TKL_UART_PORT_MAX];
+
+/* jieli_uart_wl82_recv_cnt() and jieli_uart_poll_task() are defined after
+ * jieli_uart_ioctl(), which they call. */
 #endif
 
 static const char *jieli_uart_device_name(TUYA_UART_NUM_E port_id)
@@ -114,6 +170,8 @@ static uint32_t jieli_uart_ioctl(enum jieli_uart_ioctl_cmd cmd)
         return IOCTL_UART_SET_IRQ_EVENT_CB;
     case JIELI_UART_IOCTL_START:
         return IOCTL_UART_START;
+    case JIELI_UART_IOCTL_GET_RECV_CNT:
+        return IOCTL_UART_GET_RECV_CNT;
     default:
         return 0u;
     }
@@ -129,6 +187,8 @@ static uint32_t jieli_uart_ioctl(enum jieli_uart_ioctl_cmd cmd)
         return UART_SET_BAUDRATE;
     case JIELI_UART_IOCTL_START:
         return UART_START;
+    case JIELI_UART_IOCTL_GET_RECV_CNT:
+        return UART_GET_RECV_CNT;
     default:
         return 0u;
     }
@@ -136,6 +196,47 @@ static uint32_t jieli_uart_ioctl(enum jieli_uart_ioctl_cmd cmd)
 #error "Jieli UART mapping requires a selected chip"
 #endif
 }
+
+#if defined(JIELI_SELECTED_CHIP_WL82)
+static int jieli_uart_wl82_recv_cnt(TUYA_UART_NUM_E port_id, uint32_t *cnt)
+{
+    if (s_uart_handles[port_id] == NULL) {
+        return -1;
+    }
+    return dev_ioctl(s_uart_handles[port_id], jieli_uart_ioctl(JIELI_UART_IOCTL_GET_RECV_CNT),
+                     (u32)(uintptr_t)cnt);
+}
+
+static void jieli_uart_poll_task(void *arg)
+{
+    uint8_t port_id = (uint8_t)(uintptr_t)arg;
+    uint32_t last = 0;
+
+    while (s_uart_rx_active[port_id]) {
+        uint32_t cnt = 0;
+
+        if (jieli_uart_wl82_recv_cnt((TUYA_UART_NUM_E)port_id, &cnt) != 0) {
+            /* The query is not answering; leave the notifier idle rather than
+             * spin on it. */
+            (void)tkl_system_sleep(TKL_UART_RX_POLL_PERIOD_MS);
+            continue;
+        }
+        if (cnt != last && s_uart_rx_cb[port_id] != NULL) {
+            s_uart_rx_cb[port_id]((TUYA_UART_NUM_E)port_id);
+            /* TAL drained the ring in the callback; re-baseline instead of
+             * assuming it is empty. */
+            last = 0;
+            if (jieli_uart_wl82_recv_cnt((TUYA_UART_NUM_E)port_id, &last) != 0) {
+                last = 0;
+            }
+        } else {
+            last = cnt;
+        }
+        (void)tkl_system_sleep(TKL_UART_RX_POLL_PERIOD_MS);
+    }
+    s_uart_rx_thread[port_id] = NULL;
+}
+#endif
 
 OPERATE_RET tkl_uart_init(TUYA_UART_NUM_E port_id, TUYA_UART_BASE_CFG_T *cfg)
 {
@@ -179,6 +280,37 @@ OPERATE_RET tkl_uart_deinit(TUYA_UART_NUM_E port_id)
     if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX || s_uart_handles[port_id] == NULL) {
         return OPRT_INVALID_PARM;
     }
+
+    /* Stop the receive task before the handle goes away. Without this the wl83
+     * task waits forever on a semaphore the closed port can no longer post,
+     * and the wl82 poll task keeps waking every 10 ms against a NULL handle -
+     * a leaked thread in both cases, and a callback that could still fire into
+     * a caller that believes it has deinitialised. */
+    s_uart_rx_active[port_id] = 0;
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    /* The task is blocked in tkl_semaphore_wait(); post once so it wakes, sees
+     * the flag and exits. The vendor callback is cleared too, so no further
+     * posts arrive after close. */
+    if (s_uart_rx_sem[port_id] != NULL) {
+        (void)tkl_semaphore_post(s_uart_rx_sem[port_id]);
+    }
+    (void)dev_ioctl(s_uart_handles[port_id], jieli_uart_ioctl(JIELI_UART_IOCTL_SET_IRQ_EVENT_CB), 0u);
+#endif
+    s_uart_rx_cb[port_id] = NULL;
+
+    /* Wait (bounded) for the task to actually exit before the handle goes away.
+     * Without a join, a quick init+register inside the task's exit window sees
+     * a non-NULL thread handle, skips creating a new task, and leaves the port
+     * with a callback registered but no task to service it - received bytes are
+     * then silently dropped. The task clears its own handle on the way out. */
+    {
+        uint32_t spins = 0;
+        while (s_uart_rx_thread[port_id] != NULL && spins < 20u) {
+            (void)tkl_system_sleep(5);
+            spins++;
+        }
+    }
+
     dev_close(s_uart_handles[port_id]);
     s_uart_handles[port_id] = NULL;
     return OPRT_OK;
@@ -208,19 +340,43 @@ void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
     if (rx_cb == NULL || s_uart_handles[port_id] == NULL) {
         return;
     }
+    /* Publish "should run" before anything else: if a previous task is still
+     * exiting, it re-reads this flag and keeps running rather than leaving the
+     * port with no consumer. */
+    s_uart_rx_active[port_id] = 1;
     if (s_uart_rx_sem[port_id] == NULL &&
         tkl_semaphore_create_init(&s_uart_rx_sem[port_id], 0u, 1u) != OPRT_OK) {
         s_uart_rx_sem[port_id] = NULL;
+        s_uart_rx_active[port_id] = 0;
         return;
     }
     if (s_uart_rx_thread[port_id] == NULL) {
-        (void)tkl_thread_create(&s_uart_rx_thread[port_id], "tuya_uart_rx", TKL_UART_RX_TASK_STACK, 3u,
-                                jieli_uart_rx_task, (void *)(uintptr_t)port_id);
+        if (tkl_thread_create(&s_uart_rx_thread[port_id], "tuya_uart_rx", TKL_UART_RX_TASK_STACK, 3u,
+                              jieli_uart_rx_task, (void *)(uintptr_t)port_id) != OPRT_OK) {
+            s_uart_rx_active[port_id] = 0;
+            s_uart_rx_thread[port_id] = NULL;
+            return;
+        }
     }
     (void)dev_ioctl(s_uart_handles[port_id], jieli_uart_ioctl(JIELI_UART_IOCTL_SET_IRQ_EVENT_CB),
                     (u32)(uintptr_t)s_uart_irq_event_cb[port_id]);
 #else
-    (void)rx_cb;
+    s_uart_rx_cb[port_id] = rx_cb;
+    if (rx_cb == NULL || s_uart_handles[port_id] == NULL) {
+        return;
+    }
+    if (s_uart_rx_thread[port_id] == NULL) {
+        s_uart_rx_active[port_id] = 1;
+        if (tkl_thread_create(&s_uart_rx_thread[port_id], "tuya_uart_rx", TKL_UART_RX_TASK_STACK, 4u,
+                              jieli_uart_poll_task, (void *)(uintptr_t)port_id) != OPRT_OK) {
+            s_uart_rx_active[port_id] = 0;
+            s_uart_rx_thread[port_id] = NULL;
+        }
+    } else {
+        /* A previous task is still winding down; keep it alive rather than
+         * leaving the port with a callback and no poller. */
+        s_uart_rx_active[port_id] = 1;
+    }
 #endif
 }
 

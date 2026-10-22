@@ -27,6 +27,9 @@
 #endif
 
 static uint16_t s_active_channel_mask;
+/* How many tkl_adc_init() calls are outstanding on the single supported port.
+ * See tkl_adc_deinit() for why the mask cannot simply be cleared. */
+static uint8_t s_active_users;
 
 static uint8_t jieli_adc_channel_count(uint16_t mask)
 {
@@ -114,6 +117,9 @@ OPERATE_RET tkl_adc_init(TUYA_ADC_NUM_E port_num, TUYA_ADC_BASE_CFG_T *cfg)
     }
 
     s_active_channel_mask |= requested_mask;
+    if (s_active_users < 0xFFU) {
+        s_active_users++;
+    }
     return OPRT_OK;
 }
 
@@ -123,8 +129,24 @@ OPERATE_RET tkl_adc_deinit(TUYA_ADC_NUM_E port_num)
         return OPRT_NOT_SUPPORTED;
     }
 
-    /* Do not remove vendor channels: the process-global queue can be shared. */
-    s_active_channel_mask = 0U;
+    /* Do not remove vendor channels: the process-global queue can be shared.
+     *
+     * The channel mask is shared too, and the TKL contract's deinit is
+     * port-granular while init may be per-channel - tdd_adc_button registers
+     * one channel for the K1 ladder from board_register_hardware(), and the
+     * joystick, printer and power drivers each register their own. Clearing the
+     * mask on the first deinit would make every later read from the surviving
+     * consumer fail OPRT_INVALID_PARM, which is how the K1 button would go
+     * quietly dead.
+     *
+     * So the mask is reference-counted: it is released only when the last
+     * active user of this port deinitialises. */
+    if (s_active_users > 0U) {
+        s_active_users--;
+    }
+    if (s_active_users == 0U) {
+        s_active_channel_mask = 0U;
+    }
     return OPRT_OK;
 }
 

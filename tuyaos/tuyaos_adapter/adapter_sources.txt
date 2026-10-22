@@ -3,6 +3,11 @@ src/system/tkl_system.c
 src/driver/tkl_uart.c
 src/driver/tkl_mipi_dsi.c
 src/driver/tkl_gpio.c
+src/driver/tkl_pinmux.c
+src/driver/tkl_i2c.c
+src/driver/tkl_pwm.c
+src/driver/tkl_timer.c
+src/driver/tkl_spi.c
 src/system/tkl_thread.c
 src/system/tkl_mutex.c
 src/system/tkl_semaphore.c

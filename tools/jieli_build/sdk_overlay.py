@@ -731,7 +731,10 @@ def create_staging_tree(
         platform_root / "tuyaos/tuyaos_adapter",
         source_overlay_root / "tuyaos_adapter",
     )
-    utilities_root = tuyaopen_root / "tools/porting/adapter/utilities"
+    # JIELI vendors the utilities module inside the adapter, so the staged
+    # vendor build copies this platform's own tree rather than the shared
+    # tools/porting one.
+    utilities_root = platform_root / "tuyaos" / "tuyaos_adapter" / "include" / "utilities"
     if utilities_root.is_dir():
         shutil.copytree(utilities_root, source_overlay_root / "tuya_utilities")
 
@@ -792,7 +795,7 @@ def create_staging_tree(
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/system \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/uart \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/init/include \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/utilities/include \\\n"
+    content += f"    -I{_make_path(platform_root)}/tuyaos/tuyaos_adapter/include/utilities/include \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/flash \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/network \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/wifi \\\n"
@@ -802,6 +805,14 @@ def create_staging_tree(
     # tkl_adc.h lives beside the other TKL domain headers, not under any
     # per-chip profile, so every chip's staged Makefile needs it.
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/adc \\\n"
+    # tkl_pinmux.c compiles for both chips - it refuses everything on wl82 -
+    # so its contract has to be on the include path either way.
+    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/pinmux \\\n"
+    # tkl_i2c.c compiles on both chips; its contract is likewise not under a
+    # per-chip profile.
+    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/i2c \\\n"
+    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/pwm \\\n"
+    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/spi \\\n"
     if chip.name == "wl83":
         # tkl_gpio.c includes the shared GPIO contract from this domain. The
         # MIPI-DSI contract is not here: it ships with this platform under

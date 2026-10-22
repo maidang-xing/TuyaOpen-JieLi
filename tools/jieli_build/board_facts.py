@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from typing import Mapping, Optional
 
@@ -47,6 +48,51 @@ USB_DEVICE_MACROS = {
 PANELS = {
     "MIPI_480x800_ST7701S": ("TCFG_LCD_MIPI_ST7701S_480x800", "MIPI_480x800_ST7701S"),
 }
+
+# A board names pins the way the vendor headers spell them, IO_PORT<L>_<NN>.
+# That spelling is also a number - IO_PORTA_07 is (16 * 0 + 7) - which is the
+# same flat pin index TUYA_GPIO_NUM_E uses, so no translation is needed. What
+# does need checking is whether the pin exists, because the chips do not
+# populate every bit of every port. Widths come from each chip's
+# asm/gpio.h masks: wl83 PORTC is 0x3fff and PORTF is 0x003f, while wl82
+# declares A..I at 16 bits each.
+_PIN_RE = re.compile(r"^IO_PORT([A-Z])_(\d{1,2})$")
+_CHIP_PORT_WIDTHS = {
+    # WL82.h defines JL_PORTA..JL_PORTH. asm/gpio.h also names IO_PORTI_00..15,
+    # but there is no JL_PORTI register block, so port I is not offered.
+    "wl82": {"A": 16, "B": 16, "C": 16, "D": 16, "E": 16, "F": 16, "G": 16, "H": 16},
+    "wl83": {"A": 16, "B": 16, "C": 14, "D": 16, "E": 16, "F": 6},
+}
+
+
+def _check_pin(text: str, chip: str, symbol: str) -> str:
+    """Reject a pin string the selected chip does not have.
+
+    The generated C would eventually fail to compile on an undefined vendor
+    macro, but that lands after the adapters link and says nothing about which
+    board fact was wrong. This reports it while the config is being read.
+    """
+    match = _PIN_RE.match(text)
+    if match is None:
+        raise BuildError(
+            f"{_symbol(symbol)} is {text!r}; expected the vendor spelling "
+            "IO_PORT<port letter>_<pin number>, for example IO_PORTA_05"
+        )
+    port, bit = match.group(1), int(match.group(2))
+    widths = _CHIP_PORT_WIDTHS.get(chip)
+    if widths is None:
+        raise BuildError(
+            f"{_symbol(symbol)} is {text!r}, but the chip is {chip!r}; "
+            "expected wl82 or wl83"
+        )
+    width = widths.get(port)
+    if width is None or bit >= width:
+        if width is None:
+            detail = f"{chip} has no port {port}"
+        else:
+            detail = f"{chip} port {port} has {width} pins, so bit {bit} does not exist"
+        raise BuildError(f"{_symbol(symbol)} is {text!r}: {detail}")
+    return text
 
 
 @dataclass(frozen=True)
@@ -214,6 +260,18 @@ def _parse_usb_device(params: Mapping[str, str]) -> str:
     return macro
 
 
+def _validate_pins(facts: "BoardFacts", chip: str) -> None:
+    """Check every pin the board declares against the selected chip's ports."""
+    if facts.log_uart.tx_pin is not None:
+        _check_pin(facts.log_uart.tx_pin, chip, "LOG_UART_TX_PIN")
+    if facts.service_uart is not None:
+        _check_pin(facts.service_uart.tx_pin, chip, "SERVICE_UART_TX_PIN")
+        _check_pin(facts.service_uart.rx_pin, chip, "SERVICE_UART_RX_PIN")
+    if facts.display is not None:
+        _check_pin(facts.display.reset_io, chip, "DISPLAY_RESET_IO")
+        _check_pin(facts.display.backlight_io, chip, "DISPLAY_BACKLIGHT_IO")
+
+
 def load_board_facts(params: Mapping[str, str]) -> BoardFacts:
     """Read the selected board's facts out of the evaluated config.
 
@@ -225,7 +283,10 @@ def load_board_facts(params: Mapping[str, str]) -> BoardFacts:
     board = params.get("CONFIG_BOARD_CHOICE", "").strip()
     if not board:
         raise BuildError("CONFIG_BOARD_CHOICE is missing, so no board facts apply")
-    return BoardFacts(
+    chip = params.get("CONFIG_CHIP_CHOICE", "").strip()
+    if not chip:
+        raise BuildError("CONFIG_CHIP_CHOICE is missing, so the board's pins cannot be validated")
+    facts = BoardFacts(
         board=board,
         usb_device=_parse_usb_device(params),
         memory=_parse_memory(params),
@@ -233,3 +294,5 @@ def load_board_facts(params: Mapping[str, str]) -> BoardFacts:
         service_uart=_parse_service_uart(params),
         display=_parse_display(params),
     )
+    _validate_pins(facts, chip)
+    return facts

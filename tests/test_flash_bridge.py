@@ -72,17 +72,16 @@ class StagingToolsDirTest(unittest.TestCase):
                 self.assertIsNotNone(resolved)
                 self.assertEqual(resolved[1], tools)
 
-                if os.name == "nt":
-                    with tempfile.TemporaryDirectory() as other:
-                        copy = Path(other) / "app.bin"
-                        copy.write_bytes(b"\0")
-                        command = _default_flash_command(copy, chip, origin=image)
-                        self.assertIsNotNone(command)
-                        argv, working_dir = command
-                        self.assertEqual(working_dir, tools)
-                        self.assertIn(str(copy), argv)
-                        self.assertIn(str(tools / "isd_config.ini"), argv)
-                        self.assertIn(chip, argv)
+                with tempfile.TemporaryDirectory() as other:
+                    copy = Path(other) / "app.bin"
+                    copy.write_bytes(b"\0")
+                    command = _default_flash_command(copy, chip, origin=image)
+                    self.assertIsNotNone(command)
+                    argv, working_dir = command
+                    self.assertEqual(working_dir, tools)
+                    self.assertIn(str(copy), argv)
+                    self.assertIn(str(tools / "isd_config.ini"), argv)
+                    self.assertIn(chip, argv)
 
 
     def test_a_custom_build_dir_does_not_borrow_the_default_staging(self):

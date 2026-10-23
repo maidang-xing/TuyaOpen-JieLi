@@ -178,13 +178,15 @@ def create_parser() -> argparse.ArgumentParser:
 def select_transport(args: argparse.Namespace) -> JLTransport:
     """Select and instantiate transport based on mode and availability."""
     mode = args.mode
+    wait_val = getattr(args, "wait", 30)
+    wait_sec = float(wait_val) if wait_val <= 60 else (float(wait_val) / 10.0)
 
     if mode == "auto":
         # Check if USB device is detected
         usb_devices = JLUsbScsiTransport.find_devices()
         if usb_devices:
             logger.info(f"Auto-selected USB mode ({len(usb_devices)} JieLi USB device(s) found).")
-            return JLUsbScsiTransport()
+            return JLUsbScsiTransport(wait_seconds=wait_sec)
         elif args.port:
             logger.info(f"Auto-selected Serial mode on port {args.port}.")
             return JLSerialTransport(
@@ -194,9 +196,9 @@ def select_transport(args: argparse.Namespace) -> JLTransport:
             )
         else:
             # Default to USB transport (it will probe on connect)
-            return JLUsbScsiTransport()
+            return JLUsbScsiTransport(wait_seconds=wait_sec)
     elif mode == "usb":
-        return JLUsbScsiTransport()
+        return JLUsbScsiTransport(wait_seconds=wait_sec)
     elif mode == "serial":
         if not args.port:
             raise ValueError("Serial port (-p/--port) must be specified when mode is serial.")

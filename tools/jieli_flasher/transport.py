@@ -468,3 +468,209 @@ class JLSerialTransport(JLTransport):
             return data_in
         finally:
             self.ser.timeout = old_timeout
+
+
+class JLSgIoTransport(JLTransport):
+    """Linux SCSI Generic (SG_IO) Transport for JieLi USB Mass Storage devices.
+
+    Communicates directly with /dev/sg* using the Linux kernel SG_IO ioctl.
+    Bypasses pyusb/libusb detach contention with kernel usb-storage.
+    """
+
+    def __init__(self, dev_path: Optional[str] = None, wait_seconds: float = 30.0):
+        self.dev_path = dev_path
+        self.wait_seconds = wait_seconds
+        self.fd: Optional[int] = None
+        self.device_info: dict = {}
+
+    @classmethod
+    def find_devices(cls) -> list[dict]:
+        """Scan /dev/sg* device nodes for JieLi devices."""
+        if not sys.platform.startswith("linux"):
+            return []
+
+        import glob
+        devices = []
+        sg_nodes = sorted(glob.glob("/dev/sg*"))
+
+        for node in sg_nodes:
+            try:
+                fd = os.open(node, os.O_RDWR | os.O_NONBLOCK)
+            except Exception:
+                continue
+
+            try:
+                cdb = bytes([0x12, 0, 0, 0, 36, 0])
+                resp = cls._sg_io_transfer(fd, cdb, data_in_len=36, timeout_ms=1000)
+                if len(resp) >= 36:
+                    vendor = resp[8:16].decode("latin1", errors="replace").strip()
+                    product = resp[16:32].decode("latin1", errors="replace").strip()
+                    revision = resp[32:36].decode("latin1", errors="replace").strip()
+                    ident = f"{vendor} {product}".upper()
+
+                    if any(k in ident for k in ("JIELI", "UBOOT", "WL80", "WL82", "WL83", "AC79", "LOADER", "BR21", "BR23")):
+                        devices.append({
+                            "path": node,
+                            "vendor": vendor,
+                            "product": product,
+                            "revision": revision,
+                            "is_uboot": "UBOOT" in product.upper(),
+                        })
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+
+        return devices
+
+    @staticmethod
+    def _sg_io_transfer(
+        fd: int,
+        cdb: bytes,
+        data_out: Optional[bytes] = None,
+        data_in_len: int = 0,
+        timeout_ms: int = 5000,
+    ) -> bytes:
+        import ctypes
+        import fcntl
+
+        SG_IO = 0x2285
+        SG_DXFER_NONE = -1
+        SG_DXFER_TO_DEV = -2
+        SG_DXFER_FROM_DEV = -3
+
+        class SgIoHdr(ctypes.Structure):
+            _fields_ = [
+                ("interface_id", ctypes.c_int),
+                ("dxfer_direction", ctypes.c_int),
+                ("cmd_len", ctypes.c_ubyte),
+                ("mx_sb_len", ctypes.c_ubyte),
+                ("iovec_count", ctypes.c_short),
+                ("dxfer_len", ctypes.c_uint),
+                ("dxferp", ctypes.c_void_p),
+                ("cmdp", ctypes.c_void_p),
+                ("sbp", ctypes.c_void_p),
+                ("timeout", ctypes.c_uint),
+                ("flags", ctypes.c_uint),
+                ("pack_id", ctypes.c_int),
+                ("usr_ptr", ctypes.c_void_p),
+                ("status", ctypes.c_ubyte),
+                ("masked_status", ctypes.c_ubyte),
+                ("msg_status", ctypes.c_ubyte),
+                ("sb_len_wr", ctypes.c_ubyte),
+                ("host_status", ctypes.c_ushort),
+                ("driver_status", ctypes.c_ushort),
+                ("resid", ctypes.c_int),
+                ("duration", ctypes.c_uint),
+                ("info", ctypes.c_uint),
+            ]
+
+        cdb_buf = ctypes.create_string_buffer(cdb)
+        sb_buf = ctypes.create_string_buffer(32)
+
+        hdr = SgIoHdr()
+        hdr.interface_id = ord("S")
+        hdr.cmd_len = len(cdb)
+        hdr.cmdp = ctypes.cast(cdb_buf, ctypes.c_void_p).value
+        hdr.mx_sb_len = ctypes.sizeof(sb_buf)
+        hdr.sbp = ctypes.cast(sb_buf, ctypes.c_void_p).value
+        hdr.timeout = timeout_ms
+
+        data_buf = None
+        if data_out and len(data_out) > 0:
+            hdr.dxfer_direction = SG_DXFER_TO_DEV
+            hdr.dxfer_len = len(data_out)
+            data_buf = ctypes.create_string_buffer(bytes(data_out))
+            hdr.dxferp = ctypes.cast(data_buf, ctypes.c_void_p).value
+        elif data_in_len > 0:
+            hdr.dxfer_direction = SG_DXFER_FROM_DEV
+            hdr.dxfer_len = data_in_len
+            data_buf = ctypes.create_string_buffer(data_in_len)
+            hdr.dxferp = ctypes.cast(data_buf, ctypes.c_void_p).value
+        else:
+            hdr.dxfer_direction = SG_DXFER_NONE
+            hdr.dxfer_len = 0
+            hdr.dxferp = None
+
+        fcntl.ioctl(fd, SG_IO, hdr)
+        if hdr.status != 0 or hdr.host_status != 0:
+            raise TransportError(
+                f"SCSI transfer failed: status=0x{hdr.status:02X}, host_status=0x{hdr.host_status:04X}"
+            )
+
+        if data_in_len > 0 and data_buf is not None:
+            return bytes(data_buf.raw[:data_in_len])
+        return b""
+
+    def connect(self) -> None:
+        start_time = time.time()
+        printed_wait = False
+
+        while True:
+            candidates = self.find_devices()
+            if self.dev_path:
+                matches = [d for d in candidates if d["path"] == self.dev_path]
+                if matches:
+                    self.device_info = matches[0]
+                    break
+            elif candidates:
+                self.device_info = candidates[0]
+                self.dev_path = self.device_info["path"]
+                break
+
+            if time.time() - start_time >= self.wait_seconds:
+                break
+
+            if not printed_wait:
+                logger.info("Waiting for JieLi USB device in download mode (hold UPDATE and press RST)...")
+                printed_wait = True
+
+            time.sleep(0.2)
+
+        if not self.dev_path or not self.device_info:
+            raise TransportError(
+                "No JieLi USB device found within timeout. Ensure device is in download mode (hold UPDATE and press RST)."
+            )
+
+        logger.info(
+            f"Found JieLi USB storage node: {self.dev_path} "
+            f"({self.device_info.get('vendor')} {self.device_info.get('product')})"
+        )
+        self.fd = os.open(self.dev_path, os.O_RDWR)
+
+    def close(self) -> None:
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            self.fd = None
+
+    def send_cmd(
+        self,
+        cdb: bytes,
+        data_out: Optional[bytes] = None,
+        data_in_len: int = 0,
+        timeout_ms: int = 5000,
+    ) -> bytes:
+        if self.fd is None:
+            raise TransportError("SCSI transport not connected.")
+        return self._sg_io_transfer(
+            self.fd,
+            cdb,
+            data_out=data_out,
+            data_in_len=data_in_len,
+            timeout_ms=timeout_ms,
+        )
+
+    def inquiry(self) -> tuple[str, str, str]:
+        cdb = bytes([0x12, 0, 0, 0, 36, 0])
+        resp = self.send_cmd(cdb, data_in_len=36)
+        vendor = resp[8:16].decode("latin1", errors="replace").strip()
+        product = resp[16:32].decode("latin1", errors="replace").strip()
+        revision = resp[32:36].decode("latin1", errors="replace").strip()
+        return vendor, product, revision
+

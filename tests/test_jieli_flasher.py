@@ -9,7 +9,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from jieli_flasher.crypto import cd03_cipher, crc8_maxim, crc16_ccitt, scsi_xor_cipher
+from jieli_flasher.crypto import (
+    cd03_cipher,
+    crc8_maxim,
+    crc16_ccitt,
+    jl_crc_cipher,
+    jl_enc_cipher,
+    jl_sfc_cipher,
+    scsi_xor_cipher,
+)
+from jieli_flasher.flasher import JLFlasher
 from jieli_flasher.firmware import (
     SdfileEntry,
     build_flash_head_v2,
@@ -74,6 +83,22 @@ class TestJieLiCrypto(unittest.TestCase):
         dec = scsi_xor_cipher(bytearray(enc), key)
         self.assertEqual(plain, dec)
 
+    def test_jl_crc_cipher_symmetry(self):
+        plain = bytearray(b"TestMengLiCipherPayload" * 10)
+        copy_data = bytearray(plain)
+        jl_crc_cipher(copy_data, 0, len(copy_data))
+        self.assertNotEqual(plain, copy_data)
+        jl_crc_cipher(copy_data, 0, len(copy_data))
+        self.assertEqual(plain, copy_data)
+
+    def test_jl_sfc_cipher_symmetry(self):
+        plain = bytearray(b"TestSfcCipherPayloadDataBlock123456" * 8)
+        copy_data = bytearray(plain)
+        jl_sfc_cipher(copy_data, 0, len(copy_data), base=0x4000)
+        self.assertNotEqual(plain, copy_data)
+        jl_sfc_cipher(copy_data, 0, len(copy_data), base=0x4000)
+        self.assertEqual(plain, copy_data)
+
 
 class TestJieLiProtocol(unittest.TestCase):
     def test_build_cdb_erase_sector(self):
@@ -111,6 +136,23 @@ class TestJieLiProtocol(unittest.TestCase):
         self.assertEqual(res_tag, 0x12345678)
         self.assertEqual(residue, 0)
         self.assertEqual(status, CSW_STATUS_PASSED)
+
+    def test_build_cdb_16bit_with_padding(self):
+        # 16-bit opcode 0xFB01 with 0xFF padding
+        cdb = build_cdb(0xFB01, addr=0x4000, pad=0xFF)
+        self.assertEqual(len(cdb), 16)
+        self.assertEqual(cdb[0], 0xFB)
+        self.assertEqual(cdb[1], 0x01)
+        self.assertEqual(cdb[2:6], b"\x00\x00\x40\x00")
+
+    def test_locate_loader_binaries(self):
+        flasher = JLFlasher(None)
+        p82 = flasher._locate_loader("wl82loader.bin")
+        p83 = flasher._locate_loader("wl83loader.bin")
+        self.assertIsNotNone(p82)
+        self.assertTrue(p82.is_file())
+        self.assertIsNotNone(p83)
+        self.assertTrue(p83.is_file())
 
 
 class TestJieLiFirmware(unittest.TestCase):

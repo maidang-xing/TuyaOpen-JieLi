@@ -250,7 +250,7 @@ class LowPowerTest(unittest.TestCase):
             header = self._staged(temp_dir, "board_demo.h", header_text)
             wifi_conf = self._staged(temp_dir, "wifi_conf.c", wifi_conf_text)
             configure_lowpower(chip, app_config, header, wifi_conf=wifi_conf,
-                               compiler=shutil.which("clang"))
+                               compiler=shutil.which("clang") or shutil.which("gcc"))
             return (
                 app_config.read_text(encoding="utf-8"),
                 header.read_text(encoding="utf-8"),
@@ -320,7 +320,7 @@ class LowPowerTest(unittest.TestCase):
 
             with self.assertRaisesRegex(BuildError, "PSMode=CAM.*Legacy_PSP"):
                 _check_ps_mode(header, wifi_conf, WL83_STA_PS_VALUE,
-                               compiler=shutil.which("clang"))
+                               compiler=shutil.which("clang") or shutil.which("gcc"))
 
     def test_a_missing_wifi_conf_is_a_build_error(self):
         with tempfile.TemporaryDirectory() as temp_dir:

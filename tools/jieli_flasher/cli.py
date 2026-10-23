@@ -8,8 +8,8 @@ import sys
 import time
 from pathlib import Path
 
-from .flasher import JLFlasher
-from .transport import JLSerialTransport, JLTransport, JLUsbScsiTransport
+from .flasher import JLFlasher, print_progress
+from .transport import JLSgIoTransport, JLSerialTransport, JLTransport, JLUsbScsiTransport
 
 logger = logging.getLogger("jieli_flasher")
 
@@ -191,25 +191,7 @@ def select_transport(args: argparse.Namespace) -> JLTransport:
         wait_val = getattr(args, "wait", 30)
         wait_sec = float(wait_val) if wait_val <= 60 else (float(wait_val) / 10.0)
 
-    if mode == "auto":
-        # Check if USB device is detected
-        usb_devices = JLUsbScsiTransport.find_devices()
-        if usb_devices:
-            logger.info(f"Auto-selected USB mode ({len(usb_devices)} JieLi USB device(s) found).")
-            return JLUsbScsiTransport(wait_seconds=wait_sec)
-        elif args.port:
-            logger.info(f"Auto-selected Serial mode on port {args.port}.")
-            return JLSerialTransport(
-                port=args.port,
-                baudrate=args.baud,
-                init_baudrate=args.init_baud,
-            )
-        else:
-            # Default to USB transport (it will probe on connect)
-            return JLUsbScsiTransport(wait_seconds=wait_sec)
-    elif mode == "usb":
-        return JLUsbScsiTransport(wait_seconds=wait_sec)
-    elif mode == "serial":
+    if mode == "serial":
         if not args.port:
             raise ValueError("Serial port (-p/--port) must be specified when mode is serial.")
         return JLSerialTransport(
@@ -217,8 +199,41 @@ def select_transport(args: argparse.Namespace) -> JLTransport:
             baudrate=args.baud,
             init_baudrate=args.init_baud,
         )
+
+    # On Linux, prefer native SG_IO driver for USB Mass Storage devices to avoid libusb detach collisions
+    if sys.platform.startswith("linux"):
+        sg_devices = JLSgIoTransport.find_devices()
+        if sg_devices:
+            logger.info(f"Auto-selected Linux SG_IO transport ({len(sg_devices)} JieLi device(s) found).")
+            return JLSgIoTransport(wait_seconds=wait_sec)
+        elif mode == "usb":
+            return JLSgIoTransport(wait_seconds=wait_sec)
+        elif mode == "auto" and args.port:
+            logger.info(f"Auto-selected Serial mode on port {args.port}.")
+            return JLSerialTransport(
+                port=args.port,
+                baudrate=args.baud,
+                init_baudrate=args.init_baud,
+            )
+        else:
+            return JLSgIoTransport(wait_seconds=wait_sec)
+
+    # Windows, macOS, and fallback: standard USB SCSI BOT
+    usb_devices = JLUsbScsiTransport.find_devices()
+    if usb_devices:
+        logger.info(f"Auto-selected USB mode ({len(usb_devices)} JieLi USB device(s) found).")
+        return JLUsbScsiTransport(wait_seconds=wait_sec)
+    elif mode == "usb":
+        return JLUsbScsiTransport(wait_seconds=wait_sec)
+    elif mode == "auto" and args.port:
+        logger.info(f"Auto-selected Serial mode on port {args.port}.")
+        return JLSerialTransport(
+            port=args.port,
+            baudrate=args.baud,
+            init_baudrate=args.init_baud,
+        )
     else:
-        raise ValueError(f"Unknown transport mode: {mode}")
+        return JLUsbScsiTransport(wait_seconds=wait_sec)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -256,23 +271,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[*] Flash UUID: {info['flash_uuid']}")
             return 0
 
+        # Ensure RAM loader is staged if device is in Mask ROM mode
+        flasher.prepare_device(chip_name=args.chip, boot_addr=args.boot_addr)
+
         # 2. Read flash if requested
         if args.read_flash:
             addr = int(args.read_flash[0], 0)
             length = int(args.read_flash[1], 0)
             out_path = Path(args.read_flash[2])
             print(f"[*] Reading {length} bytes from flash 0x{addr:08X} to {out_path}...")
-            # Read in 4KB chunks
-            data = bytearray()
-            offset = 0
-            while offset < length:
-                chunk_len = min(4096, length - offset)
-                cdb = flasher.transport.send_cmd(
-                    cdb=flasher.transport.build_cdb(0x05, addr=addr + offset, length=chunk_len),
-                    data_in_len=chunk_len,
-                )
-                data.extend(cdb)
-                offset += chunk_len
+            data = flasher.read_flash(addr, length)
             out_path.write_bytes(data)
             print(f"[+] Flash read saved to {out_path} ({len(data)} bytes).")
             return 0
@@ -324,32 +332,28 @@ def main(argv: list[str] | None = None) -> int:
                 if uboot_p.is_file():
                     uboot_data = uboot_p.read_bytes()
                     print(f"[*] Flashing uboot ({len(uboot_data)} bytes) at 0x00000000...")
-                    flasher.erase_range(0x0, len(uboot_data), progress_cb=flasher.print_progress if hasattr(flasher, "print_progress") else None)
-                    flasher.write_flash(0x0, uboot_data)
+                    flasher.erase_range(0x0, len(uboot_data), progress_cb=print_progress)
+                    flasher.write_flash(0x0, uboot_data, progress_cb=print_progress)
 
-            app_files = []
             if args.app:
-                app_files.extend(args.app if isinstance(args.app, list) else [args.app])
-            if args.cfg and args.cfg not in app_files:
-                app_files.append(args.cfg)
+                app_files = args.app if isinstance(args.app, list) else [args.app]
+                app_main = Path(app_files[0])
+                if not app_main.is_file():
+                    raise FileNotFoundError(f"App binary file not found: {app_main}")
+                cfg_p = Path(args.cfg) if args.cfg else (Path(app_files[1]) if len(app_files) > 1 else None)
+                cfg_data = cfg_p.read_bytes() if (cfg_p and cfg_p.is_file()) else None
 
-            for idx, app_file in enumerate(app_files):
-                app_p = Path(app_file)
-                if app_p.is_file():
-                    app_data = app_p.read_bytes()
-                    # First file is main application, secondary files (like cfg_tool.bin) follow
-                    if idx == 0:
-                        app_addr = args.boot_addr if args.boot_addr else 0x2000
-                    else:
-                        app_addr = 0x10000 + (idx - 1) * 0x10000
-                    print(f"[*] Flashing {app_p.name} ({len(app_data)} bytes) at 0x{app_addr:08X}...")
-                    flasher.erase_range(app_addr, len(app_data))
-                    flasher.write_flash(app_addr, app_data)
+                print(f"[*] Flashing application {app_main.name} ({app_main.stat().st_size} bytes)...")
+                flasher.flash_app(
+                    app_bin=app_main.read_bytes(),
+                    cfg_tool_bin=cfg_data,
+                    progress_cb=print_progress,
+                )
 
             flasher.flash_done()
             if not args.no_reboot and args.reboot > 0:
                 flasher.reset(delay_ms=args.reboot)
-            print("[+] Multi-part firmware flashing completed!")
+            print("[+] Firmware flashing completed successfully!")
             return 0
 
         print("[!] No action specified. Use -f <firmware.bin>, -wflash <addr> <file>, or --probe.")

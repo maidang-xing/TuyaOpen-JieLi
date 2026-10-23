@@ -96,3 +96,40 @@ def scsi_xor_cipher(data: bytes | bytearray, key16: bytes) -> bytearray:
     for i in range(len(buf)):
         buf[i] ^= key16[i % klen]
     return buf
+
+
+def jl_enc_cipher(buff: bytearray, off: int, size: int, key: int = 0xFFFF) -> int:
+    """JieLi ENC cipher (used for SDFILE root entries)."""
+    k = key & 0xFFFF
+    for i in range(size):
+        buff[off + i] ^= k & 0xFF
+        k = ((k << 1) ^ (0x1021 if k & 0x8000 else 0)) & 0xFFFF
+    return k
+
+
+def jl_crc_cipher(buff: bytearray, off: int, size: int, key: int = 0xFFFFFFFF) -> None:
+    """JieLi MengLi CrcDecode cipher for RAM loader upload."""
+    magic = "孟黎我爱你，玉林".encode("gb2312", errors="ignore")
+    k_hi = (key >> 16) & 0xFFFF
+    k_lo = key & 0xFFFF
+    crc = crc16_ccitt(int.to_bytes(k_hi, 2, "little"), k_lo)
+    mlen = len(magic)
+    for i in range(size):
+        mi = i % mlen
+        crc = crc16_ccitt(magic[mi : mi + 1], crc)
+        buff[off + i] ^= crc & 0xFF
+
+
+def jl_sfc_cipher(
+    buff: bytearray,
+    off: int,
+    size: int,
+    base: int = 0,
+    key: int = 0xFFFF,
+    blocksize: int = 32,
+) -> None:
+    """JieLi SFC cipher (used for app_dir_head and SFC area payload)."""
+    for i in range(0, size, blocksize):
+        chunk_len = min(size - i, blocksize)
+        jl_enc_cipher(buff, off + i, chunk_len, key ^ ((off + i - base) >> 2))
+

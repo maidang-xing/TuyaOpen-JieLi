@@ -26,9 +26,32 @@ SUBCMD_GET_FLASH_UUID    = 0x84  # Query SPI flash 16-byte UUID
 SUBCMD_READ_EFUSE        = 0xA0  # Read eFuse
 SUBCMD_WRITE_EFUSE       = 0xA1  # Write eFuse
 
+# JieLi 16-bit SCSI Command Opcodes
+CMD_ERASE_FLASH_BLOCK   = 0xFB00  # Erase 64KB flash block
+CMD_ERASE_FLASH_SECTOR  = 0xFB01  # Erase 4KB flash sector
+CMD_ERASE_FLASH_CHIP    = 0xFB02  # Erase entire flash chip
+CMD_READ_STATUS         = 0xFC03  # Read loader status
+CMD_WRITE_FLASH         = 0xFB04  # Write data buffer to flash
+CMD_READ_FLASH          = 0xFD05  # Read data buffer from flash
+CMD_WRITE_MEMORY        = 0xFB06  # Write to memory/RAM
+CMD_READ_MEMORY         = 0xFD07  # Read from memory/RAM
+CMD_JUMP_TO_MEMORY      = 0xFB08  # Jump to execution address
+CMD_READ_KEY            = 0xFC09  # Read chip key
+CMD_GET_ONLINE_DEVICE   = 0xFC0A  # Query online device type
+CMD_READ_ID             = 0xFC0B  # Read device / flash ID
+CMD_RUN_APP             = 0xFC0C  # Run application / chip reset
+CMD_SET_FLASH_CMD       = 0xFC0D  # Set flash SPI commands
+CMD_FLASH_CRC16         = 0xFC0E  # Query on-chip CRC16
+CMD_WRITE_KEY           = 0xFC12  # Write chip key
+CMD_FLASH_CRC16_RAW     = 0xFC13  # Query raw on-chip CRC16
+CMD_GET_USB_BUFF_SIZE   = 0xFC14  # Query USB buffer size
+CMD_GET_LOADER_VER      = 0xFC15  # Query loader version
+CMD_GET_MASKROM_ID      = 0xFC16  # Query Mask ROM ID
+
 # Known JieLi USB Vendor IDs
 JIELI_USB_VIDS = [
     0x3654,  # Zhuhai JieLi Technology Co., Ltd.
+    0x4C4A,  # 'JL' JieLi Bootloader / UBOOT
     0x0483,  # STMicroelectronics (common fallback / maskrom)
     0x485A,  # 'HZ' / JieLi alternate
 ]
@@ -57,25 +80,57 @@ def build_cdb(
     length: int = 0,
     crc: int = 0,
     extra: int = 0,
+    pad: int = 0x00,
 ) -> bytes:
     """Build a 16-byte JieLi SCSI Command Descriptor Block (CDB).
 
     Byte Layout:
-    - [0]: 0xFC (Vendor Command Opcode)
-    - [1]: Subcommand Code
+    - [0..1]: Opcode / Subcommand Code (either 1-byte OP_VENDOR + 1-byte subcmd, or 2-byte command)
     - [2..5]: 32-bit Big-Endian Flash / RAM Address
     - [6..7]: 16-bit Big-Endian Data Length
     - [8..9]: 16-bit Big-Endian CRC16 of Data Payload (for write)
-    - [10..15]: Extra parameters / Padding (0)
+    - [10..15]: Extra parameters / Padding
     """
     cdb = bytearray(16)
-    cdb[0] = OP_VENDOR
-    cdb[1] = subcmd & 0xFF
+    if subcmd > 0xFF:
+        cdb[0] = (subcmd >> 8) & 0xFF
+        cdb[1] = subcmd & 0xFF
+        fill_pad = pad if pad != 0 else 0xFF
+        if subcmd in (CMD_WRITE_FLASH, CMD_WRITE_MEMORY):
+            cdb[2:6] = struct.pack(">I", addr & 0xFFFFFFFF)
+            cdb[6:8] = struct.pack(">H", length & 0xFFFF)
+            cdb[8] = 0x00
+            cdb[9:11] = struct.pack("<H", crc & 0xFFFF)
+            for p in range(11, 16):
+                cdb[p] = fill_pad & 0xFF
+            return bytes(cdb)
+        elif subcmd in (CMD_READ_FLASH, CMD_JUMP_TO_MEMORY):
+            cdb[2:6] = struct.pack(">I", addr & 0xFFFFFFFF)
+            cdb[6:8] = struct.pack(">H", length & 0xFFFF)
+            for p in range(8, 16):
+                cdb[p] = fill_pad & 0xFF
+            return bytes(cdb)
+        elif subcmd in (CMD_ERASE_FLASH_BLOCK, CMD_ERASE_FLASH_SECTOR):
+            cdb[2:6] = struct.pack(">I", addr & 0xFFFFFFFF)
+            for p in range(6, 16):
+                cdb[p] = fill_pad & 0xFF
+            return bytes(cdb)
+        elif subcmd in (CMD_ERASE_FLASH_CHIP, CMD_RUN_APP):
+            for p in range(2, 16):
+                cdb[p] = fill_pad & 0xFF
+            return bytes(cdb)
+    else:
+        cdb[0] = OP_VENDOR
+        cdb[1] = subcmd & 0xFF
+
     cdb[2:6] = struct.pack(">I", addr & 0xFFFFFFFF)
     cdb[6:8] = struct.pack(">H", length & 0xFFFF)
     cdb[8:10] = struct.pack(">H", crc & 0xFFFF)
     if extra:
         cdb[10:14] = struct.pack(">I", extra & 0xFFFFFFFF)
+    elif pad != 0:
+        for p in range(10, 16):
+            cdb[p] = pad & 0xFF
     return bytes(cdb)
 
 

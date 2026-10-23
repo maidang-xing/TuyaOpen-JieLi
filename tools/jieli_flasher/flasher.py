@@ -366,12 +366,12 @@ class JLFlasher:
         """Send chip reset command with reboot delay."""
         logger.info(f"Resetting device (delay: {delay_ms} ms)...")
         try:
-            cdb = build_cdb(CMD_RUN_APP, addr=1, pad=0xFF)
-            self.transport.send_cmd(cdb, timeout_ms=2000)
+            cdb_sub = build_cdb(SUBCMD_CHIP_RESET, addr=delay_ms)
+            self.transport.send_cmd(cdb_sub, timeout_ms=2000)
         except Exception:
             try:
-                cdb_sub = build_cdb(SUBCMD_CHIP_RESET, addr=delay_ms)
-                self.transport.send_cmd(cdb_sub, timeout_ms=2000)
+                cdb = build_cdb(CMD_RUN_APP, addr=1, pad=0xFF)
+                self.transport.send_cmd(cdb, timeout_ms=2000)
             except Exception:
                 pass
         logger.info("Device reset triggered.")
@@ -445,9 +445,19 @@ class JLFlasher:
             except Exception:
                 pass
 
-        if "UBOOT" in inq_product.upper():
-            logger.info(f"Target is in Mask ROM mode ({inq_vendor} {inq_product}). Staging RAM loader...")
-            self.stage_ram_loader(chip_name=chip_name, boot_addr=boot_addr)
+        ident = f"{inq_vendor} {inq_product}".upper()
+        if "UBOOT" in ident or not inq_product:
+            # Auto-detect whether target is WL82/AC791 or WL83/AC792
+            effective_chip = chip_name.lower()
+            if "83" in ident or "792" in ident:
+                effective_chip = "wl83"
+            elif "80" in ident or "82" in ident or "791" in ident:
+                effective_chip = "wl82"
+
+            logger.info(
+                f"Target is in Mask ROM mode ({inq_vendor} {inq_product}). Staging RAM loader for {effective_chip}..."
+            )
+            self.stage_ram_loader(chip_name=effective_chip, boot_addr=boot_addr)
 
     def flash_app(
         self,
@@ -459,6 +469,14 @@ class JLFlasher:
         logger.info("Reading flash filesystem layout at 0x4000...")
         flash_hdr = bytearray(self.read_flash(0x4000, 4096))
         jl_sfc_cipher(flash_hdr, 0, len(flash_hdr), base=0, key=0xFFFF)
+
+        # Check if flash at 0x4000 is blank (freshly erased or uninitialized)
+        if flash_hdr[:16] == b"\xff" * 16 or flash_hdr[:4] == b"\x00\x00\x00\x00":
+            logger.info("Flash layout at 0x4000 is uninitialized; creating clean app_area_head template...")
+            flash_hdr = bytearray(b"\xff" * 4096)
+            area_dcrc = 0x0000
+        else:
+            area_dcrc = struct.unpack_from("<H", flash_hdr, 0x02)[0]
 
         app_len = len(app_bin)
         app_offset = 0x120

@@ -182,6 +182,19 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _find_cfg_tool(target_file: Path) -> Optional[Path]:
+    """Find cfg_tool.bin relative to target application binary."""
+    candidates = [
+        target_file.parent / "cfg_tool.bin",
+        target_file.parent.parent / "jieli-staging" / "build" / "cpu" / "wl82" / "tools" / "cfg_tool.bin",
+        target_file.parent.parent / "jieli-staging" / "build" / "sdk" / "cpu" / "wl83" / "tools" / "cfg_tool.bin",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
 def select_transport(args: argparse.Namespace) -> JLTransport:
     """Select and instantiate transport based on mode and availability."""
     mode = args.mode
@@ -296,6 +309,23 @@ def main(argv: list[str] | None = None) -> int:
             if not target_file.is_file():
                 raise FileNotFoundError(f"File not found: {target_file}")
             fw_bytes = target_file.read_bytes()
+
+            # If target_addr is 0 and fw_bytes is an application binary, flash into SFC filesystem
+            if target_addr == 0 and not fw_bytes.startswith(b"\x5a\x5a") and len(fw_bytes) > 65536:
+                cfg_p = _find_cfg_tool(target_file)
+                cfg_data = cfg_p.read_bytes() if cfg_p else None
+                print(f"[*] Detected application binary {target_file.name}. Flashing to JieLi SFC flash...")
+                flasher.flash_app(
+                    app_bin=fw_bytes,
+                    cfg_tool_bin=cfg_data,
+                    progress_cb=print_progress,
+                )
+                flasher.flash_done()
+                if not args.no_reboot and (args.reboot > 0):
+                    flasher.reset(delay_ms=args.reboot)
+                print("[+] Application firmware flashed successfully!")
+                return 0
+
             print(f"[*] Raw flashing {target_file} ({len(fw_bytes)} bytes) at 0x{target_addr:08X}...")
             flasher.flash_firmware(
                 firmware_bytes=fw_bytes,
@@ -314,6 +344,23 @@ def main(argv: list[str] | None = None) -> int:
                 raise FileNotFoundError(f"Firmware file not found: {target_file}")
             fw_bytes = target_file.read_bytes()
             start_addr = args.boot_addr
+
+            # If boot address is 0 and fw_bytes is an application binary, flash into SFC filesystem
+            if start_addr == 0 and not fw_bytes.startswith(b"\x5a\x5a") and len(fw_bytes) > 65536:
+                cfg_p = _find_cfg_tool(target_file)
+                cfg_data = cfg_p.read_bytes() if cfg_p else None
+                print(f"[*] Detected application binary {target_file.name}. Flashing to JieLi SFC flash...")
+                flasher.flash_app(
+                    app_bin=fw_bytes,
+                    cfg_tool_bin=cfg_data,
+                    progress_cb=print_progress,
+                )
+                flasher.flash_done()
+                if not args.no_reboot and (args.reboot > 0):
+                    flasher.reset(delay_ms=args.reboot)
+                print("[+] Application firmware flashed successfully!")
+                return 0
+
             print(f"[*] Flashing firmware {target_file} ({len(fw_bytes)} bytes) at offset 0x{start_addr:08X}...")
             flasher.flash_firmware(
                 firmware_bytes=fw_bytes,

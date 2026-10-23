@@ -144,43 +144,75 @@ class JLUsbScsiTransport(JLTransport):
 
         # Reset & Detach kernel driver if active on Linux/macOS
         try:
-            if dev.is_kernel_driver_active(0):
-                dev.detach_kernel_driver(0)
-                logger.debug("Detached active kernel driver.")
-        except Exception:
-            pass
-
-        try:
-            cfg = dev.get_active_configuration()
-        except Exception:
-            cfg = None
-        if cfg is None:
             try:
-                dev.set_configuration()
-            except Exception as exc:
-                logger.debug(f"set_configuration note: {exc}")
+                if dev.is_kernel_driver_active(0):
+                    dev.detach_kernel_driver(0)
+                    logger.debug("Detached active kernel driver.")
+            except Exception:
+                pass
 
-        # Locate Bulk IN and Bulk OUT endpoints
-        if cfg is None:
-            cfg = dev.get_active_configuration()
-        intf = cfg[(0, 0)]
+            try:
+                cfg = dev.get_active_configuration()
+            except Exception:
+                cfg = None
+            if cfg is None:
+                try:
+                    dev.set_configuration()
+                except Exception as exc:
+                    logger.debug(f"set_configuration note: {exc}")
 
-        ep_out = None
-        ep_in = None
-        for ep in intf:
-            if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_OUT:
-                if usb.util.endpoint_type(ep.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK:
-                    ep_out = ep
-            elif usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN:
-                if usb.util.endpoint_type(ep.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK:
-                    ep_in = ep
+            # Locate Bulk IN and Bulk OUT endpoints
+            if cfg is None:
+                cfg = dev.get_active_configuration()
+            intf = cfg[(0, 0)]
 
-        if not ep_out or not ep_in:
-            raise TransportError("Unable to locate Bulk IN and Bulk OUT endpoints for USB MSC interface.")
+            ep_out = None
+            ep_in = None
+            for ep in intf:
+                if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_OUT:
+                    if usb.util.endpoint_type(ep.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK:
+                        ep_out = ep
+                elif usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN:
+                    if usb.util.endpoint_type(ep.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK:
+                        ep_in = ep
 
-        self.ep_out = ep_out
-        self.ep_in = ep_in
-        logger.debug(f"Configured endpoints: OUT=0x{ep_out.bEndpointAddress:02X}, IN=0x{ep_in.bEndpointAddress:02X}")
+            if not ep_out or not ep_in:
+                raise TransportError("Unable to locate Bulk IN and Bulk OUT endpoints for USB MSC interface.")
+
+            self.ep_out = ep_out
+            self.ep_in = ep_in
+            logger.debug(f"Configured endpoints: OUT=0x{ep_out.bEndpointAddress:02X}, IN=0x{ep_in.bEndpointAddress:02X}")
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "insufficient permissions" in msg or "access denied" in msg or "[errno 13]" in msg:
+                from pathlib import Path
+                import subprocess
+                rules_file = Path(__file__).resolve().parents[1] / "99-jieli.rules"
+                installed = False
+                try:
+                    res = subprocess.run(
+                        ["sudo", "-n", "cp", str(rules_file), "/etc/udev/rules.d/99-jieli.rules"],
+                        capture_output=True,
+                        check=False,
+                    )
+                    if res.returncode == 0:
+                        subprocess.run(["sudo", "-n", "udevadm", "control", "--reload-rules"], capture_output=True, check=False)
+                        subprocess.run(["sudo", "-n", "udevadm", "trigger"], capture_output=True, check=False)
+                        installed = True
+                except Exception:
+                    pass
+                if installed:
+                    raise TransportError(
+                        "USB permission was missing; auto-installed /etc/udev/rules.d/99-jieli.rules. "
+                        "Please reconnect/replug the JieLi device and re-run."
+                    ) from exc
+                else:
+                    raise TransportError(
+                        f"USB permission denied. On Linux, please install the JieLi udev rule:\n"
+                        f"  sudo cp {rules_file} /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger\n"
+                        f"Then re-plug your JieLi development board."
+                    ) from exc
+            raise
 
     def close(self) -> None:
         if self.dev:

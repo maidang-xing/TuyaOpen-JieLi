@@ -99,20 +99,33 @@ class JLFlasher:
         """Probe the connected JieLi chip and flash memory."""
         logger.info("Probing device info...")
 
-        # 1. Query Chip ID (0x83)
-        cdb_chip_id = build_cdb(SUBCMD_GET_CHIP_ID)
+        # 1. Query Flash ID (0xFC0B)
         try:
-            raw_id = self.transport.send_cmd(cdb_chip_id, data_in_len=16)
-            self.chip_id = raw_id.split(b"\x00")[0].decode("latin1", errors="replace").strip()
-            logger.info(f"Chip ID / Version: {self.chip_id}")
-        except Exception as exc:
-            logger.debug(f"Could not read Chip ID: {exc}")
-            self.chip_id = "Unknown JieLi"
+            cdb_id = build_cdb(0xFC0B, pad=0xFF)
+            raw_id = self.transport.send_cmd(cdb_id, data_in_len=16, timeout_ms=1000)
+            if len(raw_id) >= 3:
+                flash_id = int.from_bytes(raw_id[:3], "big")
+                if flash_id != 0:
+                    self.chip_id = f"JieLi Flash (ID: 0x{flash_id:06X})"
+                    logger.info(f"Flash Chip ID: 0x{flash_id:06X}")
+        except Exception:
+            pass
+
+        if not self.chip_id:
+            # Fallback query Chip ID (0x83)
+            cdb_chip_id = build_cdb(SUBCMD_GET_CHIP_ID)
+            try:
+                raw_id = self.transport.send_cmd(cdb_chip_id, data_in_len=16, timeout_ms=1000)
+                self.chip_id = raw_id.split(b"\x00")[0].decode("latin1", errors="replace").strip()
+                logger.info(f"Chip ID / Version: {self.chip_id}")
+            except Exception as exc:
+                logger.debug(f"Could not read Chip ID: {exc}")
+                self.chip_id = "JieLi Device"
 
         # 2. Query Flash UUID (0x84)
         cdb_uuid = build_cdb(SUBCMD_GET_FLASH_UUID)
         try:
-            raw_uuid = self.transport.send_cmd(cdb_uuid, data_in_len=16)
+            raw_uuid = self.transport.send_cmd(cdb_uuid, data_in_len=16, timeout_ms=1000)
             self.flash_uuid = raw_uuid[:16]
             uuid_str = self.flash_uuid.hex().upper()
             logger.info(f"Flash UUID: {uuid_str}")
@@ -122,7 +135,7 @@ class JLFlasher:
         # 3. Query Max Page Size (0x14)
         try:
             cdb_page = build_cdb(SUBCMD_GET_MAX_PAGE)
-            resp = self.transport.send_cmd(cdb_page, data_in_len=4)
+            resp = self.transport.send_cmd(cdb_page, data_in_len=4, timeout_ms=1000)
             if len(resp) >= 2:
                 page_size = struct.unpack(">H", resp[:2])[0]
                 if page_size > 0:
@@ -142,7 +155,7 @@ class JLFlasher:
         """Erase a single 4KB sector."""
         try:
             cdb = build_cdb(CMD_ERASE_FLASH_SECTOR, addr=addr, pad=0xFF)
-            self.transport.send_cmd(cdb, timeout_ms=3000)
+            self.transport.send_cmd(cdb, data_in_len=16, timeout_ms=3000)
         except Exception:
             cdb_fb = build_cdb(SUBCMD_ERASE_SECTOR, addr=addr)
             self.transport.send_cmd(cdb_fb, timeout_ms=3000)
@@ -151,7 +164,7 @@ class JLFlasher:
         """Erase a 64KB block."""
         try:
             cdb = build_cdb(CMD_ERASE_FLASH_BLOCK, addr=addr, pad=0xFF)
-            self.transport.send_cmd(cdb, timeout_ms=5000)
+            self.transport.send_cmd(cdb, data_in_len=16, timeout_ms=5000)
         except Exception:
             cdb_fb = build_cdb(SUBCMD_ERASE_BLOCK, addr=addr)
             self.transport.send_cmd(cdb_fb, timeout_ms=5000)
@@ -161,7 +174,7 @@ class JLFlasher:
         logger.info("Performing full chip erase (this may take several seconds)...")
         try:
             cdb = build_cdb(CMD_ERASE_FLASH_CHIP, pad=0xFF)
-            self.transport.send_cmd(cdb, timeout_ms=30000)
+            self.transport.send_cmd(cdb, data_in_len=16, timeout_ms=30000)
         except Exception:
             cdb_fb = build_cdb(SUBCMD_ERASE_ALL)
             self.transport.send_cmd(cdb_fb, timeout_ms=30000)
@@ -407,7 +420,8 @@ class JLFlasher:
                 jl_crc_cipher(block, 0, len(block))
 
             addr = target_addr + offset
-            cdb = build_cdb(CMD_WRITE_MEMORY, addr=addr, length=len(block), pad=0xFF)
+            block_crc = crc16_ccitt(block)
+            cdb = build_cdb(CMD_WRITE_MEMORY, addr=addr, length=len(block), crc=block_crc, pad=0xFF)
             self.transport.send_cmd(cdb, data_out=bytes(block), timeout_ms=3000)
             offset += len(block)
 
@@ -444,7 +458,7 @@ class JLFlasher:
         """Flash application binary and configuration into the JieLi SFC filesystem."""
         logger.info("Reading flash filesystem layout at 0x4000...")
         flash_hdr = bytearray(self.read_flash(0x4000, 4096))
-        jl_sfc_cipher(flash_hdr, 0, len(flash_hdr), base=0x4000, key=0xFFFF)
+        jl_sfc_cipher(flash_hdr, 0, len(flash_hdr), base=0, key=0xFFFF)
 
         app_len = len(app_bin)
         app_offset = 0x120

@@ -263,6 +263,9 @@ def main(argv: list[str] | None = None) -> int:
         transport.connect()
         flasher = JLFlasher(transport)
 
+        # Ensure RAM loader is staged if device is in Mask ROM mode
+        flasher.prepare_device(chip_name=args.chip, boot_addr=args.boot_addr)
+
         # 1. Device Probe (if requested)
         if args.probe:
             info = flasher.probe()
@@ -270,9 +273,6 @@ def main(argv: list[str] | None = None) -> int:
             if info["flash_uuid"]:
                 print(f"[*] Flash UUID: {info['flash_uuid']}")
             return 0
-
-        # Ensure RAM loader is staged if device is in Mask ROM mode
-        flasher.prepare_device(chip_name=args.chip, boot_addr=args.boot_addr)
 
         # 2. Read flash if requested
         if args.read_flash:

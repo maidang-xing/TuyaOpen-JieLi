@@ -95,6 +95,30 @@ def build_cdb(
     if subcmd > 0xFF:
         cdb[0] = (subcmd >> 8) & 0xFF
         cdb[1] = subcmd & 0xFF
+        fill_pad = pad if pad != 0 else 0xFF
+        if subcmd in (CMD_WRITE_FLASH, CMD_WRITE_MEMORY):
+            cdb[2:6] = struct.pack(">I", addr & 0xFFFFFFFF)
+            cdb[6:8] = struct.pack(">H", length & 0xFFFF)
+            cdb[8] = 0x00
+            cdb[9:11] = struct.pack("<H", crc & 0xFFFF)
+            for p in range(11, 16):
+                cdb[p] = fill_pad & 0xFF
+            return bytes(cdb)
+        elif subcmd in (CMD_READ_FLASH, CMD_JUMP_TO_MEMORY):
+            cdb[2:6] = struct.pack(">I", addr & 0xFFFFFFFF)
+            cdb[6:8] = struct.pack(">H", length & 0xFFFF)
+            for p in range(8, 16):
+                cdb[p] = fill_pad & 0xFF
+            return bytes(cdb)
+        elif subcmd in (CMD_ERASE_FLASH_BLOCK, CMD_ERASE_FLASH_SECTOR):
+            cdb[2:6] = struct.pack(">I", addr & 0xFFFFFFFF)
+            for p in range(6, 16):
+                cdb[p] = fill_pad & 0xFF
+            return bytes(cdb)
+        elif subcmd in (CMD_ERASE_FLASH_CHIP, CMD_RUN_APP):
+            for p in range(2, 16):
+                cdb[p] = fill_pad & 0xFF
+            return bytes(cdb)
     else:
         cdb[0] = OP_VENDOR
         cdb[1] = subcmd & 0xFF

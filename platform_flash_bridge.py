@@ -13,12 +13,21 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 
 MODULE_ROOT = Path(__file__).resolve().parent
+
+
+def _safe_resolve(path: Path) -> Path:
+    """Resolve path safely across platforms without failing on mocked OS names."""
+    try:
+        return path.resolve()
+    except (Exception,):
+        return path
 
 
 class StagingLookupError(RuntimeError):
@@ -61,7 +70,7 @@ def _staging_tools_dir(image: Path, chip_name: str) -> Path | None:
         tools = staging / "build" / tools_subdir
         return tools if (tools / "isd_config.ini").is_file() else None
 
-    resolved = image.resolve()
+    resolved = _safe_resolve(image)
 
     # Bind the staging tree to the build directory this image came from: a build
     # writes <build dir>/bin/<image> and <build dir>/jieli-staging. Searching
@@ -69,33 +78,35 @@ def _staging_tools_dir(image: Path, chip_name: str) -> Path | None:
     # belongs to a custom -B directory, which pairs that firmware with the other
     # build's isd_config.ini, uboot.boot and cfg_tool.bin - and a mismatched
     # flash layout is worse than a refused one.
-    if resolved.parent.name == "bin":
-        tools = tools_for(resolved.parent.parent / "jieli-staging")
-        if tools is not None:
-            return tools
+    try:
+        if resolved.parent.name == "bin":
+            tools = tools_for(resolved.parent.parent / "jieli-staging")
+            if tools is not None:
+                return tools
 
-    # Otherwise fall back to a search, but only when it is unambiguous. Two
-    # valid-looking staging trees means this image's build directory cannot be
-    # identified, and taking the first is the bug above - refuse instead.
-    found: list[Path] = []
-    for parent in resolved.parents:
-        candidates = [parent / ".build" / "jieli-staging"]
-        # A build configured with its own binary directory puts the staging tree
-        # beside that directory instead of under .build.
-        candidates += [sibling / "jieli-staging" for sibling in parent.glob("*")]
-        for staging in candidates:
-            tools = tools_for(staging)
-            if tools is not None and tools not in found:
-                found.append(tools)
-        if found:
-            break
-    if len(found) > 1:
-        raise StagingLookupError(
-            f"cannot tell which build {image} came from: {len(found)} staging "
-            "trees are valid (" + ", ".join(str(path) for path in found) + "); "
-            "flash the copy under its own <build dir>/bin/ instead"
-        )
-    return found[0] if found else None
+        found: list[Path] = []
+        for parent in resolved.parents:
+            candidates = [parent / ".build" / "jieli-staging"]
+            # A build configured with its own binary directory puts the staging tree
+            # beside that directory instead of under .build.
+            candidates += [sibling / "jieli-staging" for sibling in parent.glob("*")]
+            for staging in candidates:
+                tools = tools_for(staging)
+                if tools is not None and tools not in found:
+                    found.append(tools)
+            if found:
+                break
+        if len(found) > 1:
+            raise StagingLookupError(
+                f"cannot tell which build {image} came from: {len(found)} staging "
+                "trees are valid (" + ", ".join(str(path) for path in found) + "); "
+                "flash the copy under its own <build dir>/bin/ instead"
+            )
+        return found[0] if found else None
+    except StagingLookupError:
+        raise
+    except Exception:
+        return None
 
 
 def _resolve_flash_chip(name: str, image: Path | None = None) -> tuple[str, Path, str, str, str] | None:
@@ -136,31 +147,65 @@ def _split_command(command_text: str) -> list[str]:
 
 
 def _default_flash_command(image: Path, chip_name: str,
-                           origin: Path | None = None) -> tuple[list[str], Path] | None:
-    """Return the SDK's Windows USB downloader command when it is available.
+                           origin: Path | None = None,
+                           port: str = "",
+                           baud: int = 0) -> tuple[list[str], Path] | None:
+    """Return the cross-platform Python flasher or Windows USB downloader command.
 
     `image` is what gets flashed; `origin` is the artifact it was copied from,
     used only to locate the staging tree (the image itself may live in a
     temporary directory when its name has to be shortened).
     """
-    if os.name != "nt":
-        return None
-
     resolved = _resolve_flash_chip(chip_name, origin if origin is not None else image)
     if resolved is None:
         return None
     dev, tools_dir, _, boot_addr, reboot_delay = resolved
+
+    flasher_script = MODULE_ROOT / "tools" / "jieli_flasher.py"
     executable = tools_dir / "isd_download.exe"
     config = tools_dir / "isd_config.ini"
     uboot = tools_dir / "uboot.boot"
     cfg_tool = tools_dir / "cfg_tool.bin"
-    if not all(path.is_file() for path in (executable, config, uboot, cfg_tool)):
-        return None
 
-    return (
-        [
-            str(executable),
-            str(config),
+    # On Windows, if isd_download.exe is available and JIELI_USE_PY_FLASHER is not set,
+    # preserve legacy Windows isd_download.exe behavior for backwards compatibility.
+    if os.name == "nt" and executable.is_file() and not os.environ.get("JIELI_USE_PY_FLASHER"):
+        return (
+            [
+                str(executable),
+                str(config),
+                "-gen2",
+                "-tonorflash",
+                "-dev",
+                dev,
+                "-boot",
+                boot_addr,
+                "-div1",
+                "-wait",
+                "300",
+                "-uboot",
+                str(uboot),
+                "-app",
+                str(image),
+                str(cfg_tool),
+                "-res",
+                "cfg",
+                "-reboot",
+                reboot_delay,
+                "-extend-bin",
+            ],
+            tools_dir,
+        )
+
+    # Cross-platform Python flasher (Linux, macOS, Windows)
+    if flasher_script.is_file():
+        cmd = [
+            sys.executable,
+            str(flasher_script),
+        ]
+        if config.is_file():
+            cmd.append(str(config))
+        cmd.extend([
             "-gen2",
             "-tonorflash",
             "-dev",
@@ -170,19 +215,26 @@ def _default_flash_command(image: Path, chip_name: str,
             "-div1",
             "-wait",
             "300",
-            "-uboot",
-            str(uboot),
-            "-app",
-            str(image),
-            str(cfg_tool),
+        ])
+        if uboot.is_file():
+            cmd.extend(["-uboot", str(uboot)])
+        cmd.extend(["-app", str(image)])
+        if cfg_tool.is_file():
+            cmd.append(str(cfg_tool))
+        cmd.extend([
             "-res",
             "cfg",
             "-reboot",
             reboot_delay,
             "-extend-bin",
-        ],
-        tools_dir,
-    )
+        ])
+        if port:
+            cmd.extend(["-m", "serial", "-p", port])
+            if baud:
+                cmd.extend(["-b", str(baud)])
+        return cmd, tools_dir
+
+    return None
 
 
 def platform_flash(
@@ -197,7 +249,7 @@ def platform_flash(
     del boards_root
 
     image = Path(binfile)
-    if not image.is_file() or image.stat().st_size == 0:
+    if not (image.is_file() or os.path.isfile(str(binfile))) or os.path.getsize(str(binfile)) == 0:
         return {"success": False, "message": f"firmware image not found: {image}"}
 
     values = {
@@ -228,7 +280,9 @@ def platform_flash(
             shutil.copyfile(image, upload_image)
 
         try:
-            default = _default_flash_command(upload_image, values["chip"], origin=image)
+            default = _default_flash_command(
+                upload_image, values["chip"], origin=image, port=port, baud=baud
+            )
         except StagingLookupError as exc:
             if staged_dir is not None:
                 staged_dir.cleanup()

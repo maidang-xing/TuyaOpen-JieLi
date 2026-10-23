@@ -106,27 +106,33 @@ elseif(CMAKE_HOST_WIN32)
 endif()
 
 if(NOT JIELI_TOOL_DIR)
-    set(sdk_tool_dir "${JIELI_SDK_ROOT}/../ipc_ac7916a/toolchain/jieli-linux-toolchains/pi32v2/bin")
-    _jieli_toolchain_missing_tools("${sdk_tool_dir}" sdk_missing_tools)
-    if(NOT sdk_missing_tools)
-        set(JIELI_TOOL_DIR "${sdk_tool_dir}")
-    elseif(NOT CMAKE_HOST_WIN32)
-        _jieli_toolchain_missing_tools("/opt/jieli/pi32v2/bin" opt_missing_tools)
-        if(NOT opt_missing_tools)
-            set(JIELI_TOOL_DIR "/opt/jieli/pi32v2/bin")
+    set(toolchain_candidates
+        "${JIELI_SDK_ROOT}/../ipc_ac7916a/toolchain/jieli-linux-toolchains/pi32v2/bin"
+        "${CMAKE_CURRENT_LIST_DIR}/../tools/jieli-toolchain/jieli-linux-toolchains-20260730.1/pi32v2/bin"
+        "${CMAKE_CURRENT_LIST_DIR}/../../tools/jieli-toolchain/jieli-linux-toolchains-20260730.1/pi32v2/bin"
+        "${CMAKE_CURRENT_LIST_DIR}/../tools/jieli-toolchain/pi32v2/bin"
+        "${CMAKE_CURRENT_LIST_DIR}/../../tools/jieli-toolchain/pi32v2/bin"
+        "${PLATFORM_PATH}/../../tools/jieli-toolchain/jieli-linux-toolchains-20260730.1/pi32v2/bin"
+        "${PLATFORM_PATH}/../../tools/jieli-toolchain/pi32v2/bin"
+        "${PLATFORM_PATH}/../../jieli-toolchain/pi32v2/bin"
+        "/opt/jieli/pi32v2/bin"
+    )
+    foreach(cand ${toolchain_candidates})
+        if(EXISTS "${cand}")
+            _jieli_toolchain_missing_tools("${cand}" cand_missing_tools)
+            if(NOT cand_missing_tools)
+                set(JIELI_TOOL_DIR "${cand}")
+                break()
+            endif()
         endif()
-    endif()
+    endforeach()
 endif()
 
 if(NOT JIELI_TOOL_DIR)
-    set(JIELI_TOOL_DIR "${PLATFORM_PATH}/../../jieli-toolchain/pi32v2/bin")
-    _jieli_toolchain_missing_tools("${JIELI_TOOL_DIR}" missing_tools)
-    if(missing_tools)
-        message(FATAL_ERROR
-            "Jieli pi32v2 toolchain not found. Required tools: clang, lto-wrapper, lto-ar, "
-            "objdump, objsizedump. Set JIELI_TOOL_DIR or prepare "
-            ".tools/portable-jieli-windows/pi32/bin on Windows.")
-    endif()
+    message(FATAL_ERROR
+        "Jieli pi32v2 toolchain not found. Required tools: clang, lto-wrapper, lto-ar, "
+        "objdump, objsizedump. Set JIELI_TOOL_DIR or prepare "
+        ".tools/portable-jieli-windows/pi32/bin on Windows.")
 endif()
 file(TO_CMAKE_PATH "${JIELI_TOOL_DIR}" JIELI_TOOL_DIR)
 

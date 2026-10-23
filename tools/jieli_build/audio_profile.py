@@ -250,7 +250,7 @@ AUDIO_PROFILES = {
                 "-include ../../../../../apps/demo/demo_hello/board/wl83/tuya_board_audio_config.h",
             ),
         ),
-        link_libs=("media.a", "stream_media_server.a", "fs.a"),
+        link_libs=("media.a", "fs.a"),
         app_tasks=(
             ("audio_server", '    {"audio_server", 16, 512, 64},\n'),
             ("audio_mix", '    {"audio_mix", 28, 512, 0},\n'),

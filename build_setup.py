@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 from tools.jieli_build.chip_profiles import resolve_chip, resolve_sdk_root
@@ -15,6 +17,48 @@ from tools.jieli_build.toolchain import (
     resolve_tool_dir,
     resolve_tool_path,
 )
+
+PLATFORM_ROOT = Path(__file__).resolve().parent
+
+
+def _check_linux_udev_rules(platform_root: Path) -> None:
+    if sys.platform != "linux":
+        return
+    rules_src = platform_root / "tools" / "99-jieli.rules"
+    if not rules_src.is_file():
+        return
+    has_rule = False
+    for rules_dir in (Path("/etc/udev/rules.d"), Path("/usr/lib/udev/rules.d"), Path("/lib/udev/rules.d")):
+        if rules_dir.is_dir():
+            for rule_file in rules_dir.glob("*.rules"):
+                try:
+                    text = rule_file.read_text(encoding="utf-8", errors="ignore")
+                    if "4c4a" in text.lower() and "3654" in text.lower():
+                        has_rule = True
+                        break
+                except Exception:
+                    continue
+        if has_rule:
+            break
+    if not has_rule:
+        dest = Path("/etc/udev/rules.d/99-jieli.rules")
+        try:
+            res = subprocess.run(
+                ["sudo", "-n", "cp", str(rules_src), str(dest)],
+                capture_output=True,
+                check=False,
+            )
+            if res.returncode == 0:
+                subprocess.run(["sudo", "-n", "udevadm", "control", "--reload-rules"], capture_output=True, check=False)
+                subprocess.run(["sudo", "-n", "udevadm", "trigger"], capture_output=True, check=False)
+                print("[JIELI] udev rules installed to /etc/udev/rules.d/99-jieli.rules")
+                return
+        except Exception:
+            pass
+        print(
+            f"[JIELI] Notice: Non-root USB flashing rule not installed. To install:\n"
+            f"        sudo cp {rules_src} /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -91,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[JIELI] toolchain: {tool_dir}")
     print(f"[JIELI] make: {make}")
     print(f"[JIELI] postbuild: {postbuild if host_client else 'raw app.bin via objcopy'}")
+    _check_linux_udev_rules(PLATFORM_ROOT)
     return 0
 
 

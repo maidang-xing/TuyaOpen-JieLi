@@ -18,8 +18,16 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from .crypto import crc16_ccitt
+from .crypto import crc16_ccitt, jl_crc_cipher, jl_sfc_cipher
 from .protocol import (
+    CMD_ERASE_FLASH_BLOCK,
+    CMD_ERASE_FLASH_CHIP,
+    CMD_ERASE_FLASH_SECTOR,
+    CMD_JUMP_TO_MEMORY,
+    CMD_READ_FLASH,
+    CMD_RUN_APP,
+    CMD_WRITE_FLASH,
+    CMD_WRITE_MEMORY,
     SUBCMD_CHIP_RESET,
     SUBCMD_ERASE_ALL,
     SUBCMD_ERASE_BLOCK,
@@ -91,20 +99,33 @@ class JLFlasher:
         """Probe the connected JieLi chip and flash memory."""
         logger.info("Probing device info...")
 
-        # 1. Query Chip ID (0x83)
-        cdb_chip_id = build_cdb(SUBCMD_GET_CHIP_ID)
+        # 1. Query Flash ID (0xFC0B)
         try:
-            raw_id = self.transport.send_cmd(cdb_chip_id, data_in_len=16)
-            self.chip_id = raw_id.split(b"\x00")[0].decode("latin1", errors="replace").strip()
-            logger.info(f"Chip ID / Version: {self.chip_id}")
-        except Exception as exc:
-            logger.warning(f"Could not read Chip ID: {exc}")
-            self.chip_id = "Unknown JieLi"
+            cdb_id = build_cdb(0xFC0B, pad=0xFF)
+            raw_id = self.transport.send_cmd(cdb_id, data_in_len=16, timeout_ms=1000)
+            if len(raw_id) >= 3:
+                flash_id = int.from_bytes(raw_id[:3], "big")
+                if flash_id != 0:
+                    self.chip_id = f"JieLi Flash (ID: 0x{flash_id:06X})"
+                    logger.info(f"Flash Chip ID: 0x{flash_id:06X}")
+        except Exception:
+            pass
+
+        if not self.chip_id:
+            # Fallback query Chip ID (0x83)
+            cdb_chip_id = build_cdb(SUBCMD_GET_CHIP_ID)
+            try:
+                raw_id = self.transport.send_cmd(cdb_chip_id, data_in_len=16, timeout_ms=1000)
+                self.chip_id = raw_id.split(b"\x00")[0].decode("latin1", errors="replace").strip()
+                logger.info(f"Chip ID / Version: {self.chip_id}")
+            except Exception as exc:
+                logger.debug(f"Could not read Chip ID: {exc}")
+                self.chip_id = "JieLi Device"
 
         # 2. Query Flash UUID (0x84)
         cdb_uuid = build_cdb(SUBCMD_GET_FLASH_UUID)
         try:
-            raw_uuid = self.transport.send_cmd(cdb_uuid, data_in_len=16)
+            raw_uuid = self.transport.send_cmd(cdb_uuid, data_in_len=16, timeout_ms=1000)
             self.flash_uuid = raw_uuid[:16]
             uuid_str = self.flash_uuid.hex().upper()
             logger.info(f"Flash UUID: {uuid_str}")
@@ -114,7 +135,7 @@ class JLFlasher:
         # 3. Query Max Page Size (0x14)
         try:
             cdb_page = build_cdb(SUBCMD_GET_MAX_PAGE)
-            resp = self.transport.send_cmd(cdb_page, data_in_len=4)
+            resp = self.transport.send_cmd(cdb_page, data_in_len=4, timeout_ms=1000)
             if len(resp) >= 2:
                 page_size = struct.unpack(">H", resp[:2])[0]
                 if page_size > 0:
@@ -132,19 +153,31 @@ class JLFlasher:
 
     def erase_sector(self, addr: int) -> None:
         """Erase a single 4KB sector."""
-        cdb = build_cdb(SUBCMD_ERASE_SECTOR, addr=addr)
-        self.transport.send_cmd(cdb, timeout_ms=3000)
+        try:
+            cdb = build_cdb(CMD_ERASE_FLASH_SECTOR, addr=addr, pad=0xFF)
+            self.transport.send_cmd(cdb, data_in_len=16, timeout_ms=3000)
+        except Exception:
+            cdb_fb = build_cdb(SUBCMD_ERASE_SECTOR, addr=addr)
+            self.transport.send_cmd(cdb_fb, timeout_ms=3000)
 
     def erase_block(self, addr: int) -> None:
         """Erase a 64KB block."""
-        cdb = build_cdb(SUBCMD_ERASE_BLOCK, addr=addr)
-        self.transport.send_cmd(cdb, timeout_ms=5000)
+        try:
+            cdb = build_cdb(CMD_ERASE_FLASH_BLOCK, addr=addr, pad=0xFF)
+            self.transport.send_cmd(cdb, data_in_len=16, timeout_ms=5000)
+        except Exception:
+            cdb_fb = build_cdb(SUBCMD_ERASE_BLOCK, addr=addr)
+            self.transport.send_cmd(cdb_fb, timeout_ms=5000)
 
     def erase_all(self) -> None:
         """Erase entire flash chip."""
         logger.info("Performing full chip erase (this may take several seconds)...")
-        cdb = build_cdb(SUBCMD_ERASE_ALL)
-        self.transport.send_cmd(cdb, timeout_ms=30000)
+        try:
+            cdb = build_cdb(CMD_ERASE_FLASH_CHIP, pad=0xFF)
+            self.transport.send_cmd(cdb, data_in_len=16, timeout_ms=30000)
+        except Exception:
+            cdb_fb = build_cdb(SUBCMD_ERASE_ALL)
+            self.transport.send_cmd(cdb_fb, timeout_ms=30000)
         logger.info("Full chip erase complete.")
 
     def erase_range(
@@ -189,14 +222,25 @@ class JLFlasher:
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                cdb = build_cdb(
-                    subcmd=SUBCMD_WRITE_FLASH,
-                    addr=addr,
-                    length=chunk_len,
-                    crc=chunk_crc,
-                )
-                self.transport.send_cmd(cdb, data_out=chunk, timeout_ms=5000)
-                return
+                try:
+                    cdb = build_cdb(
+                        CMD_WRITE_FLASH,
+                        addr=addr,
+                        length=chunk_len,
+                        crc=chunk_crc,
+                        pad=0xFF,
+                    )
+                    self.transport.send_cmd(cdb, data_out=chunk, timeout_ms=5000)
+                    return
+                except Exception:
+                    cdb_fb = build_cdb(
+                        SUBCMD_WRITE_FLASH,
+                        addr=addr,
+                        length=chunk_len,
+                        crc=chunk_crc,
+                    )
+                    self.transport.send_cmd(cdb_fb, data_out=chunk, timeout_ms=5000)
+                    return
             except Exception as exc:
                 last_error = exc
                 logger.warning(
@@ -236,11 +280,27 @@ class JLFlasher:
             if progress_cb:
                 progress_cb("Writing", offset, total_len, start_time)
 
+    def read_flash(self, addr: int, length: int) -> bytes:
+        """Read data from flash memory."""
+        data = bytearray()
+        offset = 0
+        while offset < length:
+            chunk_len = min(4096, length - offset)
+            curr_addr = addr + offset
+            try:
+                cdb = build_cdb(CMD_READ_FLASH, addr=curr_addr, length=chunk_len, pad=0xFF)
+                chunk = self.transport.send_cmd(cdb, data_in_len=chunk_len, timeout_ms=5000)
+            except Exception:
+                cdb_fb = build_cdb(SUBCMD_READ_FLASH, addr=curr_addr, length=chunk_len)
+                chunk = self.transport.send_cmd(cdb_fb, data_in_len=chunk_len, timeout_ms=5000)
+            data.extend(chunk)
+            offset += chunk_len
+        return bytes(data)
+
     def get_onchip_crc(self, addr: int, length: int) -> int:
         """Query on-chip hardware CRC16 for the flash range."""
         cdb = build_cdb(SUBCMD_GET_CRC16, addr=addr, length=length)
         resp = self.transport.send_cmd(cdb, data_in_len=16, timeout_ms=10000)
-        # Parse CRC16 from response (typically first 2 or 4 bytes)
         if len(resp) >= 2:
             return struct.unpack(">H", resp[:2])[0]
         raise FlasherError("Failed to receive CRC16 from chip.")
@@ -273,27 +333,24 @@ class JLFlasher:
                     "Falling back to block read verification..."
                 )
             except Exception as exc:
-                logger.warning(f"Hardware CRC query failed ({exc}); falling back to read verify.")
+                logger.debug(f"Hardware CRC query note ({exc}); falling back to read verify.")
 
         # Fallback: Read and compare block-by-block
-        offset = 0
-        start_time = time.time()
-        while offset < total_len:
-            size = min(chunk_size, total_len - offset)
-            addr = start_addr + offset
-            cdb = build_cdb(SUBCMD_READ_FLASH, addr=addr, length=size)
-            read_chunk = self.transport.send_cmd(cdb, data_in_len=size, timeout_ms=5000)
-            expected_chunk = expected_data[offset : offset + size]
+        readback = self.read_flash(start_addr, total_len)
+        if readback != expected_data:
+            # Locate first mismatch for clear diagnostic
+            for i in range(min(len(readback), len(expected_data))):
+                if readback[i] != expected_data[i]:
+                    raise FlasherError(
+                        f"Flash verification mismatch at byte offset 0x{start_addr + i:08X}: "
+                        f"expected 0x{expected_data[i]:02X}, read 0x{readback[i]:02X}"
+                    )
+            raise FlasherError(
+                f"Flash verification length mismatch: read {len(readback)} bytes vs expected {len(expected_data)}"
+            )
 
-            if read_chunk != expected_chunk:
-                raise FlasherError(
-                    f"Verification failed at offset 0x{addr:08X}: read mismatch."
-                )
-
-            offset += size
-            if progress_cb:
-                progress_cb("Verifying", offset, total_len, start_time)
-
+        if progress_cb:
+            progress_cb("Verifying", total_len, total_len, time.time())
         logger.info("Flash readback verification PASSED.")
         return True
 
@@ -308,13 +365,145 @@ class JLFlasher:
     def reset(self, delay_ms: int = 500) -> None:
         """Send chip reset command with reboot delay."""
         logger.info(f"Resetting device (delay: {delay_ms} ms)...")
-        cdb = build_cdb(SUBCMD_CHIP_RESET, addr=delay_ms)
         try:
+            cdb = build_cdb(CMD_RUN_APP, addr=1, pad=0xFF)
             self.transport.send_cmd(cdb, timeout_ms=2000)
         except Exception:
-            # Device resets immediately and USB/Serial disconnects, which is expected
-            pass
+            try:
+                cdb_sub = build_cdb(SUBCMD_CHIP_RESET, addr=delay_ms)
+                self.transport.send_cmd(cdb_sub, timeout_ms=2000)
+            except Exception:
+                pass
         logger.info("Device reset triggered.")
+
+    def _locate_loader(self, loader_name: str) -> Optional[Path]:
+        """Locate RAM loader binary."""
+        here = Path(__file__).resolve().parent / "loaders" / loader_name
+        if here.is_file():
+            return here
+
+        sdk_dirs = [
+            Path(__file__).resolve().parents[1] / "chip" / "wl82" / "AC79_AIoT_SDK" / "cpu" / "wl82" / "tools" / loader_name,
+            Path(__file__).resolve().parents[1] / "chip" / "wl83" / "AC792_SDK" / "sdk" / "cpu" / "wl83" / "tools" / loader_name,
+            Path(__file__).resolve().parents[1] / "chip" / "wl82" / "AC79_AIoT_SDK" / "cpu" / "wl82" / "tools" / "loader_tools" / loader_name,
+        ]
+        for candidate in sdk_dirs:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def stage_ram_loader(self, chip_name: str = "wl82", boot_addr: int = 0) -> None:
+        """Upload and execute RAM loader in chip memory."""
+        chip = chip_name.lower()
+        if "83" in chip or "792" in chip:
+            loader_name = "wl83loader.bin"
+            default_addr = 0x103000
+            mengli = False
+        else:
+            loader_name = "wl82loader.bin"
+            default_addr = 0x1C02000
+            mengli = True
+
+        target_addr = boot_addr if boot_addr > 0 else default_addr
+        loader_path = self._locate_loader(loader_name)
+        if not loader_path or not loader_path.is_file():
+            raise FlasherError(f"Cannot find RAM loader binary: {loader_name}")
+
+        loader_bytes = loader_path.read_bytes()
+        logger.info(f"Uploading {loader_name} ({len(loader_bytes)} bytes) to RAM 0x{target_addr:08X}...")
+
+        block_size = 512
+        offset = 0
+        while offset < len(loader_bytes):
+            block = bytearray(loader_bytes[offset : offset + block_size])
+            if mengli:
+                jl_crc_cipher(block, 0, len(block))
+
+            addr = target_addr + offset
+            block_crc = crc16_ccitt(block)
+            cdb = build_cdb(CMD_WRITE_MEMORY, addr=addr, length=len(block), crc=block_crc, pad=0xFF)
+            self.transport.send_cmd(cdb, data_out=bytes(block), timeout_ms=3000)
+            offset += len(block)
+
+        logger.info(f"Executing RAM loader at 0x{target_addr:08X}...")
+        cdb_jump = build_cdb(CMD_JUMP_TO_MEMORY, addr=target_addr, length=1, pad=0xFF)
+        try:
+            self.transport.send_cmd(cdb_jump, data_in_len=16, timeout_ms=3000)
+        except Exception:
+            pass
+
+        time.sleep(0.1)
+        logger.info("RAM loader execution started.")
+
+    def prepare_device(self, chip_name: str = "wl82", boot_addr: int = 0) -> None:
+        """Probe device and ensure RAM loader is running if target is in Mask ROM mode."""
+        inq_product = ""
+        inq_vendor = ""
+        if hasattr(self.transport, "inquiry"):
+            try:
+                inq_vendor, inq_product, _ = self.transport.inquiry()
+            except Exception:
+                pass
+
+        if "UBOOT" in inq_product.upper():
+            logger.info(f"Target is in Mask ROM mode ({inq_vendor} {inq_product}). Staging RAM loader...")
+            self.stage_ram_loader(chip_name=chip_name, boot_addr=boot_addr)
+
+    def flash_app(
+        self,
+        app_bin: bytes,
+        cfg_tool_bin: Optional[bytes] = None,
+        progress_cb: Optional[Callable[[str, int, int, float], None]] = None,
+    ) -> None:
+        """Flash application binary and configuration into the JieLi SFC filesystem."""
+        logger.info("Reading flash filesystem layout at 0x4000...")
+        flash_hdr = bytearray(self.read_flash(0x4000, 4096))
+        jl_sfc_cipher(flash_hdr, 0, len(flash_hdr), base=0, key=0xFFFF)
+
+        app_len = len(app_bin)
+        app_offset = 0x120
+        app_dcrc = crc16_ccitt(app_bin)
+
+        cfg_len = len(cfg_tool_bin) if cfg_tool_bin else 0
+        cfg_offset = app_offset + app_len
+
+        # Update Entry 1 (app.bin) at 0x20
+        app_name = b"app.bin\x00" + b"\xff" * 8
+        app_hdr_body = struct.pack("<HIIBBH16s", app_dcrc, app_offset, app_len, 0x82, 0xFF, 0, app_name)
+        app_hcrc = crc16_ccitt(app_hdr_body)
+        flash_hdr[0x20:0x40] = struct.pack("<H30s", app_hcrc, app_hdr_body)
+
+        # Update Entry 2 (cfg_tool.bin) at 0x40
+        if cfg_tool_bin:
+            cfg_dcrc = crc16_ccitt(cfg_tool_bin)
+            cfg_name = b"cfg_tool.bin\x00" + b"\xff" * 3
+            cfg_hdr_body = struct.pack("<HIIBBH16s", cfg_dcrc, cfg_offset, cfg_len, 0x82, 0xFF, 0, cfg_name)
+            cfg_hcrc = crc16_ccitt(cfg_hdr_body)
+            flash_hdr[0x40:0x60] = struct.pack("<H30s", cfg_hcrc, cfg_hdr_body)
+
+        # Update Entry 0 (app_area_head) at 0x00
+        area_total_len = cfg_offset + cfg_len
+        area_dcrc = struct.unpack_from("<H", flash_hdr, 0x02)[0]
+        area_name = b"app_area_head\x00\xff\xff"
+        area_hdr_body = struct.pack("<HIIBBH16s", area_dcrc, 0x02000120, area_total_len, 0x83, 0xFF, 0, area_name)
+        area_hcrc = crc16_ccitt(area_hdr_body)
+        flash_hdr[0x00:0x20] = struct.pack("<H30s", area_hcrc, area_hdr_body)
+
+        payload = bytearray(0x120 + area_total_len)
+        payload[:0x120] = flash_hdr[:0x120]
+        payload[app_offset : app_offset + app_len] = app_bin
+        if cfg_tool_bin:
+            payload[cfg_offset : cfg_offset + cfg_len] = cfg_tool_bin
+
+        aligned_len = ((len(payload) + 4095) // 4096) * 4096
+        payload += b"\xff" * (aligned_len - len(payload))
+
+        logger.info(f"Encrypting {aligned_len} bytes with JieLi SFC cipher...")
+        jl_sfc_cipher(payload, 0, len(payload), base=0, key=0xFFFF)
+
+        self.erase_range(0x4000, aligned_len, progress_cb=progress_cb)
+        self.write_flash(0x4000, bytes(payload), progress_cb=progress_cb)
+        self.verify_flash(0x4000, bytes(payload), progress_cb=progress_cb)
 
     def flash_firmware(
         self,
@@ -330,10 +519,7 @@ class JLFlasher:
         if total_len == 0:
             raise FlasherError("Cannot flash empty firmware image.")
 
-        # Step 1: Probe device
-        info = self.probe()
-
-        # Step 2: Erase
+        # Step 1: Erase
         if full_erase:
             self.erase_all()
         else:

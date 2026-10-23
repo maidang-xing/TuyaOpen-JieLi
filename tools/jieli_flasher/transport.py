@@ -134,6 +134,9 @@ class JLUsbScsiTransport(JLTransport):
                         pass
 
                 if is_jieli:
+                    is_uboot = dev.idVendor == 0x4C4A or any(
+                        k in f"{mfg} {prod}".upper() for k in ("UBOOT", "LOADER")
+                    )
                     devices.append({
                         "vid": dev.idVendor,
                         "pid": dev.idProduct,
@@ -142,11 +145,66 @@ class JLUsbScsiTransport(JLTransport):
                         "manufacturer": mfg,
                         "product": prod,
                         "device_obj": dev,
+                        "is_uboot": is_uboot,
                     })
         except Exception as exc:
             logger.debug(f"Error enumerating USB devices: {exc}")
 
         return devices
+
+    @classmethod
+    def trigger_soft_boot_device(cls, dev) -> bool:
+        """Trigger soft-jump into Mask ROM on running JieLi USB device."""
+        try:
+            mfg = getattr(dev, "manufacturer", "") or ""
+            prod = getattr(dev, "product", "") or ""
+        except Exception:
+            mfg, prod = "", ""
+        logger.info(
+            f"Sending USB soft-jump command to running JieLi device ({dev.idVendor:04X}:{dev.idProduct:04X} {mfg} {prod})..."
+        )
+
+        # 1. Try EP0 Control Transfer (GET_STATUS wValue=0xfc, wIndex=0xfe)
+        # Standard JieLi soft upgrade command in user_setup.c
+        for bm_req in (0x83, 0x03):
+            try:
+                dev.ctrl_transfer(
+                    bmRequestType=bm_req,
+                    bRequest=0x00,
+                    wValue=0x00FC,
+                    wIndex=0x00FE,
+                    data_or_wLength=0,
+                    timeout=1000,
+                )
+                logger.debug(f"EP0 soft-jump command sent with bmRequestType 0x{bm_req:02X}.")
+                return True
+            except Exception as e:
+                logger.debug(f"EP0 soft-jump note (0x{bm_req:02X}): {e}")
+
+        # 2. Fallback: Try Bulk OUT SCSI CBW with opcode 0xFD
+        try:
+            cfg = dev.get_active_configuration()
+            if cfg is None:
+                dev.set_configuration()
+                cfg = dev.get_active_configuration()
+            intf = cfg[(0, 0)]
+            ep_out = None
+            for ep in intf:
+                if (ep.bEndpointAddress & 0x80) == 0 and (ep.bmAttributes & 3) == 2:
+                    ep_out = ep
+                    break
+            if ep_out is not None:
+                from .protocol import build_cbw
+                cdb = bytearray(16)
+                cdb[0] = 0xFD
+                cbw = build_cbw(tag=0x12345678, transfer_length=0, flags=0, cdb=cdb)
+                dev.write(ep_out.bEndpointAddress, cbw, timeout=1000)
+                logger.debug("SCSI Bulk OUT soft-jump command sent.")
+                return True
+        except Exception as e:
+            logger.debug(f"SCSI Bulk soft-jump note: {e}")
+
+        return False
 
     def connect(self) -> None:
         import usb.core
@@ -155,14 +213,36 @@ class JLUsbScsiTransport(JLTransport):
         dev = None
         start_time = time.time()
         printed_wait = False
+        soft_jump_triggered = False
 
         while True:
+            candidates = self.find_devices()
             if self.target_vid and self.target_pid:
-                dev = usb.core.find(idVendor=self.target_vid, idProduct=self.target_pid)
-            else:
-                candidates = self.find_devices()
-                if candidates:
-                    dev = candidates[0]["device_obj"]
+                matches = [d for d in candidates if d["vid"] == self.target_vid and d["pid"] == self.target_pid]
+                if matches:
+                    if matches[0].get("is_uboot"):
+                        dev = matches[0]["device_obj"]
+                        break
+                    elif not soft_jump_triggered:
+                        self.trigger_soft_boot_device(matches[0]["device_obj"])
+                        soft_jump_triggered = True
+                        self.target_vid = None
+                        self.target_pid = None
+                        time.sleep(1.2)
+                        continue
+            elif candidates:
+                # Prefer devices that are already in UBOOT mode
+                uboot_devs = [d for d in candidates if d.get("is_uboot")]
+                if uboot_devs:
+                    dev = uboot_devs[0]["device_obj"]
+                    break
+                elif not soft_jump_triggered:
+                    # Found a running JieLi application device
+                    app_dev = candidates[0]
+                    self.trigger_soft_boot_device(app_dev["device_obj"])
+                    soft_jump_triggered = True
+                    time.sleep(1.2)
+                    continue
 
             if dev is not None:
                 break
@@ -171,7 +251,9 @@ class JLUsbScsiTransport(JLTransport):
                 break
 
             if not printed_wait:
-                logger.info("Waiting for JieLi USB device in download mode (hold UPDATE and press RST)...")
+                logger.info(
+                    "Waiting for JieLi USB device in download mode (hold UPDATE and press RST if not auto-reset)..."
+                )
                 printed_wait = True
 
             time.sleep(0.2)
@@ -605,27 +687,77 @@ class JLSgIoTransport(JLTransport):
             return bytes(data_buf.raw[:data_in_len])
         return b""
 
+    @classmethod
+    def trigger_soft_boot(cls, path: str) -> bool:
+        """Send private SCSI jump command to running JieLi UDISK firmware to reboot into Mask ROM UBOOT mode."""
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        except Exception as e:
+            logger.debug(f"Failed to open {path} for soft jump: {e}")
+            return False
+
+        try:
+            # Opcode 0xFD triggers private_scsi_cmd in JieLi msd_upgrade.c
+            cdb = bytearray(16)
+            cdb[0] = 0xFD
+            logger.info(f"Sending soft-jump command (SCSI 0xFD) to running JieLi device at {path}...")
+            try:
+                cls._sg_io_transfer(fd, bytes(cdb), timeout_ms=1000)
+            except Exception:
+                # Device resets immediately; ioctl error/hang/reset is expected
+                pass
+            return True
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
     def connect(self) -> None:
         start_time = time.time()
         printed_wait = False
+        soft_jump_triggered = False
 
         while True:
             candidates = self.find_devices()
             if self.dev_path:
                 matches = [d for d in candidates if d["path"] == self.dev_path]
                 if matches:
-                    self.device_info = matches[0]
-                    break
+                    if matches[0].get("is_uboot"):
+                        self.device_info = matches[0]
+                        break
+                    elif not soft_jump_triggered:
+                        logger.info(
+                            f"Target {self.dev_path} is running application firmware ({matches[0].get('vendor')} {matches[0].get('product')})."
+                        )
+                        self.trigger_soft_boot(self.dev_path)
+                        soft_jump_triggered = True
+                        self.dev_path = None
+                        time.sleep(1.2)
+                        continue
             elif candidates:
-                self.device_info = candidates[0]
-                self.dev_path = self.device_info["path"]
-                break
+                uboot_devs = [d for d in candidates if d.get("is_uboot")]
+                if uboot_devs:
+                    self.device_info = uboot_devs[0]
+                    self.dev_path = self.device_info["path"]
+                    break
+                elif not soft_jump_triggered:
+                    app_dev = candidates[0]
+                    logger.info(
+                        f"Detected running JieLi application device ({app_dev['vendor']} {app_dev['product']}) at {app_dev['path']}."
+                    )
+                    self.trigger_soft_boot(app_dev["path"])
+                    soft_jump_triggered = True
+                    time.sleep(1.2)
+                    continue
 
             if time.time() - start_time >= self.wait_seconds:
                 break
 
             if not printed_wait:
-                logger.info("Waiting for JieLi USB device in download mode (hold UPDATE and press RST)...")
+                logger.info(
+                    "Waiting for JieLi USB device in download mode (hold UPDATE and press RST if not auto-reset)..."
+                )
                 printed_wait = True
 
             time.sleep(0.2)

@@ -226,6 +226,8 @@ class JLUsbScsiTransport(JLTransport):
                     elif not soft_jump_triggered:
                         self.trigger_soft_boot_device(matches[0]["device_obj"])
                         soft_jump_triggered = True
+                        self.target_vid = None
+                        self.target_pid = None
                         time.sleep(1.2)
                         continue
             elif candidates:
@@ -730,6 +732,7 @@ class JLSgIoTransport(JLTransport):
                         )
                         self.trigger_soft_boot(self.dev_path)
                         soft_jump_triggered = True
+                        self.dev_path = None
                         time.sleep(1.2)
                         continue
             elif candidates:

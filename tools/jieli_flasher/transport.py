@@ -221,6 +221,15 @@ class JLUsbScsiTransport(JLTransport):
                 logger.debug(f"Writing Data-Out ({len(data_out)} bytes)")
                 self.ep_out.write(data_out, timeout=timeout_ms)
             except Exception as exc:
+                try:
+                    self.dev.clear_halt(self.ep_out.bEndpointAddress)
+                except Exception:
+                    pass
+                try:
+                    max_pkt = getattr(self.ep_in, "wMaxPacketSize", 64) or 64
+                    bytes(self.ep_in.read(max(CSW_LENGTH, max_pkt), timeout=1000))
+                except Exception:
+                    pass
                 raise TransportError(f"Failed to write Data-Out ({len(data_out)} bytes): {exc}") from exc
         elif data_in_len > 0:
             try:
@@ -231,6 +240,15 @@ class JLUsbScsiTransport(JLTransport):
                 logger.debug(f"Received Data-In ({len(raw_data)} bytes): {raw_data.hex()}")
                 data_in = raw_data[:data_in_len]
             except Exception as exc:
+                try:
+                    self.dev.clear_halt(self.ep_in.bEndpointAddress)
+                except Exception:
+                    pass
+                try:
+                    max_pkt = getattr(self.ep_in, "wMaxPacketSize", 64) or 64
+                    bytes(self.ep_in.read(max(CSW_LENGTH, max_pkt), timeout=1000))
+                except Exception:
+                    pass
                 raise TransportError(f"Failed to read Data-In ({data_in_len} bytes): {exc}") from exc
 
         # 3. Status Phase: Read 13-byte CSW

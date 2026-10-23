@@ -98,7 +98,7 @@ class JLFlasher:
             self.chip_id = raw_id.split(b"\x00")[0].decode("latin1", errors="replace").strip()
             logger.info(f"Chip ID / Version: {self.chip_id}")
         except Exception as exc:
-            logger.warning(f"Could not read Chip ID: {exc}")
+            logger.debug(f"Could not read Chip ID: {exc}")
             self.chip_id = "Unknown JieLi"
 
         # 2. Query Flash UUID (0x84)

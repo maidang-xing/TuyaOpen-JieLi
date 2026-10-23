@@ -94,8 +94,7 @@ class JLUsbScsiTransport(JLTransport):
         devices = []
         try:
             for dev in usb.core.find(find_all=True):
-                # Match either known VID or Mass Storage Class with JieLi strings
-                is_jieli = dev.idVendor in JIELI_USB_VIDS
+                is_jieli = False
                 mfg = ""
                 prod = ""
                 try:
@@ -104,8 +103,35 @@ class JLUsbScsiTransport(JLTransport):
                 except Exception:
                     pass
 
-                if any(k in f"{mfg} {prod}".upper() for k in ("JIELI", "BR21", "WL80", "WL82", "WL83", "AC79", "UBOOT")) :
+                # Check if device is a JieLi flash target
+                if dev.idVendor == 0x4C4A:
                     is_jieli = True
+                elif dev.idVendor in JIELI_USB_VIDS or any(k in f"{mfg} {prod}".upper() for k in ("JIELI", "BR21", "WL80", "WL82", "WL83", "AC79", "UBOOT")):
+                    # Ensure it has a Mass Storage interface (Class 0x08) or Bulk IN/OUT endpoints
+                    # (Pure CDC-ACM serial composite 3654:5155 must wait for UPDATE button press)
+                    try:
+                        for cfg in dev:
+                            for intf in cfg:
+                                if intf.bInterfaceClass == 8:
+                                    is_jieli = True
+                                    break
+                                # If vendor-specific, ensure it has both bulk IN and OUT
+                                if intf.bInterfaceClass not in (2, 10):  # Not CDC
+                                    has_in = False
+                                    has_out = False
+                                    for ep in intf:
+                                        if usb.util.endpoint_type(ep.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK:
+                                            if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN:
+                                                has_in = True
+                                            else:
+                                                has_out = True
+                                    if has_in and has_out:
+                                        is_jieli = True
+                                        break
+                            if is_jieli:
+                                break
+                    except Exception:
+                        pass
 
                 if is_jieli:
                     devices.append({

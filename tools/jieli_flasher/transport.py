@@ -65,10 +65,12 @@ class JLUsbScsiTransport(JLTransport):
         vid: Optional[int] = None,
         pid: Optional[int] = None,
         serial_number: Optional[str] = None,
+        wait_seconds: float = 30.0,
     ):
         self.target_vid = vid
         self.target_pid = pid
         self.target_serial = serial_number
+        self.wait_seconds = wait_seconds
         self.dev = None
         self.ep_out = None
         self.ep_in = None
@@ -124,22 +126,41 @@ class JLUsbScsiTransport(JLTransport):
         import usb.core
         import usb.util
 
-        if self.target_vid and self.target_pid:
-            dev = usb.core.find(idVendor=self.target_vid, idProduct=self.target_pid)
-            if not dev:
+        dev = None
+        start_time = time.time()
+        printed_wait = False
+
+        while True:
+            if self.target_vid and self.target_pid:
+                dev = usb.core.find(idVendor=self.target_vid, idProduct=self.target_pid)
+            else:
+                candidates = self.find_devices()
+                if candidates:
+                    dev = candidates[0]["device_obj"]
+
+            if dev is not None:
+                break
+
+            if time.time() - start_time >= self.wait_seconds:
+                break
+
+            if not printed_wait:
+                logger.info("Waiting for JieLi USB device in download mode (hold UPDATE and press RST)...")
+                printed_wait = True
+
+            time.sleep(0.2)
+
+        if not dev:
+            if self.target_vid and self.target_pid:
                 raise TransportError(f"USB device {self.target_vid:04X}:{self.target_pid:04X} not found.")
-        else:
-            candidates = self.find_devices()
-            if not candidates:
-                raise TransportError(
-                    "No JieLi USB device found. Ensure device is in download mode (OTG/USB plugged)."
-                )
-            dev = candidates[0]["device_obj"]
-            logger.info(
-                f"Found JieLi USB device: {dev.idVendor:04X}:{dev.idProduct:04X} "
-                f"(Bus {dev.bus}, Dev {dev.address})"
+            raise TransportError(
+                "No JieLi USB device found within timeout. Ensure device is in download mode (hold UPDATE and press RST)."
             )
 
+        logger.info(
+            f"Found JieLi USB device: {dev.idVendor:04X}:{dev.idProduct:04X} "
+            f"(Bus {dev.bus}, Dev {dev.address})"
+        )
         self.dev = dev
 
         # Reset & Detach kernel driver if active on Linux/macOS

@@ -428,7 +428,7 @@ class JLFlasher:
         logger.info(f"Executing RAM loader at 0x{target_addr:08X}...")
         cdb_jump = build_cdb(CMD_JUMP_TO_MEMORY, addr=target_addr, length=1, pad=0xFF)
         try:
-            self.transport.send_cmd(cdb_jump, timeout_ms=3000)
+            self.transport.send_cmd(cdb_jump, data_in_len=16, timeout_ms=3000)
         except Exception:
             pass
 

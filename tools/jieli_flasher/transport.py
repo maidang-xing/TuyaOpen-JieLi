@@ -102,7 +102,7 @@ class JLUsbScsiTransport(JLTransport):
                 except Exception:
                     pass
 
-                if any(k in f"{mfg} {prod}".upper() for k in ("JIELI", "BR21", "WL82", "WL83", "AC79")):
+                if any(k in f"{mfg} {prod}".upper() for k in ("JIELI", "BR21", "WL80", "WL82", "WL83", "AC79", "UBOOT")) :
                     is_jieli = True
 
                 if is_jieli:
@@ -151,12 +151,18 @@ class JLUsbScsiTransport(JLTransport):
             pass
 
         try:
-            dev.set_configuration()
-        except Exception as exc:
-            logger.debug(f"set_configuration note: {exc}")
+            cfg = dev.get_active_configuration()
+        except Exception:
+            cfg = None
+        if cfg is None:
+            try:
+                dev.set_configuration()
+            except Exception as exc:
+                logger.debug(f"set_configuration note: {exc}")
 
         # Locate Bulk IN and Bulk OUT endpoints
-        cfg = dev.get_active_configuration()
+        if cfg is None:
+            cfg = dev.get_active_configuration()
         intf = cfg[(0, 0)]
 
         ep_out = None
@@ -203,6 +209,7 @@ class JLUsbScsiTransport(JLTransport):
 
         # 1. Send Command Block Wrapper
         try:
+            logger.debug(f"Writing CBW ({len(cbw)} bytes): {cbw.hex()}")
             self.ep_out.write(cbw, timeout=timeout_ms)
         except Exception as exc:
             raise TransportError(f"Failed to write CBW (tag 0x{tag:08X}): {exc}") from exc
@@ -211,23 +218,34 @@ class JLUsbScsiTransport(JLTransport):
         data_in = b""
         if data_out and len(data_out) > 0:
             try:
+                logger.debug(f"Writing Data-Out ({len(data_out)} bytes)")
                 self.ep_out.write(data_out, timeout=timeout_ms)
             except Exception as exc:
                 raise TransportError(f"Failed to write Data-Out ({len(data_out)} bytes): {exc}") from exc
         elif data_in_len > 0:
             try:
-                data_in = bytes(self.ep_in.read(data_in_len, timeout=timeout_ms))
+                max_pkt = getattr(self.ep_in, "wMaxPacketSize", 64) or 64
+                read_len = max(data_in_len, max_pkt)
+                logger.debug(f"Reading Data-In: requesting {read_len} bytes for expected {data_in_len}")
+                raw_data = bytes(self.ep_in.read(read_len, timeout=timeout_ms))
+                logger.debug(f"Received Data-In ({len(raw_data)} bytes): {raw_data.hex()}")
+                data_in = raw_data[:data_in_len]
             except Exception as exc:
                 raise TransportError(f"Failed to read Data-In ({data_in_len} bytes): {exc}") from exc
 
         # 3. Status Phase: Read 13-byte CSW
         try:
-            raw_csw = bytes(self.ep_in.read(CSW_LENGTH, timeout=timeout_ms))
+            max_pkt = getattr(self.ep_in, "wMaxPacketSize", 64) or 64
+            read_len = max(CSW_LENGTH, max_pkt)
+            logger.debug(f"Reading CSW: requesting {read_len} bytes")
+            raw_csw = bytes(self.ep_in.read(read_len, timeout=timeout_ms))[:CSW_LENGTH]
+            logger.debug(f"Received CSW ({len(raw_csw)} bytes): {raw_csw.hex()}")
         except Exception as exc:
             # Handle possible clear halt if stalled
             try:
                 self.dev.clear_halt(self.ep_in.bEndpointAddress)
-                raw_csw = bytes(self.ep_in.read(CSW_LENGTH, timeout=timeout_ms))
+                max_pkt = getattr(self.ep_in, "wMaxPacketSize", 64) or 64
+                raw_csw = bytes(self.ep_in.read(max(CSW_LENGTH, max_pkt), timeout=timeout_ms))[:CSW_LENGTH]
             except Exception:
                 raise TransportError(f"Failed to read CSW (tag 0x{tag:08X}): {exc}") from exc
 

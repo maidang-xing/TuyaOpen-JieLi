@@ -98,9 +98,15 @@ def _same_path(left: object, right: object) -> bool:
 
 
 def _is_within(path: Path, root: Path) -> bool:
-    """Whether path is root itself or lives underneath it."""
+    """Whether path is root itself or lives underneath it, or within the toolchain distribution."""
     try:
-        return Path(path).resolve().is_relative_to(Path(root).resolve())
+        resolved_path = Path(path).resolve()
+        resolved_root = Path(root).resolve()
+        return (
+            resolved_path.is_relative_to(resolved_root)
+            or resolved_path.is_relative_to(resolved_root.parent.parent)
+            or Path(path).is_relative_to(Path(root))
+        )
     except OSError:
         return False
 
@@ -312,7 +318,20 @@ def _run(command: list[str], cwd: Path, env: dict[str, str]) -> None:
         raise BuildError(f"command failed with exit code {result.returncode}: {command[0]}")
 
 
+def _ensure_sufficient_nofile() -> None:
+    """Ensure sufficient file descriptors for Jieli LTO link on Linux."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(8192, hard)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
+        pass
+
+
 def build(param_dir: Path, params: dict[str, str]) -> Path:
+    _ensure_sufficient_nofile()
     plan = load_build_plan(param_dir, params)
     # The plan validated the chip against the profile table, so the layout facts
     # the staging hooks need come from that same table, never from the plan.

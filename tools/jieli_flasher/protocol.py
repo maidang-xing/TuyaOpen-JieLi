@@ -29,6 +29,7 @@ SUBCMD_WRITE_EFUSE       = 0xA1  # Write eFuse
 # Known JieLi USB Vendor IDs
 JIELI_USB_VIDS = [
     0x3654,  # Zhuhai JieLi Technology Co., Ltd.
+    0x4C4A,  # 'JL' JieLi Bootloader / UBOOT
     0x0483,  # STMicroelectronics (common fallback / maskrom)
     0x485A,  # 'HZ' / JieLi alternate
 ]

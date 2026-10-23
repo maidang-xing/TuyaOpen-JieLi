@@ -330,10 +330,7 @@ class JLFlasher:
         if total_len == 0:
             raise FlasherError("Cannot flash empty firmware image.")
 
-        # Step 1: Probe device
-        info = self.probe()
-
-        # Step 2: Erase
+        # Step 1: Erase
         if full_erase:
             self.erase_all()
         else:

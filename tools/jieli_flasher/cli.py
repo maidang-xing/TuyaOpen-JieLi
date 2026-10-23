@@ -236,13 +236,12 @@ def main(argv: list[str] | None = None) -> int:
         transport.connect()
         flasher = JLFlasher(transport)
 
-        # 1. Device Probe
-        info = flasher.probe()
-        print(f"[*] Chip Model: {info['chip_id']}")
-        if info["flash_uuid"]:
-            print(f"[*] Flash UUID: {info['flash_uuid']}")
-
+        # 1. Device Probe (if requested)
         if args.probe:
+            info = flasher.probe()
+            print(f"[*] Chip Model: {info['chip_id']}")
+            if info["flash_uuid"]:
+                print(f"[*] Flash UUID: {info['flash_uuid']}")
             return 0
 
         # 2. Read flash if requested

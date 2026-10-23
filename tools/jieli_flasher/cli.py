@@ -165,6 +165,13 @@ def create_parser() -> argparse.ArgumentParser:
         help="Read flash memory to file: specify <addr> <length> <output_file>",
     )
 
+    op_group.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds to wait for USB download device to appear",
+    )
+
     # Verbosity & Logging
     parser.add_argument(
         "-v", "--verbose",
@@ -178,8 +185,11 @@ def create_parser() -> argparse.ArgumentParser:
 def select_transport(args: argparse.Namespace) -> JLTransport:
     """Select and instantiate transport based on mode and availability."""
     mode = args.mode
-    wait_val = getattr(args, "wait", 30)
-    wait_sec = float(wait_val) if wait_val <= 60 else (float(wait_val) / 10.0)
+    if getattr(args, "timeout", None) is not None:
+        wait_sec = float(args.timeout)
+    else:
+        wait_val = getattr(args, "wait", 30)
+        wait_sec = float(wait_val) if wait_val <= 60 else (float(wait_val) / 10.0)
 
     if mode == "auto":
         # Check if USB device is detected

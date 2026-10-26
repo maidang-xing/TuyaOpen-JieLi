@@ -29,7 +29,7 @@
 #define JPEG_HEAD  0xE0FFD8FF
 #define JPEG_HEAD1 0xC0FFD8FF
 
-#define JL_CSI2_BUF_SIZE (128 * 1024)
+#define JL_CSI2_BUF_SIZE (256 * 1024)
 
 static struct server *s_video_rec     = NULL;
 static uint8_t       *s_video_buf     = NULL;
@@ -39,6 +39,7 @@ static bool           s_is_inited  = false;
 static bool           s_is_running = false;
 static uint32_t       s_frame_id   = 0;
 volatile int          g_csi2_open_status = 0;
+volatile int          g_csi2_rec_err = 0;
 volatile uint32_t     g_csi2_packet_count = 0;
 
 static int s_csi2_packet_cb(u8 type, u8 *buf, u32 size)
@@ -132,22 +133,31 @@ OPERATE_RET tkl_csi2_start(void)
         return OPRT_MALLOC_FAILED;
     }
 
+    uint16_t w = s_csi_cfg.width ? s_csi_cfg.width : 640;
+    uint16_t h = s_csi_cfg.height ? s_csi_cfg.height : 480;
+
     union video_req req;
     memset(&req, 0, sizeof(req));
     req.rec.camera_type = VIDEO_CAMERA_NORMAL;
     req.rec.channel     = 1;
-    req.rec.width       = s_csi_cfg.width ? s_csi_cfg.width : 640;
-    req.rec.height      = s_csi_cfg.height ? s_csi_cfg.height : 480;
+    req.rec.width       = w;
+    req.rec.src_w       = w;
+    req.rec.height      = h;
+    req.rec.src_h       = h;
     req.rec.state       = VIDEO_STATE_START;
     req.rec.format      = VIDEO_FMT_AVI;
-    req.rec.quality     = VIDEO_MID_Q;
+    req.rec.quality     = VIDEO_LOW_Q;
     req.rec.fps         = s_csi_cfg.fps ? (uint8_t)s_csi_cfg.fps : 15;
-    req.rec.real_fps    = req.rec.fps;
+    req.rec.real_fps    = 15;
+    req.rec.abr_kbps    = 3000;
+    req.rec.cycle_time  = 60;
+    req.rec.enable_dri  = 0;
     req.rec.online      = 1;
     req.rec.buf         = s_video_buf;
     req.rec.buf_len     = s_video_buf_len;
 
     int err = server_request(s_video_rec, VIDEO_REQ_REC, &req);
+    g_csi2_rec_err = err;
     if (err != 0) {
         g_csi2_open_status = 3;
         tkl_log_output("[CSI2] ERROR: VIDEO_REQ_REC failed: %d\r\n", err);

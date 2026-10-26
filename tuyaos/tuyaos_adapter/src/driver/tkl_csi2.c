@@ -145,7 +145,7 @@ OPERATE_RET tkl_csi2_start(void)
     req.rec.height      = h;
     req.rec.src_h       = h;
     req.rec.state       = VIDEO_STATE_START;
-    req.rec.format      = VIDEO_FMT_AVI;
+    req.rec.format      = USER_VIDEO_FMT_AVI;
     req.rec.quality     = VIDEO_LOW_Q;
     req.rec.fps         = s_csi_cfg.fps ? (uint8_t)s_csi_cfg.fps : 15;
     req.rec.real_fps    = 15;

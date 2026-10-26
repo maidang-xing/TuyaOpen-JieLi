@@ -31,6 +31,7 @@ void tkl_log_output(const char *format, ...)
     if (len > 0) {
         unsigned int write_len = (len < (int)sizeof(log_buf)) ? (unsigned int)len : (sizeof(log_buf) - 1);
         cdc_write_data(0, (const unsigned char *)log_buf, write_len);
+        cdc_write_data(1, (const unsigned char *)log_buf, write_len);
     }
 #endif
     va_start(args, format);

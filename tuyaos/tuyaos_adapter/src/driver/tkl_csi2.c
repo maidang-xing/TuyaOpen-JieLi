@@ -7,6 +7,7 @@
  */
 
 #include "tkl_csi2.h"
+#include "tkl_output.h"
 #include "tuya_error_code.h"
 
 #include <stdint.h>
@@ -40,6 +41,11 @@ static uint32_t       s_frame_id   = 0;
 
 static int s_csi2_packet_cb(u8 type, u8 *buf, u32 size)
 {
+    static uint32_t s_pkt_cnt = 0;
+    s_pkt_cnt++;
+    if (s_pkt_cnt <= 5 || s_pkt_cnt % 30 == 0) {
+        tkl_log_output("[CSI2-CB] packet #%u: type=%d, size=%u\r\n", s_pkt_cnt, type, size);
+    }
     if (!s_is_running || !buf || size < 8) {
         return 0;
     }
@@ -106,10 +112,13 @@ OPERATE_RET tkl_csi2_start(void)
         return OPRT_OK;
     }
 
+    tkl_log_output("[CSI2] opening video_server video0.1...\r\n");
     s_video_rec = server_open("video_server", "video0.1");
     if (!s_video_rec) {
+        tkl_log_output("[CSI2] ERROR: server_open video0.1 failed!\r\n");
         return OPRT_COM_ERROR;
     }
+    tkl_log_output("[CSI2] server_open video0.1 OK, allocating buffer...\r\n");
 
     s_video_buf_len = JL_CSI2_BUF_SIZE;
     s_video_buf     = (uint8_t *)malloc(s_video_buf_len);
@@ -136,12 +145,14 @@ OPERATE_RET tkl_csi2_start(void)
 
     int err = server_request(s_video_rec, VIDEO_REQ_REC, &req);
     if (err != 0) {
+        tkl_log_output("[CSI2] ERROR: VIDEO_REQ_REC failed: %d\r\n", err);
         server_close(s_video_rec);
         s_video_rec = NULL;
         free(s_video_buf);
         s_video_buf = NULL;
         return OPRT_COM_ERROR;
     }
+    tkl_log_output("[CSI2] VIDEO_REQ_REC OK!\r\n");
 
     req.rec.packet_cb = s_csi2_packet_cb;
     err               = server_request(s_video_rec, VIDEO_REQ_SET_PACKET_CALLBACK, &req);

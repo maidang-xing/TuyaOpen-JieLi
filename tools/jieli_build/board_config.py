@@ -832,13 +832,8 @@ def configure_usb_download_app_config(app_config_file: Path) -> None:
         '#include "board_com_api.h"\n'
         "#endif\n"
         "#endif\n"
-        "#if (defined(ENABLE_JIELI_USB_CDC_LOG) && ENABLE_JIELI_USB_CDC_LOG) || \\\n"
-        "    (defined(CONFIG_ENABLE_JIELI_USB_CDC_LOG) && CONFIG_ENABLE_JIELI_USB_CDC_LOG)\n"
         "#define TCFG_USB_SLAVE_CDC_ENABLE           1\n"
         "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS | CDC_CLASS)\n"
-        "#else\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS)\n"
-        "#endif\n"
         "#define TCFG_HOST_AUDIO_ENABLE              0\n"
         "#define TCFG_HOST_UVC_ENABLE                0\n"
         "#define TCFG_HID_HOST_ENABLE                0\n"
@@ -871,13 +866,8 @@ def configure_usb_download_board_header(board_header: Path, facts: BoardFacts) -
         '#include "board_com_api.h"\n'
         "#endif\n"
         "#endif\n"
-        "#if (defined(ENABLE_JIELI_USB_CDC_LOG) && ENABLE_JIELI_USB_CDC_LOG) || \\\n"
-        "    (defined(CONFIG_ENABLE_JIELI_USB_CDC_LOG) && CONFIG_ENABLE_JIELI_USB_CDC_LOG)\n"
         "#define TCFG_USB_SLAVE_CDC_ENABLE           1\n"
         "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS | CDC_CLASS)\n"
-        "#else\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS)\n"
-        "#endif\n"
         '#include "usb_std_class_def.h"\n'
         '#include "usb_common_def.h"\n\n'
     )

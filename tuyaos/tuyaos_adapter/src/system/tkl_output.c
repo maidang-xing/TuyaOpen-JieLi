@@ -32,11 +32,10 @@ void tkl_log_output(const char *format, ...)
         unsigned int write_len = (len < (int)sizeof(log_buf)) ? (unsigned int)len : (sizeof(log_buf) - 1);
         cdc_write_data(0, (const unsigned char *)log_buf, write_len);
     }
-#else
+#endif
     va_start(args, format);
     vprintf(format, args);
     va_end(args);
-#endif
 }
 
 OPERATE_RET tkl_log_close(void)

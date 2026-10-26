@@ -79,6 +79,9 @@ OPERATE_RET tkl_mipi_dsi_init(TUYA_MIPI_DSI_BASE_CFG_T *cfg)
         return OPRT_INVALID_PARM;
     }
     if (!tkl_mipi_dsi_size_supported(cfg->width, cfg->height)) {
+        extern void tkl_log_output(const char *format, ...);
+        tkl_log_output("[MIPI-DSI] size %ux%u not supported (hardware panel is %ux%u)\r\n",
+                       cfg->width, cfg->height, LCD_W, LCD_H);
         return OPRT_NOT_SUPPORTED;
     }
     if (s_lcd_dev != NULL) {

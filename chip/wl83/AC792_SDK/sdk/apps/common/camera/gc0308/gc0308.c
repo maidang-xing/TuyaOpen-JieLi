@@ -813,6 +813,8 @@ static s32 GC0308_power_ctl(u8 isp_dev, u8 is_work)
     return 0;
 }
 
+extern void tkl_log_output(const char *format, ...);
+
 static s32 GC0308_ID_check(void *iic)
 {
     u8 pid = 0x00;
@@ -820,6 +822,7 @@ static s32 GC0308_ID_check(void *iic)
         rdGC0308Reg(iic, 0x00, &pid);
         rdGC0308Reg(iic, 0x00, &pid);
     }
+    tkl_log_output("[GC0308] ID_check: read reg 0x00 = 0x%02x (expected 0x9b)\r\n", pid);
     printf("GC0308 Sensor ID : 0x%x\n", pid);
     if (pid != 0x9b) {
         return -1;

@@ -440,6 +440,8 @@ s32 SC1346_mipi_power_ctl(u8 isp_dev, u8 is_work)
     return 0;
 }
 
+extern void tkl_log_output(const char *format, ...);
+
 s32 SC1346_mipi_ID_check(void)
 {
     u8 pid = 0x00;
@@ -451,6 +453,7 @@ s32 SC1346_mipi_ID_check(void)
         rd_SC1346_reg(0x3108, &ver);
     }
 
+    tkl_log_output("[SC1346] ID_check: read 0x3107=0x%02x, 0x3108=0x%02x\r\n", pid, ver);
     printf("SC1346_mipi,read3107=: 0x%x,read3108=: 0x%x \n", pid, ver);
 
     // if (pid != 0x22 && ver != 0x35)
@@ -458,6 +461,7 @@ s32 SC1346_mipi_ID_check(void)
         puts("----not SC1346_mipi-----\n");
         return -1;
     }
+    tkl_log_output("[SC1346] FOUND SC1346_mipi sensor!\r\n");
     puts("----hello SC1346_mipi-----\n");
     return 0;
 }
@@ -490,11 +494,13 @@ static u8 cur_sensor_type = 0xff;
 
 s32 SC1346_mipi_check(u8 isp_dev, u32 reset_gpio, u32 pwdn_gpio, char *iic_name)
 {
-
+    tkl_log_output("[SC1346] check: dev=%d, rst=%d, pwdn=%d, iic=%s\r\n",
+                   isp_dev, reset_gpio, pwdn_gpio, iic_name ? iic_name : "NULL");
     puts("\n\n SC1346_mipi_check \n\n");
     if (!iic) {
         iic = dev_open(iic_name, 0);
         if (!iic) {
+            tkl_log_output("[SC1346] dev_open %s failed!\r\n", iic_name ? iic_name : "NULL");
             return -1;
         }
     } else {
@@ -502,7 +508,6 @@ s32 SC1346_mipi_check(u8 isp_dev, u32 reset_gpio, u32 pwdn_gpio, char *iic_name)
             return -1;
         }
     }
-    // printf("\n\n isp_dev =%d\n\n", isp_dev);
 
     reset_gpios[isp_dev] = reset_gpio;
     pwdn_gpios[isp_dev] = pwdn_gpio;

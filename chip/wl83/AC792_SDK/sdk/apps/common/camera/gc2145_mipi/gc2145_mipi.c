@@ -946,6 +946,8 @@ void GC2145_MIPI_config_SENSOR(u16 *width, u16 *height, u8 *format, u8 *frame_fr
     puts("\nGC2145 YUYV\n");
 }
 
+extern void tkl_log_output(const char *format, ...);
+
 s32 GC2145_MIPI_ID_check(void)
 {
     u8 pid = 0x00;
@@ -957,10 +959,13 @@ s32 GC2145_MIPI_ID_check(void)
         os_time_dly(10);
     }
 
+    tkl_log_output("[GC2145] ID_check: read PID=0x%02x, VER=0x%02x\r\n", pid, ver);
+
     if (pid != 0x21 || ver != 0x45) {
         puts("\n----not GC2145_MIPI-----\n");
         return -1;
     }
+    tkl_log_output("[GC2145] FOUND GC2145_MIPI sensor!\r\n");
     puts("\n----hello GC2145_MIPI-----\n");
     return 0;
 
@@ -999,9 +1004,12 @@ void GC2145_MIPI_reset(u8 isp_dev)
 
 s32 GC2145_MIPI_check(u8 isp_dev, u32 _reset_gpio, u32 _power_gpio, char *iic_name)
 {
+    tkl_log_output("[GC2145] check: dev=%d, rst=%d, pwr=%d, iic=%s\r\n",
+                   isp_dev, _reset_gpio, _power_gpio, iic_name ? iic_name : "NULL");
     if (!iic) {
         iic = dev_open(iic_name, 0);
         if (!iic) {
+            tkl_log_output("[GC2145] dev_open %s failed!\r\n", iic_name ? iic_name : "NULL");
             return -1;
         }
     } else {
@@ -1015,6 +1023,19 @@ s32 GC2145_MIPI_check(u8 isp_dev, u32 _reset_gpio, u32 _power_gpio, char *iic_na
     GC2145_MIPI_reset(isp_dev);
 
     if (0 != GC2145_MIPI_ID_check()) {
+        int found = 0;
+        for (u8 a = 0x08; a <= 0x77; a++) {
+            dev_ioctl(iic, IOCTL_IIC_START, 0);
+            int ret = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, (a << 1));
+            dev_ioctl(iic, IOCTL_IIC_STOP, 0);
+            if (ret == 0) {
+                tkl_log_output("[I2C-SCAN] Device responded at 7-bit addr 0x%02x (write 0x%02x)!\r\n", a, (a << 1));
+                found++;
+            }
+        }
+        if (!found) {
+            tkl_log_output("[I2C-SCAN] No response on %s\r\n", iic_name ? iic_name : "iic");
+        }
         dev_close(iic);
         iic = NULL;
         return -1;

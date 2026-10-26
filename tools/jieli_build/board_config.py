@@ -1150,6 +1150,24 @@ def configure_camera_board(
     if anchor not in content:
         raise BuildError(f"Jieli board file has no include insertion point: {board_file}")
 
+    if dvp_enabled:
+        content = re.sub(
+            r'HW_IIC1_PLATFORM_DATA_BEGIN\(hw_iic1_data\)[\s\S]*?HW_IIC1_PLATFORM_DATA_END\(\)',
+            '/* hw_iic1_data defined by camera config */',
+            content,
+        )
+        content = re.sub(
+            r'\{\s*"iic1"\s*,\s*&iic_dev_ops\s*,\s*\(void\s*\*\)&hw_iic1_data\s*\},?',
+            '// { "iic1", &iic_dev_ops, (void *)&hw_iic1_data },',
+            content,
+        )
+    if csi2_enabled:
+        content = re.sub(
+            r'\{\s*"iic2"\s*,\s*&iic_dev_ops\s*,\s*\(void\s*\*\)&sw_iic2_data\s*\},?',
+            '// { "iic2", &iic_dev_ops, (void *)&sw_iic2_data },',
+            content,
+        )
+
     defs = [
         f"\n{CAMERA_MARKER}",
         '#include "device/video/video.h"',

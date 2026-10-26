@@ -27,4 +27,3 @@ src/driver/tkl_kws.c
 src/driver/tkl_dvp.c
 src/driver/tkl_csi2.c
 src/driver/tkl_jpeg_codec.c
-src/driver/lcd_mipi_st7701s_rotate90.c

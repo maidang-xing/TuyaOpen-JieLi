@@ -47,7 +47,6 @@ USB_DEVICE_MACROS = {
 # and which driver that means is the SDK's business, not the board's.
 PANELS = {
     "MIPI_480x800_ST7701S": ("TCFG_LCD_MIPI_ST7701S_480x800", "MIPI_480x800_ST7701S"),
-    "MIPI_480x800_ST7701S_ROTATE90": ("TCFG_LCD_MIPI_ST7701S_480x800_ROTATE_90", "MIPI_480x800_ST7701S_ROTATE90"),
 }
 
 # A board names pins the way the vendor headers spell them, IO_PORT<L>_<NN>.

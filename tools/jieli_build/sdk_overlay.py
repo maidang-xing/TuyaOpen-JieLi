@@ -54,6 +54,7 @@ USB_DEVICE_SOURCES = (
     "apps/common/usb/device/usb_device.c",
     "apps/common/usb/device/descriptor.c",
     "apps/common/usb/device/user_setup.c",
+    "apps/common/usb/device/cdc.c",
     "apps/common/usb/device/msd.c",
     "apps/common/usb/device/msd_upgrade.c",
     "apps/common/usb/device/task_pc.c",

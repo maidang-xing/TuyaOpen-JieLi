@@ -38,11 +38,13 @@ static TUYA_DVP_CFG_T s_csi_cfg;
 static bool           s_is_inited  = false;
 static bool           s_is_running = false;
 static uint32_t       s_frame_id   = 0;
+volatile int          g_csi2_open_status = 0;
+volatile uint32_t     g_csi2_packet_count = 0;
 
 static int s_csi2_packet_cb(u8 type, u8 *buf, u32 size)
 {
-    static uint32_t s_pkt_cnt = 0;
-    s_pkt_cnt++;
+    g_csi2_packet_count++;
+    uint32_t s_pkt_cnt = g_csi2_packet_count;
     if (s_pkt_cnt <= 5 || s_pkt_cnt % 30 == 0) {
         tkl_log_output("[CSI2-CB] packet #%u: type=%d, size=%u\r\n", s_pkt_cnt, type, size);
     }
@@ -115,6 +117,7 @@ OPERATE_RET tkl_csi2_start(void)
     tkl_log_output("[CSI2] opening video_server video0.1...\r\n");
     s_video_rec = server_open("video_server", "video0.1");
     if (!s_video_rec) {
+        g_csi2_open_status = 1;
         tkl_log_output("[CSI2] ERROR: server_open video0.1 failed!\r\n");
         return OPRT_COM_ERROR;
     }
@@ -123,6 +126,7 @@ OPERATE_RET tkl_csi2_start(void)
     s_video_buf_len = JL_CSI2_BUF_SIZE;
     s_video_buf     = (uint8_t *)malloc(s_video_buf_len);
     if (!s_video_buf) {
+        g_csi2_open_status = 2;
         server_close(s_video_rec);
         s_video_rec = NULL;
         return OPRT_MALLOC_FAILED;
@@ -145,6 +149,7 @@ OPERATE_RET tkl_csi2_start(void)
 
     int err = server_request(s_video_rec, VIDEO_REQ_REC, &req);
     if (err != 0) {
+        g_csi2_open_status = 3;
         tkl_log_output("[CSI2] ERROR: VIDEO_REQ_REC failed: %d\r\n", err);
         server_close(s_video_rec);
         s_video_rec = NULL;
@@ -157,6 +162,7 @@ OPERATE_RET tkl_csi2_start(void)
     req.rec.packet_cb = s_csi2_packet_cb;
     err               = server_request(s_video_rec, VIDEO_REQ_SET_PACKET_CALLBACK, &req);
     if (err != 0) {
+        g_csi2_open_status = 4;
         memset(&req, 0, sizeof(req));
         req.rec.channel = 1;
         req.rec.state   = VIDEO_STATE_STOP;
@@ -168,7 +174,9 @@ OPERATE_RET tkl_csi2_start(void)
         return OPRT_COM_ERROR;
     }
 
+    g_csi2_open_status = 10;
     s_is_running = true;
+    tkl_log_output("[CSI2] CSI2 started successfully, status=10\r\n");
     return OPRT_OK;
 }
 

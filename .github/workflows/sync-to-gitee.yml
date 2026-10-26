@@ -1,8 +1,6 @@
 name: syncToGitee
 on:
   push:
-  pull_request:
-    types: [closed]
   release:
     types: [published]
   delete:

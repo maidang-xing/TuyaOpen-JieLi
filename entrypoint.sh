@@ -8,12 +8,6 @@ case "${GITHUB_EVENT_NAME}" in
         git push -f --all target
         git push -f --tags target
         ;;
-    pull_request)
-        if [ "${GITHUB_EVENT_ACTION}" = "closed" ]; then
-            git push -f --all target
-            git push -f --tags target
-        fi
-        ;;
     delete)
         git push -d target ${GITHUB_EVENT_REF}
         ;;

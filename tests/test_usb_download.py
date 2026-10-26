@@ -280,6 +280,13 @@ class UsbDownloadStagingTest(unittest.TestCase):
         self.assertIn("DEVICE_EVENT_FROM_OTG", usb_entry)
         self.assertIn("pc_device_event_handler(event)", usb_entry)
 
+    def test_tkl_output_supports_usb_cdc_log_switch(self):
+        tkl_output = (PLATFORM_ROOT / "tuyaos/tuyaos_adapter/src/system/tkl_output.c").read_text(encoding="utf-8")
+        self.assertIn("ENABLE_JIELI_USB_CDC_LOG", tkl_output)
+        self.assertIn("CONFIG_ENABLE_JIELI_USB_CDC_LOG", tkl_output)
+        self.assertIn("cdc_write_data", tkl_output)
+        self.assertIn("vprintf(format, args)", tkl_output)
+
 
 if __name__ == "__main__":
     unittest.main()

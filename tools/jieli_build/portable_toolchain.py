@@ -122,6 +122,10 @@ def prepare_bundled_windows_toolchain(
 
     if target.is_symlink():
         raise BuildError(f"portable toolchain target is a symbolic link: {target}")
+    bundled_dir = module_root / "tools" / "toolchains" / "windows" / "pi32"
+    if bundled_dir.is_dir() and not _missing_contents(bundled_dir):
+        return bundled_dir / "bin"
+
     if target.exists():
         missing = _missing_contents(target)
         if not missing:

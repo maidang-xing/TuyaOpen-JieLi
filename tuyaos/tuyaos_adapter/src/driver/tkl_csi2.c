@@ -26,11 +26,27 @@
 #include "device/device.h"
 #include "asm/gpio.h"
 #include "driver/device/gpio.h"
+#include "asm/eva_sfr.h"
 
 extern void avdd18_enable(uint8_t level, uint8_t step);
 extern void avdd28_enable(uint8_t level, uint8_t step);
 extern void clk_out0(uint32_t gpio, uint32_t index);
 extern void delay_us(unsigned int us);
+
+void tkl_csi2_dump_regs(void)
+{
+    tkl_log_output("[CSI2-SFR] sys=0x%08x rmap=0x%08x lane=0x%08x tval=0x%08x task=0x%08x haw=%u vaw=%u\r\n",
+                   (unsigned int)csi_sys_con, (unsigned int)csi_rmap_con,
+                   (unsigned int)csi_lane_con, (unsigned int)csi_tval_con,
+                   (unsigned int)csi_task_con,
+                   (unsigned int)csi_task_haw, (unsigned int)csi_task_vaw);
+    tkl_log_output("[CSI2-SFR] phy0=0x%08x phy1=0x%08x phy2=0x%08x | vbus: isp0=%u imc0=%u\r\n",
+                   *(volatile uint32_t *)csi_phy_con0,
+                   *(volatile uint32_t *)csi_phy_con1,
+                   *(volatile uint32_t *)csi_phy_con2,
+                   (unsigned int)vbus_set(vtid_isp0),
+                   (unsigned int)vbus_set(vtid_imc_ch0));
+}
 
 #define JL_000DC   0x63643030
 #define JPEG_HEAD  0xE0FFD8FF
@@ -259,6 +275,7 @@ OPERATE_RET tkl_csi2_start(void)
     g_csi2_open_status = 10;
     s_is_running = true;
     tkl_log_output("[CSI2] CSI2 started successfully, status=10\r\n");
+    tkl_csi2_dump_regs();
     return OPRT_OK;
 }
 

@@ -5,7 +5,8 @@
 #include "gpio.h"
 #include "generic/jiffies.h"
 #include "device/iic.h"
-#include "device/device.h"
+#include "device/device.h"
+extern void tkl_log_output(const char *format, ...);
 
 #define GC2145_MIPI_WRCMD 0x78
 #define GC2145_MIPI_RDCMD 0x79

@@ -1,4 +1,5 @@
 #include "app_config.h"
+extern void tkl_log_output(const char *format, ...);
 
 #include "iic.h"
 #include "asm/isp_dev.h"

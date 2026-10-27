@@ -154,29 +154,29 @@ class JLFlasher:
     def erase_sector(self, addr: int) -> None:
         """Erase a single 4KB sector."""
         try:
-            cdb = build_cdb(CMD_ERASE_FLASH_SECTOR, addr=addr, pad=0xFF)
-            self.transport.send_cmd(cdb, data_in_len=16, timeout_ms=3000)
+            cdb = build_cdb(SUBCMD_ERASE_SECTOR, addr=addr)
+            self.transport.send_cmd(cdb, timeout_ms=3000)
         except Exception:
-            cdb_fb = build_cdb(SUBCMD_ERASE_SECTOR, addr=addr)
+            cdb_fb = build_cdb(CMD_ERASE_FLASH_SECTOR, addr=addr, pad=0xFF)
             self.transport.send_cmd(cdb_fb, timeout_ms=3000)
 
     def erase_block(self, addr: int) -> None:
         """Erase a 64KB block."""
         try:
-            cdb = build_cdb(CMD_ERASE_FLASH_BLOCK, addr=addr, pad=0xFF)
-            self.transport.send_cmd(cdb, data_in_len=16, timeout_ms=5000)
+            cdb = build_cdb(SUBCMD_ERASE_BLOCK, addr=addr)
+            self.transport.send_cmd(cdb, timeout_ms=5000)
         except Exception:
-            cdb_fb = build_cdb(SUBCMD_ERASE_BLOCK, addr=addr)
+            cdb_fb = build_cdb(CMD_ERASE_FLASH_BLOCK, addr=addr, pad=0xFF)
             self.transport.send_cmd(cdb_fb, timeout_ms=5000)
 
     def erase_all(self) -> None:
         """Erase entire flash chip."""
         logger.info("Performing full chip erase (this may take several seconds)...")
         try:
-            cdb = build_cdb(CMD_ERASE_FLASH_CHIP, pad=0xFF)
-            self.transport.send_cmd(cdb, data_in_len=16, timeout_ms=30000)
+            cdb = build_cdb(SUBCMD_ERASE_ALL)
+            self.transport.send_cmd(cdb, timeout_ms=30000)
         except Exception:
-            cdb_fb = build_cdb(SUBCMD_ERASE_ALL)
+            cdb_fb = build_cdb(CMD_ERASE_FLASH_CHIP, pad=0xFF)
             self.transport.send_cmd(cdb_fb, timeout_ms=30000)
         logger.info("Full chip erase complete.")
 
@@ -224,20 +224,20 @@ class JLFlasher:
             try:
                 try:
                     cdb = build_cdb(
-                        CMD_WRITE_FLASH,
+                        SUBCMD_WRITE_FLASH,
                         addr=addr,
                         length=chunk_len,
                         crc=chunk_crc,
-                        pad=0xFF,
                     )
                     self.transport.send_cmd(cdb, data_out=chunk, timeout_ms=5000)
                     return
                 except Exception:
                     cdb_fb = build_cdb(
-                        SUBCMD_WRITE_FLASH,
+                        CMD_WRITE_FLASH,
                         addr=addr,
                         length=chunk_len,
                         crc=chunk_crc,
+                        pad=0xFF,
                     )
                     self.transport.send_cmd(cdb_fb, data_out=chunk, timeout_ms=5000)
                     return

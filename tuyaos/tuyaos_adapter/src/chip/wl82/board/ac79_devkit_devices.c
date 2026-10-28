@@ -1,4 +1,4 @@
-/* AC79_DevKitBoard-only device registration for TKL display and touch buses. */
+/* AC79_DevKitBoard SDK device-table glue used by the platform TKL adapters. */
 #if defined(JIELI_SELECTED_CHIP_WL82) && defined(JIELI_AC79_DEVKIT_BOARD)
 
 #include "system/init.h"

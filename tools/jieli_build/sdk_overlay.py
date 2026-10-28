@@ -52,6 +52,7 @@ USB_DEVICE_SOURCES = (
     "apps/common/usb/usb_epbuf_manager.c",
     "apps/common/usb/device/usb_device.c",
     "apps/common/usb/device/descriptor.c",
+    "apps/common/usb/device/cdc.c",
     "apps/common/usb/device/user_setup.c",
     "apps/common/usb/device/msd.c",
     "apps/common/usb/device/msd_upgrade.c",

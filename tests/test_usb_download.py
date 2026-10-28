@@ -260,6 +260,7 @@ class UsbDownloadStagingTest(unittest.TestCase):
     )
     def test_sdk_has_download_entry_points_on_both_chips(self):
         essential = (
+            "apps/common/usb/device/cdc.c",
             "apps/common/usb/device/msd_upgrade.c",
             "apps/common/usb/device/user_setup.c",
             "apps/common/usb/device/task_pc.c",

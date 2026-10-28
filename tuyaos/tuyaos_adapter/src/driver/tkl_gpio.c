@@ -158,36 +158,37 @@ static int tkl_irq_edge(TUYA_GPIO_IRQ_E mode, int *edge)
     }
 }
 
-static void tkl_gpio_apply_pull(u32 pin, TUYA_GPIO_MODE_E mode)
+static int tkl_gpio_apply_pull(u32 pin, TUYA_GPIO_MODE_E mode)
 {
 #if defined(JIELI_SELECTED_CHIP_WL82)
     /* wl82 takes a plain 1/0 per direction and fixes the resistor at 10K, so
      * the two calls are always made as a pair to keep the opposite leg off. */
     if (mode == TUYA_GPIO_PULLUP) {
-        (void)gpio_set_pull_down(pin, 0);
-        (void)gpio_set_pull_up(pin, 1);
+        if (gpio_set_pull_down(pin, 0) != 0) return -1;
+        if (gpio_set_pull_up(pin, 1) != 0) return -1;
     } else if (mode == TUYA_GPIO_PULLDOWN) {
-        (void)gpio_set_pull_up(pin, 0);
-        (void)gpio_set_pull_down(pin, 1);
+        if (gpio_set_pull_up(pin, 0) != 0) return -1;
+        if (gpio_set_pull_down(pin, 1) != 0) return -1;
     } else {
-        (void)gpio_set_pull_up(pin, 0);
-        (void)gpio_set_pull_down(pin, 0);
+        if (gpio_set_pull_up(pin, 0) != 0) return -1;
+        if (gpio_set_pull_down(pin, 0) != 0) return -1;
     }
 #else
     /* wl83 selects a strength. Only the 10K taps exist on this part - the
      * header marks 100K and 1M as unsupported - so 10K is the one to use, with
      * the opposite leg explicitly disabled. */
     if (mode == TUYA_GPIO_PULLUP) {
-        (void)gpio_set_pull_down(pin, GPIO_PULL_DOWN_DISABLE);
-        (void)gpio_set_pull_up(pin, GPIO_PULL_UP_10K);
+        if (gpio_set_pull_down(pin, GPIO_PULL_DOWN_DISABLE) != 0) return -1;
+        if (gpio_set_pull_up(pin, GPIO_PULL_UP_10K) != 0) return -1;
     } else if (mode == TUYA_GPIO_PULLDOWN) {
-        (void)gpio_set_pull_up(pin, GPIO_PULL_UP_DISABLE);
-        (void)gpio_set_pull_down(pin, GPIO_PULL_DOWN_10K);
+        if (gpio_set_pull_up(pin, GPIO_PULL_UP_DISABLE) != 0) return -1;
+        if (gpio_set_pull_down(pin, GPIO_PULL_DOWN_10K) != 0) return -1;
     } else {
-        (void)gpio_set_pull_up(pin, GPIO_PULL_UP_DISABLE);
-        (void)gpio_set_pull_down(pin, GPIO_PULL_DOWN_DISABLE);
+        if (gpio_set_pull_up(pin, GPIO_PULL_UP_DISABLE) != 0) return -1;
+        if (gpio_set_pull_down(pin, GPIO_PULL_DOWN_DISABLE) != 0) return -1;
     }
 #endif
+    return 0;
 }
 
 #if defined(JIELI_SELECTED_CHIP_WL82)
@@ -331,6 +332,14 @@ OPERATE_RET tkl_gpio_init(TUYA_GPIO_NUM_E pin_id, const TUYA_GPIO_BASE_CFG_T *cf
         return OPRT_INVALID_PARM;
     }
 
+    if ((cfg->direct != TUYA_GPIO_OUTPUT && cfg->direct != TUYA_GPIO_INPUT) ||
+        (cfg->mode != TUYA_GPIO_PULLUP && cfg->mode != TUYA_GPIO_PULLDOWN &&
+         cfg->mode != TUYA_GPIO_HIGH_IMPEDANCE && cfg->mode != TUYA_GPIO_FLOATING &&
+         cfg->mode != TUYA_GPIO_OPENDRAIN && cfg->mode != TUYA_GPIO_OPENDRAIN_PULLUP) ||
+        (cfg->level != TUYA_GPIO_LEVEL_LOW && cfg->level != TUYA_GPIO_LEVEL_HIGH)) {
+        return OPRT_INVALID_PARM;
+    }
+
     /* Check the mode before touching the pin. The vendor API has no open-drain
      * setting - gpio_set_hd() selects a drive strength, not an output type - so
      * an open-drain request cannot be honoured. Driving it push-pull instead
@@ -344,21 +353,22 @@ OPERATE_RET tkl_gpio_init(TUYA_GPIO_NUM_E pin_id, const TUYA_GPIO_BASE_CFG_T *cf
 
     /* Digital function: the analogue alternative (die = 0) is only meaningful
      * for pins routed to the ADC, which this contract does not cover. */
-    (void)gpio_set_die((u32)pin_id, 1);
+    if (gpio_set_die((u32)pin_id, 1) != 0) return OPRT_COM_ERROR;
 
     if (cfg->direct == TUYA_GPIO_OUTPUT) {
-        (void)gpio_direction_output((u32)pin_id,
-                                    cfg->level == TUYA_GPIO_LEVEL_HIGH ? 1 : 0);
-        return OPRT_OK;
+        if (gpio_direction_output((u32)pin_id,
+                                  cfg->level == TUYA_GPIO_LEVEL_HIGH ? 1 : 0) != 0) {
+            return OPRT_COM_ERROR;
+        }
+        return tkl_gpio_apply_pull((u32)pin_id, cfg->mode) == 0 ? OPRT_OK : OPRT_COM_ERROR;
     }
 
-    (void)gpio_direction_input((u32)pin_id);
+    if (gpio_direction_input((u32)pin_id) != 0) return OPRT_COM_ERROR;
 
     /* Pull selection is mapped for both chips now: wl82 has a fixed 10K up/down
      * and wl83 picks the 10K tap. A mode with no pull (HIGH_IMPEDANCE,
      * FLOATING) clears both legs. */
-    tkl_gpio_apply_pull((u32)pin_id, cfg->mode);
-    return OPRT_OK;
+    return tkl_gpio_apply_pull((u32)pin_id, cfg->mode) == 0 ? OPRT_OK : OPRT_COM_ERROR;
 }
 
 OPERATE_RET tkl_gpio_deinit(TUYA_GPIO_NUM_E pin_id)
@@ -375,8 +385,10 @@ OPERATE_RET tkl_gpio_deinit(TUYA_GPIO_NUM_E pin_id)
 
     /* Leave the pin as a floating input rather than holding whatever level it
      * was last driven to. */
-    (void)gpio_direction_input((u32)pin_id);
-    tkl_gpio_apply_pull((u32)pin_id, TUYA_GPIO_FLOATING);
+    if (gpio_direction_input((u32)pin_id) != 0 ||
+        tkl_gpio_apply_pull((u32)pin_id, TUYA_GPIO_FLOATING) != 0) {
+        return OPRT_COM_ERROR;
+    }
     return OPRT_OK;
 }
 
@@ -388,8 +400,8 @@ OPERATE_RET tkl_gpio_write(TUYA_GPIO_NUM_E pin_id, TUYA_GPIO_LEVEL_E level)
     if (level != TUYA_GPIO_LEVEL_LOW && level != TUYA_GPIO_LEVEL_HIGH) {
         return OPRT_INVALID_PARM;
     }
-    (void)gpio_direction_output((u32)pin_id, level == TUYA_GPIO_LEVEL_HIGH ? 1 : 0);
-    return OPRT_OK;
+    return gpio_direction_output((u32)pin_id, level == TUYA_GPIO_LEVEL_HIGH ? 1 : 0) == 0 ?
+               OPRT_OK : OPRT_COM_ERROR;
 }
 
 OPERATE_RET tkl_gpio_read(TUYA_GPIO_NUM_E pin_id, TUYA_GPIO_LEVEL_E *level)
@@ -397,7 +409,11 @@ OPERATE_RET tkl_gpio_read(TUYA_GPIO_NUM_E pin_id, TUYA_GPIO_LEVEL_E *level)
     if (!tkl_gpio_valid(pin_id) || level == NULL) {
         return OPRT_INVALID_PARM;
     }
-    *level = gpio_read((u32)pin_id) ? TUYA_GPIO_LEVEL_HIGH : TUYA_GPIO_LEVEL_LOW;
+    {
+        int value = gpio_read((u32)pin_id);
+        if (value < 0) return OPRT_COM_ERROR;
+        *level = value ? TUYA_GPIO_LEVEL_HIGH : TUYA_GPIO_LEVEL_LOW;
+    }
     return OPRT_OK;
 }
 

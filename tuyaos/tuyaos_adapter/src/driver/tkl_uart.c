@@ -40,6 +40,10 @@ static void *s_uart_handles[TKL_UART_PORT_MAX];
  * tkl_uart_deinit() clears it whichever backend is built. */
 static volatile uint8_t s_uart_rx_active[TKL_UART_PORT_MAX];
 
+#if defined(JIELI_SELECTED_CHIP_WL82)
+extern OPERATE_RET jieli_wl82_uart0_pinmux_apply(void);
+#endif
+
 #if defined(JIELI_SELECTED_CHIP_WL83)
 /* The vendor ISR must not call dev_read(): that path takes a mutex and the SDK
  * asserts with "os_mutex_pend: in_irq". So the ISR only posts a semaphore and a
@@ -245,6 +249,14 @@ OPERATE_RET tkl_uart_init(TUYA_UART_NUM_E port_id, TUYA_UART_BASE_CFG_T *cfg)
     if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX || cfg == NULL) {
         return OPRT_INVALID_PARM;
     }
+    /* The registered JieLi UART device API only exposes baud-rate control;
+     * framing and hardware flow control are fixed by the SDK. Do not report a
+     * successful init for settings the backend cannot apply. */
+    if (cfg->baudrate == 0u || cfg->databits != TUYA_UART_DATA_LEN_8BIT ||
+        cfg->stopbits != TUYA_UART_STOP_LEN_1BIT ||
+        cfg->parity != TUYA_UART_PARITY_TYPE_NONE || cfg->flowctrl != TUYA_UART_FLOWCTRL_NONE) {
+        return OPRT_NOT_SUPPORTED;
+    }
     device_name = jieli_uart_device_name(port_id);
     if (device_name == NULL) {
         return OPRT_NOT_SUPPORTED;
@@ -254,6 +266,16 @@ OPERATE_RET tkl_uart_init(TUYA_UART_NUM_E port_id, TUYA_UART_BASE_CFG_T *cfg)
     }
 
     s_uart_handles[port_id] = dev_open(device_name, NULL);
+#if defined(JIELI_SELECTED_CHIP_WL82)
+    /* dev_open() runs the SDK's board default pin setup. Re-apply a Tuya
+     * pinmux selection made before tkl_uart_init() and before UART_START. */
+    if (s_uart_handles[port_id] != NULL && port_id == TUYA_UART_NUM_0 &&
+        jieli_wl82_uart0_pinmux_apply() != OPRT_OK) {
+        dev_close(s_uart_handles[port_id]);
+        s_uart_handles[port_id] = NULL;
+        return OPRT_COM_ERROR;
+    }
+#endif
     if (s_uart_handles[port_id] != NULL &&
         (dev_ioctl(s_uart_handles[port_id], jieli_uart_ioctl(JIELI_UART_IOCTL_SET_CIRCULAR_BUFF_ADDR),
                    (u32)(uintptr_t)s_uart_rx_buffer[port_id]) != 0 ||
@@ -308,6 +330,12 @@ OPERATE_RET tkl_uart_deinit(TUYA_UART_NUM_E port_id)
         while (s_uart_rx_thread[port_id] != NULL && spins < 20u) {
             (void)tkl_system_sleep(5);
             spins++;
+        }
+        /* The callback runs in this worker and may still be using the UART
+         * handle. Keep the handle alive if it does not exit in time; callers
+         * can retry deinit after the worker observes the stop request. */
+        if (s_uart_rx_thread[port_id] != NULL) {
+            return OPRT_COM_ERROR;
         }
     }
 

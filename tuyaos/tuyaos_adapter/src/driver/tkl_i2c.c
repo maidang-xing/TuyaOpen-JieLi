@@ -5,6 +5,13 @@
 
 #include "device.h"
 #include "iic.h"
+#if defined(JIELI_SELECTED_CHIP_WL82)
+#include "ioctl_cmds.h"
+#endif
+
+#if defined(JIELI_SELECTED_CHIP_WL82)
+extern OPERATE_RET jieli_wl82_iic1_pinmux_apply(void);
+#endif
 
 /* I2C master, built on each chip's byte-level IIC device.
  *
@@ -143,10 +150,43 @@ static OPERATE_RET jieli_i2c_ioctl(void *handle, uint32_t cmd, uint32_t arg)
 OPERATE_RET tkl_i2c_init(TUYA_I2C_NUM_E port, const TUYA_IIC_BASE_CFG_T *cfg)
 {
     const char *name;
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    uint32_t speed_hz;
+#endif
 
     if (cfg == NULL || !jieli_i2c_valid(port)) {
         return OPRT_INVALID_PARM;
     }
+    if (cfg->role != TUYA_IIC_MODE_MASTER) {
+        return OPRT_NOT_SUPPORTED;
+    }
+    if (cfg->addr_width != TUYA_IIC_ADDRESS_7BIT) {
+        /* The TKL transaction path emits a 7-bit address phase; accepting
+         * 10-bit mode here would silently address the wrong device. */
+        return OPRT_NOT_SUPPORTED;
+    }
+    if (cfg->speed != TUYA_IIC_BUS_SPEED_100K && cfg->speed != TUYA_IIC_BUS_SPEED_400K &&
+        cfg->speed != TUYA_IIC_BUS_SPEED_1M && cfg->speed != TUYA_IIC_BUS_SPEED_3_4M) {
+        return OPRT_INVALID_PARM;
+    }
+#if defined(JIELI_SELECTED_CHIP_WL82)
+    /* AC79's iic0 is bit-banged with a board-constant delay. The SDK exposes
+     * no runtime SCL-rate control for it. iic1 is the single hardware bus; its
+     * documented DevKit default divider 0x3f is ~385 kHz (the TKL 400 kHz
+     * standard-speed class). Do not pass a Hz enum as this SDK expects a raw
+     * divider in IOCTL_SET_SPEED. Other requested speeds have no verified
+     * divider/clock formula in the checked-in SDK and are rejected. */
+    if (port != TUYA_I2C_NUM_1 || cfg->speed != TUYA_IIC_BUS_SPEED_400K) {
+        return OPRT_NOT_SUPPORTED;
+    }
+#else
+    switch (cfg->speed) {
+    case TUYA_IIC_BUS_SPEED_100K: speed_hz = 100000u; break;
+    case TUYA_IIC_BUS_SPEED_400K: speed_hz = 400000u; break;
+    case TUYA_IIC_BUS_SPEED_1M: speed_hz = 1000000u; break;
+    default: return OPRT_NOT_SUPPORTED; /* no verified 3.4 MHz mode */
+    }
+#endif
     name = jieli_i2c_device_name(port);
     if (s_i2c_handles[port] != NULL) {
         return OPRT_OK;
@@ -156,10 +196,30 @@ OPERATE_RET tkl_i2c_init(TUYA_I2C_NUM_E port, const TUYA_IIC_BASE_CFG_T *cfg)
         /* The board profile did not register this port. */
         return OPRT_NOT_SUPPORTED;
     }
-    /* Baudrate is baked into each board's iic platform data; neither device
-     * stack exposes a portable "set rate now" that is valid before the port is
-     * opened on both chips, so a cfg->speed that disagrees with the board is
-     * reported rather than silently ignored. */
+#if defined(JIELI_SELECTED_CHIP_WL82)
+    /* The vendor opens the board's default hardware-IIC pin pair. Re-apply a
+     * requested TKL IIC1 group after open so the SDK's default does not win. */
+    if (port == TUYA_I2C_NUM_1 && jieli_wl82_iic1_pinmux_apply() != OPRT_OK) {
+        dev_close(s_i2c_handles[port]);
+        s_i2c_handles[port] = NULL;
+        return OPRT_COM_ERROR;
+    }
+    if (dev_ioctl(s_i2c_handles[port], IOCTL_SET_SPEED, 0x3fu) != 0) {
+        dev_close(s_i2c_handles[port]);
+        s_i2c_handles[port] = NULL;
+        return OPRT_COM_ERROR;
+    }
+#else
+    /* The WL83 SDK documents IOCTL_IIC_SET_BAUDRATE as Hz. This port table
+     * only selects registered hardware controllers (iic0..iic2); software IIC
+     * devices have a no-op implementation for this command and are not mapped
+     * by jieli_i2c_device_name(). */
+    if (dev_ioctl(s_i2c_handles[port], IOCTL_IIC_SET_BAUDRATE, speed_hz) != 0) {
+        dev_close(s_i2c_handles[port]);
+        s_i2c_handles[port] = NULL;
+        return OPRT_COM_ERROR;
+    }
+#endif
     return OPRT_OK;
 }
 
@@ -215,7 +275,8 @@ OPERATE_RET tkl_i2c_master_send(TUYA_I2C_NUM_E port, uint16_t dev_addr, const vo
     uint32_t i;
     OPERATE_RET rt;
 
-    if (!jieli_i2c_valid(port) || s_i2c_handles[port] == NULL || data == NULL || size == 0) {
+    if (!jieli_i2c_valid(port) || s_i2c_handles[port] == NULL || data == NULL || size == 0 ||
+        dev_addr > 0x7Fu) {
         return OPRT_INVALID_PARM;
     }
     if (size > 0xFFFFu) {
@@ -269,7 +330,8 @@ OPERATE_RET tkl_i2c_master_receive(TUYA_I2C_NUM_E port, uint16_t dev_addr, void 
     uint32_t i;
     OPERATE_RET rt;
 
-    if (!jieli_i2c_valid(port) || s_i2c_handles[port] == NULL || data == NULL || size == 0) {
+    if (!jieli_i2c_valid(port) || s_i2c_handles[port] == NULL || data == NULL || size == 0 ||
+        dev_addr > 0x7Fu) {
         return OPRT_INVALID_PARM;
     }
 

@@ -2,6 +2,8 @@
 #include "tuya_error_code.h"
 
 #include "asm/cpu.h"
+#include "asm/iic.h"
+#include "asm/spi.h"
 #include "gpio.h"
 
 /* Defined in tkl_gpio.c. It is the single per-chip table of which Tuya pin
@@ -11,24 +13,13 @@ extern int jieli_pin_exists(uint32_t pin);
 
 /* Peripheral pin muxing, as opposed to driving a pin as plain GPIO.
  *
- * Only wl83 has an API for this. Its gpio_function_t is a per-pin function
- * selector and gpio_enable_function()/gpio_disable_function() apply it:
+ * WL83 has a per-pin gpio_function_t selector. WL82 has different, narrower
+ * mechanisms: UART0 selects one of four documented pairs, hardware IIC1 selects
+ * one of four documented pairs, and SPI selects one of the board's spi_io[]
+ * groups. These are group selectors, not a crossbar that accepts any GPIO.
+ * Unsupported pins/functions are refused rather than approximated.
  *
- *     gpio_enable_function(gpio, fn, io_init)   claim a pin for a peripheral
- *     gpio_disable_function(gpio, fn, io_uninit) hand it back
- *
- * wl82 has no equivalent. Its device/gpio.h exposes only UART-specific helpers
- * (gpio_set_uart0/1/2, gpio_uart_rx_input, gpio_output_channle), and each of
- * those takes a *channel* index rather than deriving one from the pin, so
- * choosing the argument needs a pin-to-channel table the SDK does not publish.
- * Guessing that table would put a wrong signal on a pin, so every request on
- * wl82 is refused and the rest of the peripheral drivers on that part keep
- * owning their own pin setup. That is the same shape as tkl_mipi_dsi, which is
- * wl83-only for the same reason.
- *
- * What is mapped below is only where the vendor enum member is the same thing
- * under the same name. Where the vendor has no member, or where the member is
- * ambiguous, the request is refused rather than approximated:
+ * WL83 mappings that cannot be derived from the vendor ABI remain refused:
  *
  *   SPI0/1/2 MISO, MOSI, CS
  *       The vendor names its four data lines DA0..DA3 and CLK. Nothing in the
@@ -98,6 +89,173 @@ static int tkl_pinmux_lookup(TUYA_PIN_FUNC_E pin_func, gpio_function_t *fn)
 }
 #endif /* JIELI_SELECTED_CHIP_WL83 */
 
+#if defined(JIELI_SELECTED_CHIP_WL82)
+extern OPERATE_RET jieli_wl82_spi_pinmux_select(uint32_t spi_port, uint32_t group);
+
+/* WL82 does not have WL83's per-pin function selector, but UART0 has four
+ * documented TX/RX groups in the vendor SDK. Keep this mapping explicit: the
+ * pinmux API takes one pin at a time, while gpio_set_uart0() switches the pair
+ * as a unit. This intentionally rejects pins outside the SDK's groups. */
+typedef struct {
+    uint32_t tx_pin;
+    uint32_t rx_pin;
+} jieli_wl82_uart0_pin_group_t;
+
+static const jieli_wl82_uart0_pin_group_t s_wl82_uart0_pin_groups[] = {
+    {IO_PORTA_05, IO_PORTA_06},
+    {IO_PORTB_01, IO_PORTB_02},
+    {IO_PORTA_03, IO_PORTA_04},
+    {IO_PORTH_00, IO_PORTH_01},
+};
+
+/* -1 means the board's staged default group remains in effect. */
+static int s_wl82_uart0_pin_group = -1;
+static uint32_t s_wl82_uart0_tx_pin = UINT32_MAX;
+static uint32_t s_wl82_uart0_rx_pin = UINT32_MAX;
+
+typedef struct {
+    uint32_t scl_pin;
+    uint32_t sda_pin;
+    uint32_t io_map_value;
+} jieli_wl82_iic1_pin_group_t;
+
+static const jieli_wl82_iic1_pin_group_t s_wl82_iic1_pin_groups[] = {
+    {IO_PORT_USB_DPA, IO_PORT_USB_DMA, 0u},
+    {IO_PORTA_07, IO_PORTA_08, BIT(18)},
+    {IO_PORTC_01, IO_PORTC_02, BIT(19)},
+    {IO_PORTH_00, IO_PORTH_01, BIT(18) | BIT(19)},
+};
+
+static int s_wl82_iic1_pin_group = -1;
+static uint32_t s_wl82_iic1_scl_pin = UINT32_MAX;
+static uint32_t s_wl82_iic1_sda_pin = UINT32_MAX;
+static int s_wl82_spi_route_group[3] = {-1, -1, -1};
+
+typedef struct {
+    uint8_t spi_port;
+    uint8_t group;
+    uint32_t miso_pin;
+    uint32_t mosi_pin;
+    uint32_t clk_pin;
+    uint32_t cs_pin;
+} jieli_wl82_spi_pin_group_t;
+
+/* These are the vendor SDK's spi_io[] entries. spi0 group A is the flash bus,
+ * and spi2 group B consumes the flash/SDRAM or USB pins, so neither is offered
+ * as an application pinmux target. */
+static const jieli_wl82_spi_pin_group_t s_wl82_spi_pin_groups[] = {
+    {0u, 1u, IO_PORTC_00, IO_PORTC_04, IO_PORTC_03, IO_PORTC_05},
+    {1u, 0u, IO_PORTB_05, IO_PORTB_07, IO_PORTB_06, UINT32_MAX},
+    {1u, 1u, IO_PORTC_08, IO_PORTC_10, IO_PORTC_09, UINT32_MAX},
+    {2u, 0u, IO_PORTH_02, IO_PORTH_01, IO_PORTH_00, UINT32_MAX},
+    {2u, 2u, IO_PORTA_02, IO_PORTA_04, IO_PORTA_03, UINT32_MAX},
+};
+
+static int jieli_wl82_iic1_group_for_pin(uint32_t pin, TUYA_PIN_FUNC_E pin_func)
+{
+    unsigned int i;
+
+    for (i = 0; i < sizeof(s_wl82_iic1_pin_groups) / sizeof(s_wl82_iic1_pin_groups[0]); i++) {
+        if ((pin_func == TUYA_IIC1_SCL && pin == s_wl82_iic1_pin_groups[i].scl_pin) ||
+            (pin_func == TUYA_IIC1_SDA && pin == s_wl82_iic1_pin_groups[i].sda_pin)) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int jieli_wl82_spi_role(TUYA_PIN_FUNC_E pin_func, uint32_t *spi_port)
+{
+    switch (pin_func) {
+    case TUYA_SPI0_MISO: *spi_port = 0u; return 0;
+    case TUYA_SPI0_MOSI: *spi_port = 0u; return 1;
+    case TUYA_SPI0_CLK:  *spi_port = 0u; return 2;
+    case TUYA_SPI1_MISO: *spi_port = 1u; return 0;
+    case TUYA_SPI1_MOSI: *spi_port = 1u; return 1;
+    case TUYA_SPI1_CLK:  *spi_port = 1u; return 2;
+    case TUYA_SPI2_MISO: *spi_port = 2u; return 0;
+    case TUYA_SPI2_MOSI: *spi_port = 2u; return 1;
+    case TUYA_SPI2_CLK:  *spi_port = 2u; return 2;
+    default: return -1;
+    }
+}
+
+static int jieli_wl82_spi_group_for_pin(uint32_t pin, TUYA_PIN_FUNC_E pin_func, uint32_t *spi_port)
+{
+    int role = jieli_wl82_spi_role(pin_func, spi_port);
+    unsigned int i;
+
+    if (role < 0) {
+        return -1;
+    }
+    for (i = 0; i < sizeof(s_wl82_spi_pin_groups) / sizeof(s_wl82_spi_pin_groups[0]); i++) {
+        const jieli_wl82_spi_pin_group_t *group = &s_wl82_spi_pin_groups[i];
+        uint32_t expected_pin;
+        if (group->spi_port != *spi_port) {
+            continue;
+        }
+        switch (role) {
+        case 0: expected_pin = group->miso_pin; break;
+        case 1: expected_pin = group->mosi_pin; break;
+        default: expected_pin = group->clk_pin; break;
+        }
+        if (pin == expected_pin) {
+            *spi_port = group->spi_port;
+            return group->group;
+        }
+    }
+    return -1;
+}
+
+static int jieli_wl82_uart0_group_for_pin(uint32_t pin, TUYA_PIN_FUNC_E pin_func)
+{
+    unsigned int i;
+
+    if (pin_func != TUYA_UART0_TX && pin_func != TUYA_UART0_RX) {
+        return -1;
+    }
+    for (i = 0; i < sizeof(s_wl82_uart0_pin_groups) / sizeof(s_wl82_uart0_pin_groups[0]); i++) {
+        if ((pin_func == TUYA_UART0_TX && pin == s_wl82_uart0_pin_groups[i].tx_pin) ||
+            (pin_func == TUYA_UART0_RX && pin == s_wl82_uart0_pin_groups[i].rx_pin)) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* tkl_uart_init() calls this after dev_open(), since the vendor driver applies
+ * the board's default group while opening the device. */
+OPERATE_RET jieli_wl82_uart0_pinmux_apply(void)
+{
+    if (s_wl82_uart0_pin_group < 0) {
+        return OPRT_OK;
+    }
+    return gpio_set_uart0((unsigned int)s_wl82_uart0_pin_group) == 0 ? OPRT_OK : OPRT_COM_ERROR;
+}
+
+OPERATE_RET jieli_wl82_iic1_pinmux_apply(void)
+{
+    const jieli_wl82_iic1_pin_group_t *group;
+
+    if (s_wl82_iic1_pin_group < 0) {
+        return OPRT_OK;
+    }
+    group = &s_wl82_iic1_pin_groups[s_wl82_iic1_pin_group];
+    JL_IOMAP->CON1 = (JL_IOMAP->CON1 & ~(BIT(18) | BIT(19))) | group->io_map_value;
+    if (group->scl_pin == IO_PORT_USB_DPA && group->sda_pin == IO_PORT_USB_DMA) {
+        usb_iomode(0, 1);
+    }
+    if (gpio_direction_output(group->scl_pin, 1) != 0 || gpio_direction_output(group->sda_pin, 1) != 0 ||
+        gpio_set_pull_up(group->scl_pin, 1) != 0 || gpio_set_pull_up(group->sda_pin, 1) != 0 ||
+        gpio_set_pull_down(group->scl_pin, 0) != 0 || gpio_set_pull_down(group->sda_pin, 0) != 0 ||
+        gpio_set_hd(group->scl_pin, 0) != 0 || gpio_set_hd(group->sda_pin, 0) != 0 ||
+        gpio_set_die(group->scl_pin, 1) != 0 || gpio_set_die(group->sda_pin, 1) != 0) {
+        return OPRT_COM_ERROR;
+    }
+    return OPRT_OK;
+}
+#endif /* JIELI_SELECTED_CHIP_WL82 */
+
 OPERATE_RET tkl_io_pinmux_config(TUYA_PIN_NAME_E pin, TUYA_PIN_FUNC_E pin_func)
 {
     /* The upper bound alone is not enough: IO_MAX_NUM is derived from the last
@@ -148,10 +306,102 @@ OPERATE_RET tkl_io_pinmux_config(TUYA_PIN_NAME_E pin, TUYA_PIN_FUNC_E pin_func)
         return OPRT_OK;
     }
 #else
-    /* wl82: no generic pin-function API exists on this part. See the file
-     * comment - the UART-only helpers need a channel index that cannot be
-     * derived from the pin. */
-    (void)pin_func;
+    /* WL82 UART0 can switch only among the four paired routes documented by
+     * asm/gpio.h. Use the same pair whether TX or RX is the first configured
+     * pin, and reject all unsupported pin/function combinations. */
+    if (pin_func == TUYA_UART0_TX || pin_func == TUYA_UART0_RX) {
+        int channel = jieli_wl82_uart0_group_for_pin((uint32_t)pin, pin_func);
+        if (channel < 0) {
+            return OPRT_NOT_SUPPORTED;
+        }
+        if ((pin_func == TUYA_UART0_TX && s_wl82_uart0_rx_pin != UINT32_MAX &&
+             s_wl82_uart0_pin_groups[channel].rx_pin != s_wl82_uart0_rx_pin) ||
+            (pin_func == TUYA_UART0_RX && s_wl82_uart0_tx_pin != UINT32_MAX &&
+             s_wl82_uart0_pin_groups[channel].tx_pin != s_wl82_uart0_tx_pin)) {
+            return OPRT_INVALID_PARM;
+        }
+        if (gpio_set_uart0((unsigned int)channel) != 0) {
+            return OPRT_COM_ERROR;
+        }
+        s_wl82_uart0_pin_group = channel;
+        if (pin_func == TUYA_UART0_TX) {
+            s_wl82_uart0_tx_pin = (uint32_t)pin;
+        } else {
+            s_wl82_uart0_rx_pin = (uint32_t)pin;
+        }
+        return OPRT_OK;
+    }
+
+    if (pin_func == TUYA_IIC1_SCL || pin_func == TUYA_IIC1_SDA) {
+        int group = jieli_wl82_iic1_group_for_pin((uint32_t)pin, pin_func);
+        if (group < 0) {
+            return OPRT_NOT_SUPPORTED;
+        }
+        if ((pin_func == TUYA_IIC1_SCL && s_wl82_iic1_sda_pin != UINT32_MAX &&
+             s_wl82_iic1_pin_groups[group].sda_pin != s_wl82_iic1_sda_pin) ||
+            (pin_func == TUYA_IIC1_SDA && s_wl82_iic1_scl_pin != UINT32_MAX &&
+             s_wl82_iic1_pin_groups[group].scl_pin != s_wl82_iic1_scl_pin)) {
+            return OPRT_INVALID_PARM;
+        }
+        s_wl82_iic1_pin_group = group;
+        if (pin_func == TUYA_IIC1_SCL) {
+            s_wl82_iic1_scl_pin = (uint32_t)pin;
+        } else {
+            s_wl82_iic1_sda_pin = (uint32_t)pin;
+        }
+        return jieli_wl82_iic1_pinmux_apply();
+    }
+
+    {
+        uint32_t spi_port = 0u;
+        if (jieli_wl82_spi_role(pin_func, &spi_port) >= 0) {
+            int group = jieli_wl82_spi_group_for_pin((uint32_t)pin, pin_func, &spi_port);
+            if (group < 0) {
+                return OPRT_NOT_SUPPORTED;
+            }
+            {
+                OPERATE_RET rt = jieli_wl82_spi_pinmux_select(spi_port, (uint32_t)group);
+                if (rt == OPRT_OK) {
+                    s_wl82_spi_route_group[spi_port] = group;
+                }
+                return rt;
+            }
+        }
+    }
+
+    if (pin_func == TUYA_GPIO) {
+        if (s_wl82_uart0_pin_group >= 0 &&
+            (pin == s_wl82_uart0_pin_groups[s_wl82_uart0_pin_group].tx_pin ||
+             pin == s_wl82_uart0_pin_groups[s_wl82_uart0_pin_group].rx_pin)) {
+            if (gpio_set_uart0((unsigned int)-1) != 0) {
+                return OPRT_COM_ERROR;
+            }
+            s_wl82_uart0_pin_group = -1;
+            s_wl82_uart0_tx_pin = UINT32_MAX;
+            s_wl82_uart0_rx_pin = UINT32_MAX;
+            return OPRT_OK;
+        }
+        if ((s_wl82_iic1_pin_group >= 0 &&
+             (pin == s_wl82_iic1_pin_groups[s_wl82_iic1_pin_group].scl_pin ||
+              pin == s_wl82_iic1_pin_groups[s_wl82_iic1_pin_group].sda_pin))) {
+            /* WL82 has no generic peripheral-disable operation for HW IIC. */
+            return OPRT_NOT_SUPPORTED;
+        }
+        {
+            unsigned int i;
+            for (i = 0; i < sizeof(s_wl82_spi_pin_groups) / sizeof(s_wl82_spi_pin_groups[0]); i++) {
+                const jieli_wl82_spi_pin_group_t *group = &s_wl82_spi_pin_groups[i];
+                if (group->spi_port < 3u && s_wl82_spi_route_group[group->spi_port] == group->group &&
+                    (group->miso_pin == pin || group->mosi_pin == pin || group->clk_pin == pin ||
+                     group->cs_pin == pin)) {
+                    /* WL82 has no generic SPI peripheral-disable operation. */
+                    return OPRT_NOT_SUPPORTED;
+                }
+            }
+        }
+        return OPRT_OK;
+    }
+
     return OPRT_NOT_SUPPORTED;
 #endif
 }

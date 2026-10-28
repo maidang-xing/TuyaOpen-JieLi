@@ -9,20 +9,10 @@
  * device/device.h only. */
 #include "asm/pwm.h"
 #else
-/* wl82's asm/pwm.h begins with #include "includes.h", which drags in the
- * vendor filesystem header and redefines FILE / fread / fwrite / fseek against
- * the libc the adapter already uses - six hard redefinition errors. The parts
- * this file needs are the platform-data shape and the ioctl command words.
- *
- * The command words are spelled out rather than pulled from asm/pwm.h because
- * that header's _IOW ends in _IOC_TYPECHECK, which forms sizeof(t[1]) and so
- * only accepts the vendor's own scalar typedefs; reaching those means including
- * generic/typedef.h, which pulls asm/cpu.h and string.h. The encoding is fixed
- * and public (generic/ioctl.h): dir<<30 | size<<16 | type<<8 | nr, with
- * _IOC_WRITE = 1 and a u32 payload of size 4. These are exactly what
- * _IOW('P', n, u32) expands to (1074024448, ...449, ...450, ...451, ...454,
- * ...455); they were checked numerically against that macro.
- */
+/* WL82 asm/pwm.h pulls vendor filesystem declarations that conflict with
+ * libc. Define its public _IOW('P', n, u32) command encoding locally instead:
+ * dir<<30 | size<<16 | type<<8 | nr, with a 4-byte payload. Values match the
+ * SDK macro expansion. */
 #define TKL_PWM_IOC_WRITE_U32(nr)     ((uint32_t)((1U << 30) | (4U << 16) | ((uint32_t)('P') << 8) | (uint32_t)(nr)))
 
 #define PWM_STOP          TKL_PWM_IOC_WRITE_U32(0)

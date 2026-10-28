@@ -1,37 +1,12 @@
 #include "tkl_gpio.h"
 #include "tuya_error_code.h"
 
-/* The vendor gpio.h is written in terms of u32/u8 but includes nothing itself,
- * so the base types have to be in scope first. tkl_audio.c gets them through
- * os_api.h and tkl_mipi_dsi.c through device.h; this file reaches the vendor
- * header directly, so it needs the header they all come from. Without it the
- * wl82 build fails on six "use of undeclared identifier 'u32'" errors, while
- * wl83 happens to compile because the type leaked in from another header. */
+/* gpio.h uses u32/u8 without including their definitions. */
 #include "asm/cpu.h"
 #include "gpio.h"
 
-/* The two chips reach the external interrupt through different drivers, and
- * neither is a thin wrapper over the other:
- *
- *   wl82  asm/port_waked_up.h
- *           port_wakeup_reg(event, gpio, edge, handler) / port_wakeup_unreg(hdl)
- *         One shared ISR on IRQ_PORT_IDX walks a fixed table of handlers. The
- *         handler takes no argument, and only a fixed set of "events" exists:
- *         EVENT_IO_0 and EVENT_IO_1 can be remapped to an arbitrary pin through
- *         the io map, the rest are tied to particular pins. Since each of those
- *         two owns its own remap field, only TWO arbitrary-pin interrupts can be
- *         live at once; the remap also accepts only pins the driver lists in
- *         its own port_table (ports D and F are absent from it entirely).
- *
- *   wl83  asm/exti.h
- *           exti_init(gpio, edge, cb(priv, gpio), priv) / exti_uninit(index)
- *         A real per-pin external interrupt. The callback carries both the
- *         private pointer and the pin, so one dispatcher serves every pin.
- *
- * Both drivers expose exactly two trigger edges. Neither part has a
- * both-edges or a level-triggered mode, so TUYA_GPIO_IRQ_RISE_FALL, _LOW and
- * _HIGH are refused rather than approximated - see tkl_irq_edge().
- */
+/* WL82 uses a shared wakeup table with two remappable slots; WL83 has per-pin
+ * EXTI. Both support rising/falling edges only. */
 #if defined(JIELI_SELECTED_CHIP_WL82)
 #include "asm/port_waked_up.h"
 #elif defined(JIELI_SELECTED_CHIP_WL83)
@@ -40,29 +15,11 @@
 #error "JIELI tkl_gpio.c needs JIELI_SELECTED_CHIP_WL82 or _WL83 defined"
 #endif
 
-/* The JieLi pin namespace is already flat and matches Tuya's: the vendor header
- * defines IO_PORTA_00 as IO_GROUP_NUM * 0 + 0 with IO_GROUP_NUM == 16, so port A
- * occupies 0..15, B 16..31 and so on, and a Tuya pin index is the vendor pin
- * number directly. No lookup table is needed.
- *
- * TUYA_GPIO_NUM_MAX is 128, which reaches ports A..H on wl82 (0..127) and, on
- * wl83, ports A..F plus the two sparse USB pairs. PE11 - this board's console
- * RX - is pin 75 and is now addressable through the contract.
- *
- * Which of those numbers is a real pin is a per-chip question and is answered
- * by jieli_pin_exists(): wl83's PORTC is 14 bits wide and PORTF 6, and wl82 has
- * no port I register block at all. The bound here is only the contract's.
- */
+/* Tuya and JieLi use the same flat 16-pins-per-port numbering. This is the
+ * TKL namespace bound, not proof that every pin is bonded out on a board. */
 #define TKL_GPIO_PIN_MAX 128
 
-/* How many external interrupts this backend can hold at once.
- *
- * The vendor table has PORT_WAKED_ID_NUM == 3 slots, but only EVENT_IO_0 and
- * EVENT_IO_1 can be remapped to an arbitrary pin - and each of those owns a
- * single io-map field, so two pins cannot share one. That makes two the real
- * ceiling for general-purpose pins; the third vendor slot is only useful for
- * its fixed-pin events, which this contract does not hand out. A third request
- * returns OPRT_EXCEED_UPPER_LIMIT rather than silently colliding. */
+/* Only EVENT_IO_0 and EVENT_IO_1 are general-purpose remappable slots. */
 #define TKL_GPIO_WL82_IRQ_MAX 2
 
 typedef struct {
@@ -79,27 +36,9 @@ static tkl_gpio_irq_ctx_t s_irq[TKL_GPIO_PIN_MAX];
 /* The vendor pin space is 16 pins per port letter; both chips use that width. */
 #define JIELI_PORT_WIDTH 16u
 
-/* Which of the Tuya pin numbers actually exist on this chip.
- *
- * The vendor names a pin IO_PORT<port>_<bit> and defines it arithmetically -
- * IO_PORTA_07 is (16 * 0 + 7) - which is the same flat layout TUYA_GPIO_NUM_E
- * uses, so the number needs no translation. What does need a table is the
- * population, and it is not uniform (all from the chip's asm/gpio.h):
- *
- *   wl82  WL82.h defines JL_PORTA..JL_PORTH, 16 bits each. asm/gpio.h also
- *         names IO_PORTI_00..15 and derives IO_MAX_NUM (144) from them, but no
- *         JL_PORTI base exists, so port I is not offered.
- *
- *   wl83  PORTA/B/D/E are 0xffff, PORTC is 0x3fff and PORTF is 0x003f, so
- *         PC14/PC15 and PF6..PF15 are not pins. The USB pairs are sparse at
- *         96/97 and 112/113; R and V sit above IO_MAX_NUM.
- *
- * A port mask describes the GPIO controller's width, not whether a package
- * bonds the pin out - electrical usability is still a schematic question.
- *
- * tkl_pinmux.c uses this too, through the extern declaration there, so the
- * table has exactly one definition.
- */
+/* Return whether a flat pin number exists in the chip GPIO map. WL83 has sparse
+ * C/F ports and USB pairs; WL82 exposes ports A through H. Package bonding is
+ * board-specific. tkl_pinmux.c shares this check. */
 int jieli_pin_exists(uint32_t pin)
 {
 #if defined(JIELI_SELECTED_CHIP_WL83)
@@ -130,17 +69,12 @@ int jieli_pin_exists(uint32_t pin)
 
 static int tkl_gpio_valid(TUYA_GPIO_NUM_E pin_id)
 {
-    /* Range alone is not enough: the chips do not populate every bit of every
-     * port. wl83's PORTC is 14 bits wide, so PC14/PC15 (46, 47) are not pins -
-     * without this check tkl_gpio_init() would report OPRT_OK for a pin that
-     * cannot work. */
+    /* Reject holes in WL83's sparse port map. */
     return (pin_id < TUYA_GPIO_NUM_MAX) && (pin_id < TKL_GPIO_PIN_MAX) &&
            jieli_pin_exists((uint32_t)pin_id);
 }
 
-/* Map a Tuya trigger mode onto the vendor's two-edge enum. Both chips spell the
- * two edges the same way (PORT_EDGE_E and trigger_edge_t both define
- * EDGE_POSITIVE and EDGE_NEGATIVE), so one mapping serves either. */
+/* Both chips expose positive and negative edge triggers. */
 static int tkl_irq_edge(TUYA_GPIO_IRQ_E mode, int *edge)
 {
     switch (mode) {
@@ -151,9 +85,7 @@ static int tkl_irq_edge(TUYA_GPIO_IRQ_E mode, int *edge)
         *edge = EDGE_NEGATIVE;
         return 0;
     default:
-        /* RISE_FALL, LOW and HIGH: no vendor mode expresses these. Faking a
-         * level trigger with an edge would change when the callback fires, so
-         * refuse instead of degrading silently. */
+        /* Level and both-edge modes have no equivalent in these SDKs. */
         return -1;
     }
 }
@@ -161,8 +93,7 @@ static int tkl_irq_edge(TUYA_GPIO_IRQ_E mode, int *edge)
 static int tkl_gpio_apply_pull(u32 pin, TUYA_GPIO_MODE_E mode)
 {
 #if defined(JIELI_SELECTED_CHIP_WL82)
-    /* wl82 takes a plain 1/0 per direction and fixes the resistor at 10K, so
-     * the two calls are always made as a pair to keep the opposite leg off. */
+    /* WL82 uses 10K pulls selected by enabling one leg and disabling the other. */
     if (mode == TUYA_GPIO_PULLUP) {
         if (gpio_set_pull_down(pin, 0) != 0) return -1;
         if (gpio_set_pull_up(pin, 1) != 0) return -1;
@@ -174,9 +105,7 @@ static int tkl_gpio_apply_pull(u32 pin, TUYA_GPIO_MODE_E mode)
         if (gpio_set_pull_down(pin, 0) != 0) return -1;
     }
 #else
-    /* wl83 selects a strength. Only the 10K taps exist on this part - the
-     * header marks 100K and 1M as unsupported - so 10K is the one to use, with
-     * the opposite leg explicitly disabled. */
+    /* WL83 exposes a 10K pull on each leg; disable the unused leg. */
     if (mode == TUYA_GPIO_PULLUP) {
         if (gpio_set_pull_down(pin, GPIO_PULL_DOWN_DISABLE) != 0) return -1;
         if (gpio_set_pull_up(pin, GPIO_PULL_UP_10K) != 0) return -1;
@@ -192,10 +121,7 @@ static int tkl_gpio_apply_pull(u32 pin, TUYA_GPIO_MODE_E mode)
 }
 
 #if defined(JIELI_SELECTED_CHIP_WL82)
-/* The wl82 handler takes no argument, so which pin fired cannot be recovered
- * from the call. Each live registration therefore needs its own trampoline and
- * there can be at most TKL_GPIO_WL82_IRQ_MAX of them; the slot-to-pin mapping
- * is filled in at registration time. */
+/* WL82's handler has no pin argument, so each active slot gets a trampoline. */
 static TUYA_GPIO_NUM_E s_wl82_slot_pin[TKL_GPIO_WL82_IRQ_MAX];
 /* A separate in-use flag rather than a sentinel pin number: 0 is IO_PORTA_00,
  * a perfectly valid pin, so a zero-initialised array cannot mean "free" and a

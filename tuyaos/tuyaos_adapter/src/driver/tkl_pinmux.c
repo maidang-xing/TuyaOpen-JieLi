@@ -6,43 +6,16 @@
 #include "asm/spi.h"
 #include "gpio.h"
 
-/* Defined in tkl_gpio.c. It is the single per-chip table of which Tuya pin
- * numbers exist, and this file needs the same answer before handing a pin to
- * gpio_enable_function(), so it is declared rather than duplicated. */
+/* Shared pin-existence check from tkl_gpio.c. */
 extern int jieli_pin_exists(uint32_t pin);
 
-/* Peripheral pin muxing, as opposed to driving a pin as plain GPIO.
- *
- * WL83 has a per-pin gpio_function_t selector. WL82 has different, narrower
- * mechanisms: UART0 selects one of four documented pairs, hardware IIC1 selects
- * one of four documented pairs, and SPI selects one of the board's spi_io[]
- * groups. These are group selectors, not a crossbar that accepts any GPIO.
- * Unsupported pins/functions are refused rather than approximated.
- *
- * WL83 mappings that cannot be derived from the vendor ABI remain refused:
- *
- *   SPI0/1/2 MISO, MOSI, CS
- *       The vendor names its four data lines DA0..DA3 and CLK. Nothing in the
- *       SDK says which of DA0..DA3 is MISO and which is MOSI, so the mapping
- *       cannot be derived - only CLK is unambiguous.
- *
- *   PWM0..5
- *       The vendor offers MCPWM0..3 as _H and _L (a polarity pair, not six
- *       channels) and TIMER0..5_PWM, which is reached through the output
- *       crossbar rather than gpio_enable_function. No 1:1 correspondence.
- *
- *   UART RTS/CTS and IIC3..5
- *       No vendor enum member exists at all.
- */
+/* WL83 selects functions per pin. WL82 exposes fixed UART0/IIC1 pairs and SDK
+ * SPI groups. Unsupported or ambiguous mappings return NOT_SUPPORTED. */
 #if defined(JIELI_SELECTED_CHIP_WL83)
-/* The vendor's own pin count, not Tuya's TUYA_IO_PIN_MAX: that is 0xFFFF, and
- * sizing the bookkeeping below by it would cost ~300KB of RAM. IO_MAX_NUM ends
- * just past IO_PORT_USB_DMB on this part. */
+/* Use the vendor pin bound; Tuya's TUYA_IO_PIN_MAX is 0xFFFF. */
 #define TKL_PINMUX_PIN_MAX IO_MAX_NUM
 
-/* Set once a pin is claimed, so that TUYA_GPIO can hand the same function back
- * to gpio_disable_function - it needs the fn that was enabled, not just the
- * pin. */
+/* Save the function for TUYA_GPIO release. */
 static gpio_function_t s_pin_fn[TKL_PINMUX_PIN_MAX];
 static u8 s_pin_claimed[TKL_PINMUX_PIN_MAX];
 
@@ -92,10 +65,7 @@ static int tkl_pinmux_lookup(TUYA_PIN_FUNC_E pin_func, gpio_function_t *fn)
 #if defined(JIELI_SELECTED_CHIP_WL82)
 extern OPERATE_RET jieli_wl82_spi_pinmux_select(uint32_t spi_port, uint32_t group);
 
-/* WL82 does not have WL83's per-pin function selector, but UART0 has four
- * documented TX/RX groups in the vendor SDK. Keep this mapping explicit: the
- * pinmux API takes one pin at a time, while gpio_set_uart0() switches the pair
- * as a unit. This intentionally rejects pins outside the SDK's groups. */
+/* WL82 UART0 switches among four SDK-defined TX/RX pairs. */
 typedef struct {
     uint32_t tx_pin;
     uint32_t rx_pin;
@@ -140,9 +110,7 @@ typedef struct {
     uint32_t cs_pin;
 } jieli_wl82_spi_pin_group_t;
 
-/* These are the vendor SDK's spi_io[] entries. spi0 group A is the flash bus,
- * and spi2 group B consumes the flash/SDRAM or USB pins, so neither is offered
- * as an application pinmux target. */
+/* SDK spi_io[] routes. Reserved flash/SDRAM/USB groups are excluded. */
 static const jieli_wl82_spi_pin_group_t s_wl82_spi_pin_groups[] = {
     {0u, 1u, IO_PORTC_00, IO_PORTC_04, IO_PORTC_03, IO_PORTC_05},
     {1u, 0u, IO_PORTB_05, IO_PORTB_07, IO_PORTB_06, UINT32_MAX},
@@ -223,8 +191,7 @@ static int jieli_wl82_uart0_group_for_pin(uint32_t pin, TUYA_PIN_FUNC_E pin_func
     return -1;
 }
 
-/* tkl_uart_init() calls this after dev_open(), since the vendor driver applies
- * the board's default group while opening the device. */
+/* Reapply the saved UART0 route after opening the device. */
 OPERATE_RET jieli_wl82_uart0_pinmux_apply(void)
 {
     if (s_wl82_uart0_pin_group < 0) {
@@ -258,11 +225,7 @@ OPERATE_RET jieli_wl82_iic1_pinmux_apply(void)
 
 OPERATE_RET tkl_io_pinmux_config(TUYA_PIN_NAME_E pin, TUYA_PIN_FUNC_E pin_func)
 {
-    /* The upper bound alone is not enough: IO_MAX_NUM is derived from the last
-     * defined macro, so the range contains holes. wl83 has no PC14/PC15, no
-     * PF6..PF15 and no 98..111, and handing one of those to
-     * gpio_enable_function() would mean writing an io-map field for a pin that
-     * does not exist. */
+    /* WL83's pin range contains holes; check the actual pin map. */
     if (!jieli_pin_exists((uint32_t)pin)) {
         return OPRT_INVALID_PARM;
     }
@@ -280,8 +243,7 @@ OPERATE_RET tkl_io_pinmux_config(TUYA_PIN_NAME_E pin, TUYA_PIN_FUNC_E pin_func)
     {
         gpio_function_t fn;
 
-        /* TUYA_GPIO is not a peripheral function - it means "stop driving this
-         * pin as the peripheral and give it back as a plain GPIO". */
+        /* TUYA_GPIO releases a previously claimed peripheral function. */
         if (pin_func == TUYA_GPIO) {
             if (!s_pin_claimed[pin]) {
                 return OPRT_OK; /* nothing to release */
@@ -297,8 +259,7 @@ OPERATE_RET tkl_io_pinmux_config(TUYA_PIN_NAME_E pin, TUYA_PIN_FUNC_E pin_func)
             return OPRT_NOT_SUPPORTED;
         }
         if (gpio_enable_function((unsigned int)pin, fn, 1) != 0) {
-            /* The pin cannot carry that function - the vendor refuses a pair
-             * that is not in its io map. */
+            /* The SDK rejected this pin/function combination. */
             return OPRT_NOT_SUPPORTED;
         }
         s_pin_fn[pin] = fn;
@@ -306,9 +267,7 @@ OPERATE_RET tkl_io_pinmux_config(TUYA_PIN_NAME_E pin, TUYA_PIN_FUNC_E pin_func)
         return OPRT_OK;
     }
 #else
-    /* WL82 UART0 can switch only among the four paired routes documented by
-     * asm/gpio.h. Use the same pair whether TX or RX is the first configured
-     * pin, and reject all unsupported pin/function combinations. */
+    /* Select a documented UART0 pair and reject mismatched TX/RX pins. */
     if (pin_func == TUYA_UART0_TX || pin_func == TUYA_UART0_RX) {
         int channel = jieli_wl82_uart0_group_for_pin((uint32_t)pin, pin_func);
         if (channel < 0) {
@@ -429,13 +388,7 @@ OPERATE_RET tkl_multi_io_pinmux_config(TUYA_MUL_PIN_CFG_T *cfg, uint16_t num)
 
 int32_t tkl_io_pin_to_func(uint32_t pin, TUYA_PIN_TYPE_E pin_type)
 {
-    /* This asks which peripheral channel a pin carries - a PWM id, an ADC
-     * channel. Answering it needs a pin-to-channel table for the part, and
-     * neither JieLi SDK publishes one: the channel is chosen by the peripheral
-     * driver when it claims the pin, not by the pin's position. There is no
-     * consumer of this call in any Jieli board or driver, so rather than
-     * invent a numbering that would be wrong on the next board, report that it
-     * is unavailable. */
+    /* The SDKs do not publish a pin-to-channel mapping for PWM or ADC. */
     (void)pin;
     (void)pin_type;
     return -1;

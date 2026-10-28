@@ -6,33 +6,11 @@
 #include "device.h"
 #include "asm/spi.h"
 
-/* SPI master, built on each chip's `spiN` device.
- *
- * What the two SDKs share: dev_open("spiN"), dev_write for transmit,
- * dev_read for receive, and an IOCTL set for CS and async control. What they do
- * not share is the ioctl numbering - wl82 defines SPI_* commands and wl83
- * IOCTL_SPI_* - so the mapping is per chip below.
- *
- * Mode and role come from the board's spi platform data, not from this file:
- * both chips fix the pins, clock and sample/update edges in board.c. The TKL
- * contract's cfg therefore cannot move a pin, and a cfg that disagrees with the
- * board is reported rather than silently ignored.
- *
- * Scope, stated rather than implied:
- *   - Master only. Neither device stack exposes a slave data path.
- *   - Synchronous transfers. IOCTL_SPI_SET_ASYNC_SEND is explicitly cleared on
- *     wl83 (the vendor's own one-bit example does the same) so dev_write
- *     returns when the bytes are out.
- *   - No IRQ/DMA completion callback: the transfer path is synchronous, so a
- *     callback could never fire. tkl_spi_irq_* are refused.
- *   - Word size is 8 bits. Both chips' dev_write/dev_read take a byte count;
- *     there is no 16-bit framing in this path.
- *   - CS is whatever the board pinned. For a board that leaves cs_pin = -1 the
- *     caller drives CS as GPIO and passes each transfer as one call.
- *
- * The device is named spi0/spi1/spi2 by the board's device table. Which of
- * those exist is board data; a port the board did not register comes back
- * OPRT_NOT_SUPPORTED from dev_open.
+/* Synchronous, 8-bit SPI master over registered spiN devices. ioctl names
+ * differ by chip. Board data owns pins, clock, edges and CS; cfg does not
+ * remap pins, and mode/frequency are not applied here. Slave, IRQ/DMA and
+ * unsupported framing are unavailable through this path. Unregistered ports
+ * fail at dev_open(); callers may control an unassigned CS as GPIO.
  */
 #define TKL_SPI_PORT_MAX 3
 

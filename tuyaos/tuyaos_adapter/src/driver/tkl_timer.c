@@ -65,19 +65,32 @@ typedef struct {
 
 static tkl_timer_ctx_t s_timer[TKL_TIMER_MAX];
 static int s_timer_ready;
+/* Both Jieli SDK timer.h files document a single concurrently running usec
+ * timer. Keep the TKL IDs logically independent while reserving that one
+ * vendor resource explicitly. */
+static int s_active_timer = -1;
 
 static void jieli_timer_dispatch(void *priv)
 {
     tkl_timer_ctx_t *ctx;
+    int one_shot;
+    int owner;
 
     if (priv == NULL) {
         return;
     }
     ctx = (tkl_timer_ctx_t *)priv;
-    if (ctx->mode == TUYA_TIMER_MODE_ONCE) {
+    one_shot = ctx->mode == TUYA_TIMER_MODE_ONCE;
+    owner = (int)(ctx - s_timer);
+    if (one_shot) {
         /* The vendor's `once` flag already stops it; remember that so a later
-         * tkl_timer_stop does not try to delete an id the vendor has retired. */
+         * tkl_timer_stop does not try to delete an id the vendor has retired.
+         * Release the logical slot before the callback so it can start another
+         * timer; the vendor add result remains authoritative for hardware reuse. */
         ctx->id = -1;
+        if (s_active_timer == owner) {
+            s_active_timer = -1;
+        }
     } else {
         ctx->started_us = local_timer_us_time();
     }
@@ -100,13 +113,14 @@ static void jieli_timer_reset_table(void)
         s_timer[i].args = NULL;
         s_timer[i].started_us = local_timer_us_time();
     }
+    s_active_timer = -1;
     s_timer_ready = 1;
 }
 
 static int jieli_timer_valid(TUYA_TIMER_NUM_E timer_id)
 {
     jieli_timer_reset_table();
-    return timer_id < TUYA_TIMER_NUM_MAX;
+    return (int)timer_id >= (int)TUYA_TIMER_NUM_0 && timer_id < TUYA_TIMER_NUM_MAX;
 }
 
 OPERATE_RET tkl_timer_init(TUYA_TIMER_NUM_E timer_id, TUYA_TIMER_BASE_CFG_T *cfg)
@@ -126,6 +140,9 @@ OPERATE_RET tkl_timer_init(TUYA_TIMER_NUM_E timer_id, TUYA_TIMER_BASE_CFG_T *cfg
     if (ctx->id >= 0) {
         sys_usec_timer_del(ctx->id);
         ctx->id = -1;
+        if (s_active_timer == (int)timer_id) {
+            s_active_timer = -1;
+        }
     }
     ctx->mode = cfg->mode;
     ctx->cb = cfg->cb;
@@ -154,6 +171,10 @@ OPERATE_RET tkl_timer_start(TUYA_TIMER_NUM_E timer_id, uint32_t us)
         return OPRT_OK;
     }
 
+    if (s_active_timer >= 0) {
+        return OPRT_RESOURCE_NOT_READY;
+    }
+
     /* call_in_irq = 0: task context, so a callback may stop/deinit its own
      * timer. See the file header. */
     id = sys_usec_timer_add(ctx, jieli_timer_dispatch, us, 0u,
@@ -162,6 +183,7 @@ OPERATE_RET tkl_timer_start(TUYA_TIMER_NUM_E timer_id, uint32_t us)
         return OPRT_RESOURCE_NOT_READY;
     }
     ctx->id = id;
+    s_active_timer = (int)timer_id;
     ctx->started_us = local_timer_us_time();
     return OPRT_OK;
 }
@@ -177,6 +199,9 @@ OPERATE_RET tkl_timer_stop(TUYA_TIMER_NUM_E timer_id)
     if (ctx->id >= 0) {
         sys_usec_timer_del(ctx->id);
         ctx->id = -1;
+        if (s_active_timer == (int)timer_id) {
+            s_active_timer = -1;
+        }
     }
     return OPRT_OK;
 }

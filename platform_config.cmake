@@ -49,35 +49,27 @@ set(CMAKE_CXX_COMPILER_RANLIB "${JIELI_RANLIB}" CACHE FILEPATH "Jieli C++ archiv
 set(JIELI_ADAPTER_PATH "${PLATFORM_PATH}/tuyaos/tuyaos_adapter")
 list(APPEND PLATFORM_PUBINC
     "${JIELI_ADAPTER_PATH}/include"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/system"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/uart"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/init/include"
-    # JIELI vendors the utilities module - tuya_cloud_types.h and its siblings -
-    # inside the adapter, the way the T5AI / ESP32 / GD32 platforms do. The
-    # shared tools/porting tree stays untouched; see the note beside the copy.
+    "${JIELI_ADAPTER_PATH}/include/uart"
+    "${JIELI_ADAPTER_PATH}/include/spi"
+    "${JIELI_ADAPTER_PATH}/include/i2c"
+    "${JIELI_ADAPTER_PATH}/include/pwm"
+    "${JIELI_ADAPTER_PATH}/include/adc"
+    "${JIELI_ADAPTER_PATH}/include/gpio"
+    "${JIELI_ADAPTER_PATH}/include/pinmux"
+    "${JIELI_ADAPTER_PATH}/include/timer"
+    "${JIELI_ADAPTER_PATH}/include/flash"
+    "${JIELI_ADAPTER_PATH}/include/system"
+    "${JIELI_ADAPTER_PATH}/include/network"
+    "${JIELI_ADAPTER_PATH}/include/wifi"
+    "${JIELI_ADAPTER_PATH}/include/bluetooth"
+    "${JIELI_ADAPTER_PATH}/include/security"
+    "${JIELI_ADAPTER_PATH}/include/mcu8080"
+    "${JIELI_ADAPTER_PATH}/include/mipi_dsi"
+    "${JIELI_ADAPTER_PATH}/include/media"
+    "${JIELI_ADAPTER_PATH}/include/vad"
+    "${JIELI_ADAPTER_PATH}/include/kws"
+    "${JIELI_ADAPTER_PATH}/include/init/include"
     "${JIELI_ADAPTER_PATH}/include/utilities/include"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/security"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/flash"
-    # libtuyaos.a aggregates the components as objects, which drops the
-    # PUBLIC include interface each component target declared. The adapter
-    # exposes adc and gpio to its own sources that way, so anything built
-    # outside it - every example - needs them listed here instead. Both are
-    # declared in boards/JIELI/TKL_Kconfig, and a declared capability whose
-    # header is unreachable is a claim the build cannot honour.
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/adc"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/gpio"
-    # pinmux is not a declared capability here (wl82 cannot back it, and a
-    # platform-level switch has no chip dimension), but the examples that do
-    # call tkl_io_pinmux_config - the i2c and uart ones - need the contract on
-    # the include path to compile at all.
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/pinmux"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/i2c"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/pwm"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/spi"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/network"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/wifi"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/bluetooth"
-    "${TOP_SOURCE_DIR}/tools/porting/adapter/timer"
     "${TOP_SOURCE_DIR}/src/common/include"
 )
 

@@ -72,3 +72,15 @@ tos.py monitor -p <PORT>
 
 **WPA3 Limitation on AC792N:**
 During STA association, CPU1 MbedTLS encounters an exception. As a workaround, `CONFIG_WPA3_SUPPORT` is set to 0 in `chip/wl83/AC792_SDK/sdk/apps/common/net/wifi_conf.c`. AC792 currently does not support WPA3-only AP networks; WPA2 and lower modes operate normally.
+
+## TKL 契约同步
+
+JIELI 在 `tuyaos/tuyaos_adapter/include/` 维护平台本地 TKL 头文件。主仓 TKL 接口契约变更后，进入 `platform/JIELI` 手动运行对比，并按审阅后的变更同步：
+
+```bash
+python -m tools.jieli_build.sync_tkl_headers --check
+```
+
+需要执行同步时，显式运行 `python -m tools.jieli_build.sync_tkl_headers`；它只覆盖脚本清单内审阅过的 17 个 TKL 头文件。`--check` 模式只做对比，不写文件。同步不会自动运行，也不修改源码实现、板级配置或 vendor SDK。`utilities/include/tuya_cloud_types.h` 是只检查项：JIELI `TUYA_GPIO_NUM_64..127` 的批准扩展必须保留，脚本不得覆盖。`mcu8080/tkl_8080.h` 使用 T5AI 的去重版作为基准。每次同步后应检查差异并完成对应构建验收；同步/对比成功本身不代表目标构建、烧录或硬件功能已验证。
+
+适配架构、设备注册模型与已知硬件问题见 [`docs/jieli-tkl.md`](docs/jieli-tkl.md)。

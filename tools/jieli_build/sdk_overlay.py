@@ -15,11 +15,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
@@ -41,6 +42,11 @@ from .feature_map import (
     feature_sources,
     link_libraries,
 )
+
+# Kconfiglib omits this bool when ENABLE_DISPLAY is off. When display is on,
+# write_config emits an explicit n for the visible default, so only an
+# explicitly disabled display permits this gate to be absent.
+OPTIONAL_ADAPTER_SOURCE_GATES = frozenset({"CONFIG_ENABLE_MIPI_DSI"})
 
 # SDK-root-relative sources that keep the vendor USB slave stack serviced while
 # the Tuya app runs. msd_upgrade.c owns go_mask_usb_updata() and user_setup.c
@@ -161,6 +167,55 @@ def drop_vendor_example_sources(content: str, expects_examples: bool = False) ->
             f"{VENDOR_EXAMPLE_SOURCE_PREFIX} sources but lists none"
         )
     return "".join(kept)
+
+
+def remove_vendor_spi1_registration(content: str) -> str:
+    """Remove the demo board's spi1 node so the adapter owns that name."""
+    pattern = re.compile(
+        r"(?m)^#if[ \t]+TCFG_SPI1_ENABLE\r?\n"
+        r"[ \t]*\{[ \t]*\"spi1\",[ \t]*&spi_dev_ops,[ \t]*"
+        r"\(void \*\)&spi1_data[ \t]*\},[ \t]*\r?\n"
+        r"#endif(?:[ \t]*//[^\r\n]*)?"
+    )
+    updated, count = pattern.subn("", content)
+    if count != 1:
+        raise BuildError(
+            "Expected exactly one vendor TCFG_SPI1_ENABLE spi1 device registration; "
+            f"found {count}"
+        )
+    return updated
+
+
+def remove_vendor_iic1_registration(content: str) -> str:
+    """Remove the WL83 demo board's iic1 table entry for the adapter-owned node."""
+    pattern = re.compile(
+        r"(?m)^[ \t]*\{[ \t]*\"iic1\",[ \t]*&iic_dev_ops,[ \t]*"
+        r"\(void \*\)&hw_iic1_data[ \t]*\},[ \t]*\r?\n"
+    )
+    updated, count = pattern.subn("", content)
+    if count != 1:
+        raise BuildError(
+            "Expected exactly one vendor iic1 device registration in the WL83 demo board; "
+            f"found {count}"
+        )
+    return updated
+
+
+def remove_vendor_uart2_registration(content: str) -> str:
+    """Remove the WL83 demo board's UART2 node so the adapter owns its name."""
+    pattern = re.compile(
+        r"(?m)^#if[ \t]+TCFG_UART2_ENABLE\r?\n"
+        r"[ \t]*\{[ \t]*\"uart2\",[ \t]*&uart_dev_ops,[ \t]*"
+        r"\(void \*\)&uart2_data[ \t]*\},[ \t]*\r?\n"
+        r"#endif(?:[ \t]*//[^\r\n]*)?"
+    )
+    updated, count = pattern.subn("", content)
+    if count != 1:
+        raise BuildError(
+            "Expected exactly one vendor TCFG_UART2_ENABLE uart2 device registration; "
+            f"found {count}"
+        )
+    return updated
 
 
 def link_directory(link: Path, target: Path) -> None:
@@ -452,6 +507,7 @@ def staging_input_components(
     tuya_lib_dir: Optional[Path],
     uart_log_port: int,
     uart_log_baudrate: int,
+    adapter_source_selection: str = "",
 ) -> dict[str, str]:
     """Name every input the staged bytes depend on, one digest each.
 
@@ -477,6 +533,7 @@ def staging_input_components(
         # read to decide what to write into the staged board files.
         "board_facts": board_facts,
         "features": features,
+        "adapter_sources": adapter_source_selection,
         "audio_config": _file_digest(audio_config_source),
         # The staging hooks themselves. An edit to any of them can change the
         # staged bytes without changing any other input.
@@ -542,7 +599,11 @@ def write_staging_state(staging_root: Path, components: dict[str, str]) -> None:
     )
 
 
-def read_adapter_sources(platform_root: Path, chip_name: str) -> list[str]:
+def read_adapter_sources(
+    platform_root: Path,
+    chip_name: str,
+    config_values: Optional[Mapping[str, str]] = None,
+) -> list[str]:
     """Read the source manifest shared by CMake and the SDK Makefile bridge."""
     if chip_name not in JIELI_CHIPS:
         raise BuildError(f"unsupported Jieli chip '{chip_name}'")
@@ -553,23 +614,72 @@ def read_adapter_sources(platform_root: Path, chip_name: str) -> list[str]:
     selected: list[str] = []
     seen: set[str] = set()
     for line_number, raw_line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
-        source = raw_line.partition("#")[0].strip().replace("\\", "/")
-        if not source:
+        fields = raw_line.partition("#")[0].split()
+        if not fields:
             continue
+        if len(fields) > 2:
+            raise BuildError(f"invalid adapter source at {manifest}:{line_number}: {' '.join(fields)}")
+        source = fields[0]
+        gate = fields[1] if len(fields) == 2 else None
         path = Path(source)
-        if path.is_absolute() or ".." in path.parts or not source.endswith(".c"):
+        if (
+            not source.startswith("src/")
+            or "\\" in source
+            or path.is_absolute()
+            or ".." in path.parts
+            or not source.endswith(".c")
+        ):
             raise BuildError(f"invalid adapter source at {manifest}:{line_number}: {source}")
+        include_source = True
+        if gate is not None:
+            suffix = gate[7:] if gate.startswith("CONFIG_") else ""
+            if not suffix or any(
+                not ("A" <= character <= "Z" or "0" <= character <= "9" or character == "_")
+                for character in suffix
+            ):
+                raise BuildError(f"invalid adapter source gate at {manifest}:{line_number}: {gate}")
+            if config_values is None or gate not in config_values:
+                if (
+                    gate in OPTIONAL_ADAPTER_SOURCE_GATES
+                    and config_values is not None
+                    and config_values.get("CONFIG_ENABLE_DISPLAY") == "n"
+                ):
+                    value = "n"
+                else:
+                    detail = ""
+                    if gate in OPTIONAL_ADAPTER_SOURCE_GATES:
+                        display_value = (
+                            "undefined"
+                            if config_values is None
+                            else config_values.get("CONFIG_ENABLE_DISPLAY", "undefined")
+                        )
+                        detail = f" (CONFIG_ENABLE_DISPLAY={display_value}; expected n when omitted)"
+                    raise BuildError(
+                        f"undefined adapter source gate at {manifest}:{line_number}: {gate}{detail}"
+                    )
+            else:
+                value = str(config_values[gate])
+            if value not in ("y", "n"):
+                raise BuildError(f"invalid boolean adapter source gate value at {manifest}:{line_number}: {gate}={value}")
+            if chip_name == "wl83" and gate == "CONFIG_ENABLE_MCU8080" and value == "y":
+                raise BuildError(
+                    "CONFIG_ENABLE_MCU8080 is unsupported on WL83; the Jieli MCU8080 adapter "
+                    "is implemented only for AC79_DevKitBoard"
+                )
+            include_source = value == "y"
         if source in seen:
             raise BuildError(f"duplicate adapter source at {manifest}:{line_number}: {source}")
         seen.add(source)
+
+        if not (manifest.parent / source).is_file():
+            raise BuildError(f"adapter source does not exist at {manifest}:{line_number}: {source}")
 
         parts = path.parts
         if len(parts) >= 3 and parts[:2] == ("src", "chip"):
             if parts[2] not in ("common", chip_name):
                 continue
-        if not (manifest.parent / source).is_file():
-            raise BuildError(f"adapter source does not exist at {manifest}:{line_number}: {source}")
-        selected.append(source)
+        if include_source:
+            selected.append(source)
 
     if not selected:
         raise BuildError(f"Jieli adapter source manifest has no sources for {chip_name}: {manifest}")
@@ -614,6 +724,7 @@ def create_staging_tree(
     chip=None,
     facts: Optional[BoardFacts] = None,
     features: Optional[Iterable[str]] = None,
+    config_values: Optional[Mapping[str, str]] = None,
     tool_dir: Optional[Path] = None,
 ) -> Path:
     """Create a small overlay tree without modifying the vendor checkout.
@@ -632,6 +743,7 @@ def create_staging_tree(
     if features is None:
         raise BuildError("the enabled feature set is required to stage a Jieli build")
     features = tuple(features)
+    adapter_sources = read_adapter_sources(platform_root, chip.name, config_values)
     board_name = facts.board
     profile = AUDIO_PROFILES.get(chip.name)
     audio_config_source = (
@@ -652,6 +764,7 @@ def create_staging_tree(
         tuya_lib_dir=tuya_lib_dir,
         uart_log_port=uart_log_port,
         uart_log_baudrate=uart_log_baudrate,
+        adapter_source_selection="\n".join(adapter_sources),
     )
     if staging_tree_is_current(staging_root, staging_input_digest(**components)):
         return staging_root / "build"
@@ -723,6 +836,12 @@ def create_staging_tree(
         configure_usb_download_app_config(app_config_file)
     if profile is not None and profile.board_declarations:
         configure_audio_board(board_file, audio_config_source, profile)
+    if chip.name == "wl83":
+        board_content = board_file.read_text(encoding="utf-8")
+        board_content = remove_vendor_spi1_registration(board_content)
+        board_content = remove_vendor_iic1_registration(board_content)
+        board_content = remove_vendor_uart2_registration(board_content)
+        board_file.write_text(board_content, encoding="utf-8")
     shutil.copytree(
         platform_root / "tuyaos" / "entry",
         source_overlay_root / "tuyaos" / "entry",
@@ -747,8 +866,16 @@ def create_staging_tree(
     content = drop_vendor_example_sources(content, chip.demo_lists_example_sources)
     extra_sources_list = [
         "../../../../../tuyaos_adapter/" + source
-        for source in read_adapter_sources(platform_root, chip.name)
+        for source in adapter_sources
     ]
+    wl82_iic_core_source = "../../../../../apps/common/iic/iic.c"
+    if chip.name == "wl82" and "src/driver/tkl_i2c.c" in adapter_sources:
+        listed_sources = {
+            line.strip().removesuffix("\\").strip()
+            for line in content.splitlines()
+        }
+        if wl82_iic_core_source not in listed_sources:
+            extra_sources_list.append(wl82_iic_core_source)
     extra_sources_list.extend(
         [
             "../../../../../tuya_utilities/src/tuya_hashmap.c",
@@ -789,41 +916,10 @@ def create_staging_tree(
     adapter_include = source_overlay_root / "tuyaos_adapter" / "include"
     for include_dir in sorted(path for path in adapter_include.iterdir() if path.is_dir()):
         content += f"    -I../../../../../tuyaos_adapter/include/{include_dir.name} \\\n"
-    # tkl_init.h follows the shared TuyaOpen layout under init/include.
+    # The two nested public-header layouts are part of the platform adapter.
     content += "    -I../../../../../tuyaos_adapter/include/init/include \\\n"
+    content += "    -I../../../../../tuyaos_adapter/include/utilities/include \\\n"
     tuyaopen_root_make = _make_path(tuyaopen_root)
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/system \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/uart \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/init/include \\\n"
-    content += f"    -I{_make_path(platform_root)}/tuyaos/tuyaos_adapter/include/utilities/include \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/flash \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/network \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/wifi \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/bluetooth \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/timer \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/security \\\n"
-    # tkl_adc.h lives beside the other TKL domain headers, not under any
-    # per-chip profile, so every chip's staged Makefile needs it.
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/adc \\\n"
-    # tkl_pinmux.c compiles for both chips - it refuses everything on wl82 -
-    # so its contract has to be on the include path either way.
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/pinmux \\\n"
-    # tkl_i2c.c compiles on both chips; its contract is likewise not under a
-    # per-chip profile.
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/i2c \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/pwm \\\n"
-    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/spi \\\n"
-    if chip.name == "wl83":
-        # tkl_gpio.c includes the shared GPIO contract from this domain. The
-        # MIPI-DSI contract is not here: it ships with this platform under
-        # tuyaos_adapter/include/mipi_dsi, which the loop above already adds.
-        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/gpio \\\n"
-    if chip.name in AUDIO_PROFILES:
-        # The audio adapter's public TKL headers (tkl_audio.h, tkl_vad.h,
-        # tkl_kws.h) exist only under these TuyaOpen adapter domains.
-        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/media \\\n"
-        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/vad \\\n"
-        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/kws \\\n"
     content += "    -I../../../../../apps/common/include \\\n"
     content += "    -I../../../../../apps/common/config/include \\\n"
     for include in usb_include_lines():
@@ -853,14 +949,33 @@ def create_staging_tree(
     content += "INCLUDES += -I../../../../../include_lib/net\n"
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
+    spi_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_SPI")
+    if spi_enabled not in ("y", "n"):
+        raise BuildError(f"CONFIG_ENABLE_SPI must be an evaluated Kconfig bool when staging adapter sources: {spi_enabled!r}")
+    if spi_enabled == "y":
+        if "src/driver/tkl_spi.c" not in adapter_sources:
+            raise BuildError("CONFIG_ENABLE_SPI=y but tkl_spi.c is not selected for the SDK build")
+        content += "DEFINES += -DCONFIG_ENABLE_SPI=1\n"
+    elif "src/driver/tkl_spi.c" in adapter_sources:
+        raise BuildError("tkl_spi.c is selected for the SDK build while CONFIG_ENABLE_SPI=n")
+    if chip.name == "wl82" and board_name == "AC79_DevKitBoard":
+        content += "DEFINES += -DJIELI_AC79_DEVKIT_BOARD=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
     content += "DEFINES += " + " ".join(
         "-D" + define for define in feature_defines(features)
     ) + "\n"
     if chip.name in AUDIO_PROFILES:
-        # The vendor media runtime and the staged app entry both key off this
-        # switch; without it tkl_jieli_audio_prepare compiles out entirely.
-        content += "DEFINES += -DCONFIG_MEDIA_ENABLE -DCONFIG_AUDIO_ENABLE -DCONFIG_AUDIO_ONCHIP\n"
+        # Audio profile flags remain chip-profile defaults. The adapter's
+        # media caller and provider, however, must follow the evaluated feature
+        # gate used by adapter_sources.txt on both build paths.
+        media_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_MEDIA")
+        if media_enabled not in ("y", "n"):
+            raise BuildError(
+                "CONFIG_ENABLE_MEDIA must be an evaluated Kconfig bool when staging audio profiles"
+            )
+        if media_enabled == "y":
+            content += "DEFINES += -DCONFIG_MEDIA_ENABLE\n"
+        content += "DEFINES += -DCONFIG_AUDIO_ENABLE -DCONFIG_AUDIO_ONCHIP\n"
     if tuya_lib_dir is None:
         raise BuildError("TuyaOpen library directory is required for the Jieli image")
     content += "LFLAGS += \\\n"

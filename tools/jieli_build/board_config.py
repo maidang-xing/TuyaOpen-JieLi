@@ -17,6 +17,188 @@ from .board_facts import BoardFacts, LogUart, ServiceUart
 # pins; the group is derived from them, because the schema has no field for it
 # and a pin pair is what actually selects the group.
 _PIN_PATTERN = re.compile(r"^IO_PORT([A-Z])_(\d{1,2})$")
+_ADC_INIT_CALL = re.compile(r"\badc_init\s*\(\s*\)\s*;")
+
+
+def _mask_c_noncode(content: str, *, reject_line_comment_continuation: bool = False) -> str:
+    """Mask comments and literals while preserving source offsets and lines."""
+    masked = list(content)
+    state = "code"
+    index = 0
+    while index < len(content):
+        char = content[index]
+        next_char = content[index + 1] if index + 1 < len(content) else ""
+        if state == "code":
+            if char == "/" and next_char == "/":
+                masked[index] = masked[index + 1] = " "
+                index += 2
+                state = "line_comment"
+                continue
+            if char == "/" and next_char == "*":
+                masked[index] = masked[index + 1] = " "
+                index += 2
+                state = "block_comment"
+                continue
+            if char in ('"', "'"):
+                masked[index] = " "
+                state = "string" if char == '"' else "char"
+        elif state in ("line_comment", "block_comment", "string", "char"):
+            if char not in "\r\n":
+                masked[index] = " "
+            if state == "line_comment" and char == "\\" and next_char in "\r\n":
+                # C phase-2 line splicing extends // comments across this newline.
+                if reject_line_comment_continuation:
+                    raise BuildError("board_init has a continued // comment; cannot safely stage ADC init")
+                if next_char == "\r" and index + 2 < len(content) and content[index + 2] == "\n":
+                    index += 3
+                else:
+                    index += 2
+                continue
+            if state == "line_comment" and char in "\r\n":
+                state = "code"
+            elif state == "block_comment" and char == "*" and next_char == "/":
+                masked[index + 1] = " "
+                index += 2
+                state = "code"
+                continue
+            elif state in ("string", "char"):
+                if char == "\\" and index + 1 < len(content):
+                    if content[index + 1] not in "\r\n":
+                        masked[index + 1] = " "
+                    index += 2
+                    continue
+                if (state == "string" and char == '"') or (state == "char" and char == "'"):
+                    state = "code"
+        index += 1
+    return "".join(masked)
+
+
+def _board_init_body(content: str) -> tuple[int, int]:
+    """Return the opening and closing brace offsets for board_init()."""
+    masked = _mask_c_noncode(content)
+    match = re.search(r"void\s+board_init\s*\([^)]*\)\s*\{", masked)
+    if match is None:
+        raise BuildError("Jieli board file has no board_init function")
+    opening = masked.find("{", match.start(), match.end())
+    brace_depth = 0
+    conditional_depth = 0
+    in_function = False
+    line_offset = 0
+    for line in masked.splitlines(keepends=True):
+        line_end = line_offset + len(line)
+        directive = re.match(r"\s*#\s*(\w+)\b", line)
+        if directive:
+            if in_function and any(char in line for char in "{}"):
+                raise BuildError("board_init preprocessor directive contains braces")
+            if in_function and line.rstrip("\r\n").endswith("\\"):
+                raise BuildError("board_init has a continued preprocessor directive")
+            command = directive.group(1)
+            if command in ("if", "ifdef", "ifndef"):
+                conditional_depth += 1
+            elif command == "endif":
+                conditional_depth -= 1
+                if conditional_depth < 0:
+                    raise BuildError("board_init has an unmatched #endif before its body")
+        elif conditional_depth and (in_function or line_offset <= opening < line_end) and any(
+            char in "{}" for char in line[max(0, opening - line_offset):]
+        ):
+            raise BuildError("board_init conditional branch contains braces")
+
+        for offset in range(max(opening, line_offset), line_end):
+            if offset == opening:
+                in_function = True
+            if not in_function or directive:
+                continue
+            if masked[offset] == "{":
+                brace_depth += 1
+            elif masked[offset] == "}":
+                brace_depth -= 1
+                if brace_depth == 0:
+                    body = content[opening + 1:offset]
+                    _mask_c_noncode(body, reject_line_comment_continuation=True)
+                    return opening, offset
+        line_offset = line_end
+    raise BuildError("Jieli board_init function has unbalanced braces")
+
+
+def _board_init_adc_call_count(content: str) -> int:
+    opening, closing = _board_init_body(content)
+    body = content[opening + 1 : closing]
+    # Comments and literals are not executable calls; masking preserves offsets.
+    body = _mask_c_noncode(body)
+    return len(_ADC_INIT_CALL.findall(body))
+
+
+def _make_adc_call_unconditional(content: str) -> str:
+    """Keep ADC init unconditional without changing its board_init sequence point.
+
+    We do not evaluate preprocessor expressions: the effective definitions can
+    come from nested includes and build flags. Only a one-line #if/#endif block
+    containing exactly the call can be safely moved. Other conditional shapes
+    fail staging rather than guessing about execution or initialization order.
+    """
+    opening, closing = _board_init_body(content)
+    body = content[opening + 1:closing]
+    masked = _mask_c_noncode(body)
+    match = _ADC_INIT_CALL.search(masked)
+    if match is None:
+        raise BuildError("Could not locate executable adc_init() in board_init")
+
+    lines = body.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+    call_line_index = next(
+        (index for index, start in enumerate(offsets) if start <= match.start() < start + len(lines[index])),
+        None,
+    )
+    if call_line_index is None:
+        raise BuildError("Could not identify adc_init() line in board_init")
+
+    call_line = lines[call_line_index]
+    call_line_start = offsets[call_line_index]
+    if masked[call_line_start:match.start()].strip() or masked[match.end():call_line_start + len(call_line)].strip():
+        raise BuildError("adc_init() shares a line with other code; cannot safely relocate it")
+
+    depth = 0
+    for index in range(call_line_index):
+        directive = re.match(r"\s*#\s*(if|ifdef|ifndef|endif)\b", lines[index])
+        if directive:
+            depth += 1 if directive.group(1) != "endif" else -1
+    if depth == 0:
+        return content
+
+    # Accept only a top-level guard directly wrapping this call. This keeps
+    # placement relative to surrounding hardware initialization and rejects
+    # nested guards, #else/#elif, and wider condition-controlled sequences.
+    if call_line_index == 0 or call_line_index + 1 >= len(lines):
+        raise BuildError("Conditionally guarded adc_init() has no simple #if/#endif wrapper")
+    guard_line = lines[call_line_index - 1]
+    end_line = lines[call_line_index + 1]
+    if not re.match(r"\s*#\s*if\b", guard_line) or not re.match(r"\s*#\s*endif\b", end_line):
+        raise BuildError("Conditionally guarded adc_init() uses #else/#elif or a complex guard")
+    if depth != 1:
+        raise BuildError("Conditionally guarded adc_init() is nested; cannot safely relocate it")
+    if masked[offsets[call_line_index - 1] + len(guard_line):call_line_start].strip():
+        raise BuildError("Conditionally guarded adc_init() has intervening code")
+    end_start = offsets[call_line_index + 1]
+    if masked[call_line_start + len(call_line):end_start].strip():
+        raise BuildError("Conditionally guarded adc_init() has intervening code")
+
+    indentation = re.match(r"[ \t]*", call_line).group(0)
+    newline = "\r\n" if "\r\n" in body else "\n"
+    inserted_call = f"{indentation}adc_init();{newline}"
+    guard_start = offsets[call_line_index - 1]
+    body = (
+        body[:guard_start]
+        + inserted_call
+        + body[guard_start:call_line_start]
+        + body[call_line_start:call_line_start + (match.start() - call_line_start)]
+        + body[match.end():]
+    )
+    return content[:opening + 1] + body + content[closing:]
 
 # The port-group macros the wl82 SDK's asm/uart.h defines, and the only values a
 # UART platform-data block may name. The header lists exactly these, so a pair
@@ -24,9 +206,9 @@ _PIN_PATTERN = re.compile(r"^IO_PORT([A-Z])_(\d{1,2})$")
 # name an identifier the vendor headers never define, and the compile would fail
 # inside SDK code rather than here.
 #
-# tests/test_board_config.py cross-checks this against the header when the SDK
-# checkout is present, so a vendor update that adds or removes a group fails
-# there rather than at link time.
+# A pair that is not among them has no macro to expand to: the generated block
+# would name an identifier the vendor headers never define, and the compile
+# would fail inside SDK code rather than here.
 UART_PORT_GROUPS = (
     "PORTA_3_4", "PORTA_5_6",
     "PORTB_1_2", "PORTB_3_4", "PORTB_6_7",
@@ -452,11 +634,38 @@ def configure_audio_board(board_file: Path, audio_config_header: Path, board: "A
         + board.board_early_init_post
         + content[devices_finish:]
     )
-    if board.board_init:
-        init_marker = re.search(r"void\s+board_init\s*\([^)]*\)\s*\{", content)
-        if init_marker is None:
-            raise BuildError(f"Jieli board file has no board_init function: {board_file}")
-        content = content[:init_marker.end()] + board.board_init + content[init_marker.end():]
+    init_marker = re.search(
+        r"void\s+board_init\s*\([^)]*\)\s*\{", _mask_c_noncode(content)
+    )
+    if init_marker is None:
+        raise BuildError(f"Jieli board file has no board_init function: {board_file}")
+    existing_adc_calls = _board_init_adc_call_count(content)
+    if existing_adc_calls > 1:
+        raise BuildError(
+            f"Jieli board_init already contains {existing_adc_calls} adc_init() calls: {board_file}"
+        )
+    profile_init = board.board_init
+    profile_adc_calls = len(_ADC_INIT_CALL.findall(profile_init))
+    if existing_adc_calls:
+        # Do not infer effective macros from app_config.h text: nested guards,
+        # included headers, and build flags determine the actual preprocessing.
+        # Preserve unconditional calls; safely hoist only a simple direct guard.
+        try:
+            content = _make_adc_call_unconditional(content)
+        except BuildError as error:
+            raise BuildError(f"Cannot guarantee board ADC initialization in {board_file}: {error}") from error
+    if existing_adc_calls and profile_adc_calls:
+        # Do not reinitialize the shared SDK ADC queue if this board already
+        # performs startup initialization (WL83's demo board does).
+        profile_init = _ADC_INIT_CALL.sub("", profile_init)
+    elif not existing_adc_calls and not profile_adc_calls:
+        # The TKL ADC registers channels on the SDK's global queue. Ensure it
+        # exists even on a board whose profile has no ADC-specific init code.
+        profile_init = "\n    adc_init();\n" + profile_init
+    if profile_adc_calls > 1:
+        raise BuildError("Jieli audio board profile contains multiple adc_init() calls")
+    if profile_init:
+        content = content[:init_marker.end()] + profile_init + content[init_marker.end():]
 
     content = content[:table_start] + board.board_declarations + "\n" + content[table_start:]
     table_start = content.find(table_marker)

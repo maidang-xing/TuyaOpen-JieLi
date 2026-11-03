@@ -6,37 +6,37 @@
 #include "device.h"
 #include "asm/spi.h"
 
-/* SPI master, built on each chip's `spiN` device.
- *
- * What the two SDKs share: dev_open("spiN"), dev_write for transmit,
- * dev_read for receive, and an IOCTL set for CS and async control. What they do
- * not share is the ioctl numbering - wl82 defines SPI_* commands and wl83
- * IOCTL_SPI_* - so the mapping is per chip below.
- *
- * Mode and role come from the board's spi platform data, not from this file:
- * both chips fix the pins, clock and sample/update edges in board.c. The TKL
- * contract's cfg therefore cannot move a pin, and a cfg that disagrees with the
- * board is reported rather than silently ignored.
- *
- * Scope, stated rather than implied:
- *   - Master only. Neither device stack exposes a slave data path.
- *   - Synchronous transfers. IOCTL_SPI_SET_ASYNC_SEND is explicitly cleared on
- *     wl83 (the vendor's own one-bit example does the same) so dev_write
- *     returns when the bytes are out.
- *   - No IRQ/DMA completion callback: the transfer path is synchronous, so a
- *     callback could never fire. tkl_spi_irq_* are refused.
- *   - Word size is 8 bits. Both chips' dev_write/dev_read take a byte count;
- *     there is no 16-bit framing in this path.
- *   - CS is whatever the board pinned. For a board that leaves cs_pin = -1 the
- *     caller drives CS as GPIO and passes each transfer as one call.
- *
- * The device is named spi0/spi1/spi2 by the board's device table. Which of
- * those exist is board data; a port the board did not register comes back
- * OPRT_NOT_SUPPORTED from dev_open.
- */
+/* The WL82/WL83 adapter has no verified SPI master path. Keep the entry point
+ * present for API compatibility, but do not register or open vendor nodes. */
 #define TKL_SPI_PORT_MAX 3
 
 static void *s_spi_handles[TKL_SPI_PORT_MAX];
+
+#if defined(JIELI_SELECTED_CHIP_WL82)
+static int8_t s_wl82_spi_pin_group[TKL_SPI_PORT_MAX] = {-1, -1, -1};
+
+OPERATE_RET jieli_wl82_spi_pinmux_select(uint32_t spi_port, uint32_t group)
+{
+    if (spi_port >= TKL_SPI_PORT_MAX ||
+        (spi_port == 0u && group != 1u) ||
+        (spi_port == 1u && group > 1u) ||
+        (spi_port == 2u && group != 0u && group != 2u)) {
+        return OPRT_NOT_SUPPORTED;
+    }
+    if (s_wl82_spi_pin_group[spi_port] >= 0 && s_wl82_spi_pin_group[spi_port] != (int8_t)group) {
+        /* Pinmux is configured one signal at a time. Do not let a later signal
+         * silently move the whole peripheral away from the earlier one. */
+        return OPRT_INVALID_PARM;
+    }
+    if (s_spi_handles[spi_port] != NULL &&
+        dev_ioctl(s_spi_handles[spi_port], IOCTL_SPI_SET_PORT, group) != 0) {
+        return OPRT_COM_ERROR;
+    }
+    s_wl82_spi_pin_group[spi_port] = (int8_t)group;
+    return OPRT_OK;
+}
+
+#endif
 
 static const char *jieli_spi_device_name(TUYA_SPI_NUM_E port)
 {
@@ -56,8 +56,6 @@ static int jieli_spi_valid(TUYA_SPI_NUM_E port)
 
 OPERATE_RET tkl_spi_init(TUYA_SPI_NUM_E port, const TUYA_SPI_BASE_CFG_T *cfg)
 {
-    const char *name;
-
     if (cfg == NULL || !jieli_spi_valid(port)) {
         return OPRT_INVALID_PARM;
     }
@@ -65,33 +63,13 @@ OPERATE_RET tkl_spi_init(TUYA_SPI_NUM_E port, const TUYA_SPI_BASE_CFG_T *cfg)
         /* Slave has no data path through the device layer. */
         return OPRT_NOT_SUPPORTED;
     }
-    if (cfg->databits != TUYA_SPI_DATA_BIT8) {
-        return OPRT_NOT_SUPPORTED;
+    if (cfg->freq_hz == 0u) {
+        return OPRT_INVALID_PARM;
     }
-    if (cfg->bitorder != TUYA_SPI_ORDER_MSB2LSB) {
-        /* The board's spi_attr fixes the sample/update edges; there is no
-         * separate bit-order knob in the platform data, so this cannot be
-         * honoured for the other order. */
-        return OPRT_NOT_SUPPORTED;
-    }
-
-    name = jieli_spi_device_name(port);
-    if (s_spi_handles[port] != NULL) {
-        return OPRT_OK;
-    }
-    s_spi_handles[port] = dev_open(name, NULL);
-    if (s_spi_handles[port] == NULL) {
-        /* The board did not register this port. On the AC792N profile spi1 is
-         * gated behind a demo switch that is off, so this is the expected
-         * result until a board declares it. */
-        return OPRT_NOT_SUPPORTED;
-    }
-#if defined(JIELI_SELECTED_CHIP_WL83)
-    /* Synchronous: dev_write must not return before the bytes are out, because
-     * the TKL contract has no completion callback to wait on. */
-    (void)dev_ioctl(s_spi_handles[port], IOCTL_SPI_SET_ASYNC_SEND, 0u);
-#endif
-    return OPRT_OK;
+    /* Neither supported chip profile has a verified Tuya SPI path. In
+     * particular, do not derive support from SDK TCFG defaults: WL83's vendor
+     * demo may enable spi1 independently of this adapter. */
+    return OPRT_NOT_SUPPORTED;
 }
 
 OPERATE_RET tkl_spi_deinit(TUYA_SPI_NUM_E port)
@@ -118,7 +96,9 @@ OPERATE_RET tkl_spi_send(TUYA_SPI_NUM_E port, void *data, uint32_t size)
         return OPRT_INVALID_PARM;
     }
     ret = dev_write(s_spi_handles[port], data, size);
-    return ret < 0 ? OPRT_OS_ADAPTER_SPI_BUS_ERR : OPRT_OK;
+    /* dev_write returns the number of bytes accepted (see device.h users and
+     * the vendor video decoder). A short write is a failed TKL transfer. */
+    return ret == (int)size ? OPRT_OK : OPRT_OS_ADAPTER_SPI_BUS_ERR;
 }
 
 OPERATE_RET tkl_spi_recv(TUYA_SPI_NUM_E port, void *data, uint32_t size)
@@ -132,12 +112,14 @@ OPERATE_RET tkl_spi_recv(TUYA_SPI_NUM_E port, void *data, uint32_t size)
         return OPRT_INVALID_PARM;
     }
     ret = dev_read(s_spi_handles[port], data, size);
-    return ret < 0 ? OPRT_OS_ADAPTER_SPI_BUS_ERR : OPRT_OK;
+    /* dev_read also returns a byte count; accepting a short read would leave
+     * the caller with partially initialized receive data. */
+    return ret == (int)size ? OPRT_OK : OPRT_OS_ADAPTER_SPI_BUS_ERR;
 }
 
 OPERATE_RET tkl_spi_transfer(TUYA_SPI_NUM_E port, void *send_buf, void *receive_buf, uint32_t length)
 {
-    if (length == 0u) {
+    if (length == 0u || length > SPI_MAX_SIZE) {
         return OPRT_INVALID_PARM;
     }
     /* Full duplex is a separate vendor path (IOCTL_SPI_FDX_TR_DATA on both

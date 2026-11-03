@@ -8,17 +8,13 @@
 
 #include "device.h"
 #include "uart.h"
+#include "jieli_pinmux_internal.h"
+#include "system/os/pthread.h"
 
 #define TKL_UART_PORT_MAX 2
 
-/* The vendor UART driver has no compile-time field for a receive buffer:
- * struct uart_platform_data carries pins, baud and flags but no buffer
- * address. Reception only works once a circular buffer is handed to the
- * driver with IOCTL_UART_SET_CIRCULAR_BUFF_*, and its RX interrupt writes
- * into that buffer. Opening a port without registering one leaves the ISR
- * with no destination, so the first received byte faults (observed as
- * "hmem access inv exception" inside uartx_isr). 32-byte alignment and the
- * 1 KB size follow the vendor's own uart_test.c example.
+/* The SDK receives into a registered circular buffer. Its uart_test.c uses a
+ * 1 KiB, 32-byte-aligned buffer; opening without one leaves RX without storage.
  */
 #define TKL_UART_RX_BUFFER_SIZE 1024
 
@@ -35,26 +31,103 @@ enum jieli_uart_ioctl_cmd {
 };
 
 static void *s_uart_handles[TKL_UART_PORT_MAX];
+static pthread_mutex_t s_uart_mutex[TKL_UART_PORT_MAX];
+static volatile int s_uart_mutex_state;
+static uint8_t s_uart_deinit_pending[TKL_UART_PORT_MAX];
+static uint8_t s_uart_deinit_running[TKL_UART_PORT_MAX];
+static TKL_THREAD_HANDLE s_uart_rx_thread[TKL_UART_PORT_MAX];
+static TUYA_UART_IRQ_CB s_uart_rx_cb[TKL_UART_PORT_MAX];
+
+static OPERATE_RET jieli_uart_lock(uint8_t port_id)
+{
+    if (s_uart_mutex_state != 2) {
+        if (__sync_bool_compare_and_swap(&s_uart_mutex_state, 0, 1)) {
+            int i;
+            for (i = 0; i < TKL_UART_PORT_MAX; i++) {
+                if (pthread_mutex_init(&s_uart_mutex[i], NULL) != 0) {
+                    s_uart_mutex_state = -1;
+                    return OPRT_COM_ERROR;
+                }
+            }
+            s_uart_mutex_state = 2;
+        } else {
+            while (s_uart_mutex_state == 1) (void)tkl_system_sleep(1u);
+        }
+    }
+    if (s_uart_mutex_state != 2) return OPRT_COM_ERROR;
+    return pthread_mutex_lock(&s_uart_mutex[port_id]) == 0 ? OPRT_OK : OPRT_COM_ERROR;
+}
+
+static void jieli_uart_unlock(uint8_t port_id)
+{
+    (void)pthread_mutex_unlock(&s_uart_mutex[port_id]);
+}
+
+static int jieli_uart_worker_running(uint8_t port_id)
+{
+    int running;
+    if (jieli_uart_lock(port_id) != OPRT_OK) return 1;
+    running = s_uart_rx_thread[port_id] != NULL;
+    jieli_uart_unlock(port_id);
+    return running;
+}
+
+static void jieli_uart_worker_exited(uint8_t port_id)
+{
+    if (jieli_uart_lock(port_id) != OPRT_OK) return;
+    s_uart_rx_thread[port_id] = NULL;
+    jieli_uart_unlock(port_id);
+}
+
+static TUYA_UART_IRQ_CB jieli_uart_rx_callback(uint8_t port_id)
+{
+    TUYA_UART_IRQ_CB callback;
+    if (jieli_uart_lock(port_id) != OPRT_OK) return NULL;
+    callback = s_uart_deinit_pending[port_id] ? NULL : s_uart_rx_cb[port_id];
+    jieli_uart_unlock(port_id);
+    return callback;
+}
 
 /* Set while the receive task should keep running; shared by both chips because
  * tkl_uart_deinit() clears it whichever backend is built. */
 static volatile uint8_t s_uart_rx_active[TKL_UART_PORT_MAX];
 
 #if defined(JIELI_SELECTED_CHIP_WL83)
-/* The vendor ISR must not call dev_read(): that path takes a mutex and the SDK
- * asserts with "os_mutex_pend: in_irq". So the ISR only posts a semaphore and a
- * task does the reading, which is also the vendor's own model - its
- * uart_irq_cb example only prints, while a task calls dev_read. One trampoline
- * per port is needed because the vendor callback carries no port identifier.
- * Handle both RX and OT: RX fires only when a burst reaches RXCNT, while typed
- * input arrives one character at a time and is reported only by the over-time
- * event.
+/* TuyaOpen's logical UART1 is JieLi UART2 on WL83. Keep the device's complete
+ * platform data local to this adapter so its registration has one owner. PB4
+ * and PB5 are the board's J26 Multi Port pads; flow control is unsupported by
+ * this TKL API, so do not claim the vendor demo's PA4/PA5 RTS/CTS pins. */
+static struct uart_platform_data s_uart2_pd = {
+    .irq = IRQ_UART2_IDX,
+    .flow_ctl_enable = 0,
+    .rts_hw_enable = 0,
+    .rts_idle_level = 0,
+    .cts_idle_level = 0,
+    .rx_thresh = 80,
+    .disable_tx_irq = 0,
+    .disable_rx_irq = 0,
+    .disable_ot_irq = 0,
+    .tx_pin_hd_level = GPIO_DRIVE_STRENGTH_8p0mA,
+    .tx_pin = IO_PORTB_04,
+    .rx_pin = IO_PORTB_05,
+    .rts_pin = -1,
+    .cts_pin = -1,
+    .flags = 0,
+    .baudrate = 1000000,
+    .max_continue_recv_cnt = 1024,
+    .idle_sys_clk_cnt = 500000,
+    .parity = UART_PARITY_DISABLE,
+};
+
+REGISTER_DEVICE(uart2_node) = {"uart2", &uart_dev_ops, &s_uart2_pd};
+
+/* ISR only posts a semaphore: dev_read() takes a mutex and is unsafe in IRQ
+ * context. Separate trampolines identify the port; RX and OT cover bursts and
+ * single-character input respectively.
  */
 #define TKL_UART_RX_TASK_STACK 2048
 
-static TUYA_UART_IRQ_CB s_uart_rx_cb[TKL_UART_PORT_MAX];
 static TKL_SEM_HANDLE s_uart_rx_sem[TKL_UART_PORT_MAX];
-static TKL_THREAD_HANDLE s_uart_rx_thread[TKL_UART_PORT_MAX];
 
 static void jieli_uart_irq_dispatch(uint8_t port_id, uart_irq_event_t event)
 {
@@ -87,55 +160,24 @@ static void jieli_uart_rx_task(void *arg)
         if (!s_uart_rx_active[port_id]) {
             break;
         }
-        if (s_uart_rx_cb[port_id] != NULL) {
-            s_uart_rx_cb[port_id]((TUYA_UART_NUM_E)port_id);
+        TUYA_UART_IRQ_CB callback = jieli_uart_rx_callback(port_id);
+        if (callback != NULL) {
+            callback((TUYA_UART_NUM_E)port_id);
         }
     }
     /* Allow a later init/registration to start a fresh task. */
-    s_uart_rx_thread[port_id] = NULL;
+    jieli_uart_worker_exited(port_id);
 }
 #else /* JIELI_SELECTED_CHIP_WL82 */
-/* wl82 has no receive interrupt-event callback, but TAL cannot receive without
- * a notification.
- *
- * Its uart.h defines only the UART_SET_* ioctl set - UART_IRQ_EVENT_* belongs
- * to the wl83 layout, and there is no "set irq event cb" on this part. The
- * SDK's own receive consumer (apps/common/key/uart_key.c) therefore polls
- * getbyte() from a 10 ms key scan rather than waiting on an interrupt.
- *
- * TAL cannot do that: its receive ring is filled only from the callback
- * registered here, and tal_uart_read() blocks on a semaphore that only that
- * callback posts. So this port needs a notifier of its own.
- *
- * The vendor driver still fills the circular buffer - it is handed over in
- * tkl_uart_init and UART_START enables reception - so the missing piece is only
- * "there is something to drain". UART_GET_RECV_CNT reports the count of bytes
- * received and not yet taken, which is exactly that. Its argument convention is
- * not obvious from the declaration (wl82 says _IOR(...,u32), wl83 says u32 *,
- * and their ioctl numbers differ), but the SDK's own caller settles it - the
- * awtk HAL does
- *
- *     dev_ioctl(fd, UART_GET_RECV_CNT, (u32)&len);
- *
- * so the count comes back through a pointer on wl82. This task polls it from
- * TAL context rather than an ISR, so the TAL callback's mutex use is not a
- * hazard here.
- *
- * Deliberately not used: UART_SET_RECV_TIMEOUT_CB. It looks like an idle-line
- * interrupt, but no SDK consumer exercises it, so its call context is unknown,
- * and calling a mutex-taking callback from an ISR is the exact failure the wl83
- * path was written to avoid.
- *
- * Two honest consequences: latency is one poll period rather than the
- * interrupt latency, and a burst that is emitted and fully consumed between
- * two polls is missed. In this design TAL only drains from inside the
- * callback, so data stays in the ring until the next poll.
+/* WL82 exposes no IRQ-event callback. Poll unread-byte count every 10 ms and
+ * notify TAL in task context; the SDK's awtk caller confirms GET_RECV_CNT uses
+ * a pointer argument. This adds polling latency; bytes remain buffered until
+ * TAL drains them. The timeout callback is unused because its context is not
+ * established and TAL callbacks take a mutex.
  */
 #define TKL_UART_RX_POLL_PERIOD_MS 10
 #define TKL_UART_RX_TASK_STACK     2048
 
-static TUYA_UART_IRQ_CB s_uart_rx_cb[TKL_UART_PORT_MAX];
-static TKL_THREAD_HANDLE s_uart_rx_thread[TKL_UART_PORT_MAX];
 
 /* jieli_uart_wl82_recv_cnt() and jieli_uart_poll_task() are defined after
  * jieli_uart_ioctl(), which they call. */
@@ -221,8 +263,9 @@ static void jieli_uart_poll_task(void *arg)
             (void)tkl_system_sleep(TKL_UART_RX_POLL_PERIOD_MS);
             continue;
         }
-        if (cnt != last && s_uart_rx_cb[port_id] != NULL) {
-            s_uart_rx_cb[port_id]((TUYA_UART_NUM_E)port_id);
+        TUYA_UART_IRQ_CB callback = jieli_uart_rx_callback(port_id);
+        if (cnt != last && callback != NULL) {
+            callback((TUYA_UART_NUM_E)port_id);
             /* TAL drained the ring in the callback; re-baseline instead of
              * assuming it is empty. */
             last = 0;
@@ -234,7 +277,7 @@ static void jieli_uart_poll_task(void *arg)
         }
         (void)tkl_system_sleep(TKL_UART_RX_POLL_PERIOD_MS);
     }
-    s_uart_rx_thread[port_id] = NULL;
+    jieli_uart_worker_exited(port_id);
 }
 #endif
 
@@ -245,15 +288,43 @@ OPERATE_RET tkl_uart_init(TUYA_UART_NUM_E port_id, TUYA_UART_BASE_CFG_T *cfg)
     if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX || cfg == NULL) {
         return OPRT_INVALID_PARM;
     }
+    /* The registered JieLi UART device API only exposes baud-rate control;
+     * framing and hardware flow control are fixed by the SDK. Do not report a
+     * successful init for settings the backend cannot apply. */
+    if (cfg->baudrate == 0u || cfg->databits != TUYA_UART_DATA_LEN_8BIT ||
+        cfg->stopbits != TUYA_UART_STOP_LEN_1BIT ||
+        cfg->parity != TUYA_UART_PARITY_TYPE_NONE || cfg->flowctrl != TUYA_UART_FLOWCTRL_NONE) {
+        return OPRT_NOT_SUPPORTED;
+    }
     device_name = jieli_uart_device_name(port_id);
     if (device_name == NULL) {
         return OPRT_NOT_SUPPORTED;
     }
+    if (jieli_uart_lock((uint8_t)port_id) != OPRT_OK) return OPRT_COM_ERROR;
+    if (s_uart_deinit_pending[port_id]) {
+        jieli_uart_unlock((uint8_t)port_id);
+        return OPRT_COM_ERROR;
+    }
     if (s_uart_handles[port_id] != NULL) {
-        return OPRT_OK;
+        /* Re-init applies the requested baud instead of claiming a changed
+         * configuration succeeded while leaving the old baud in place. */
+        OPERATE_RET ret = dev_ioctl(s_uart_handles[port_id],
+                                    jieli_uart_ioctl(JIELI_UART_IOCTL_SET_BAUDRATE), cfg->baudrate) == 0
+                              ? OPRT_OK
+                              : OPRT_COM_ERROR;
+        jieli_uart_unlock((uint8_t)port_id);
+        return ret;
     }
 
     s_uart_handles[port_id] = dev_open(device_name, NULL);
+    /* dev_open() may apply board defaults. Replay a saved TKL selection after
+     * open and before START on both SDK families. */
+    if (s_uart_handles[port_id] != NULL && jieli_pinmux_uart_apply(port_id) != OPRT_OK) {
+        dev_close(s_uart_handles[port_id]);
+        s_uart_handles[port_id] = NULL;
+        jieli_uart_unlock((uint8_t)port_id);
+        return OPRT_COM_ERROR;
+    }
     if (s_uart_handles[port_id] != NULL &&
         (dev_ioctl(s_uart_handles[port_id], jieli_uart_ioctl(JIELI_UART_IOCTL_SET_CIRCULAR_BUFF_ADDR),
                    (u32)(uintptr_t)s_uart_rx_buffer[port_id]) != 0 ||
@@ -270,16 +341,35 @@ OPERATE_RET tkl_uart_init(TUYA_UART_NUM_E port_id, TUYA_UART_BASE_CFG_T *cfg)
         s_uart_handles[port_id] = NULL;
     }
     if (s_uart_handles[port_id] == NULL) {
+        jieli_uart_unlock((uint8_t)port_id);
         return OPRT_OS_ADAPTER_UART_INIT_FAILED;
     }
+    jieli_uart_unlock((uint8_t)port_id);
     return OPRT_OK;
 }
 
 OPERATE_RET tkl_uart_deinit(TUYA_UART_NUM_E port_id)
 {
-    if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX || s_uart_handles[port_id] == NULL) {
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    void *handle;
+#endif
+    if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX) {
         return OPRT_INVALID_PARM;
     }
+    if (jieli_uart_lock((uint8_t)port_id) != OPRT_OK) return OPRT_COM_ERROR;
+    if (s_uart_handles[port_id] == NULL) {
+        jieli_uart_unlock((uint8_t)port_id);
+        return OPRT_INVALID_PARM;
+    }
+    if (s_uart_deinit_running[port_id]) {
+        jieli_uart_unlock((uint8_t)port_id);
+        return OPRT_COM_ERROR;
+    }
+    s_uart_deinit_running[port_id] = 1u;
+    s_uart_deinit_pending[port_id] = 1u;
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    handle = s_uart_handles[port_id];
+#endif
 
     /* Stop the receive task before the handle goes away. Without this the wl83
      * task waits forever on a semaphore the closed port can no longer post,
@@ -287,16 +377,19 @@ OPERATE_RET tkl_uart_deinit(TUYA_UART_NUM_E port_id)
      * a leaked thread in both cases, and a callback that could still fire into
      * a caller that believes it has deinitialised. */
     s_uart_rx_active[port_id] = 0;
+    s_uart_rx_cb[port_id] = NULL;
 #if defined(JIELI_SELECTED_CHIP_WL83)
     /* The task is blocked in tkl_semaphore_wait(); post once so it wakes, sees
      * the flag and exits. The vendor callback is cleared too, so no further
      * posts arrive after close. */
-    if (s_uart_rx_sem[port_id] != NULL) {
-        (void)tkl_semaphore_post(s_uart_rx_sem[port_id]);
-    }
-    (void)dev_ioctl(s_uart_handles[port_id], jieli_uart_ioctl(JIELI_UART_IOCTL_SET_IRQ_EVENT_CB), 0u);
+    TKL_SEM_HANDLE sem = s_uart_rx_sem[port_id];
 #endif
-    s_uart_rx_cb[port_id] = NULL;
+    jieli_uart_unlock((uint8_t)port_id);
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    if (sem != NULL) (void)tkl_semaphore_post(sem);
+    /* Do not hold the lifecycle mutex while the SDK disables its callback. */
+    (void)dev_ioctl(handle, jieli_uart_ioctl(JIELI_UART_IOCTL_SET_IRQ_EVENT_CB), 0u);
+#endif
 
     /* Wait (bounded) for the task to actually exit before the handle goes away.
      * Without a join, a quick init+register inside the task's exit window sees
@@ -305,30 +398,54 @@ OPERATE_RET tkl_uart_deinit(TUYA_UART_NUM_E port_id)
      * then silently dropped. The task clears its own handle on the way out. */
     {
         uint32_t spins = 0;
-        while (s_uart_rx_thread[port_id] != NULL && spins < 20u) {
+        while (jieli_uart_worker_running((uint8_t)port_id) && spins < 20u) {
             (void)tkl_system_sleep(5);
             spins++;
         }
+        /* The callback runs in this worker and may still be using the UART
+         * handle. Keep the handle alive if it does not exit in time; callers
+         * can retry deinit after the worker observes the stop request. */
+        if (jieli_uart_worker_running((uint8_t)port_id)) {
+            if (jieli_uart_lock((uint8_t)port_id) == OPRT_OK) {
+                s_uart_deinit_running[port_id] = 0u;
+                jieli_uart_unlock((uint8_t)port_id);
+            }
+            return OPRT_COM_ERROR;
+        }
     }
 
+    if (jieli_uart_lock((uint8_t)port_id) != OPRT_OK) return OPRT_COM_ERROR;
     dev_close(s_uart_handles[port_id]);
     s_uart_handles[port_id] = NULL;
+    s_uart_deinit_pending[port_id] = 0u;
+    s_uart_deinit_running[port_id] = 0u;
+    jieli_uart_unlock((uint8_t)port_id);
     return OPRT_OK;
 }
 
 int tkl_uart_write(TUYA_UART_NUM_E port_id, void *buff, uint16_t len)
 {
-    if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX || s_uart_handles[port_id] == NULL ||
-        buff == NULL) {
+    if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX || buff == NULL) {
+        return OPRT_INVALID_PARM;
+    }
+    if (jieli_uart_lock((uint8_t)port_id) != OPRT_OK) return OPRT_COM_ERROR;
+    if (s_uart_deinit_pending[port_id] || s_uart_handles[port_id] == NULL) {
+        jieli_uart_unlock((uint8_t)port_id);
         return OPRT_INVALID_PARM;
     }
     int ret = dev_write(s_uart_handles[port_id], buff, len);
+    jieli_uart_unlock((uint8_t)port_id);
     return ret < 0 ? OPRT_OS_ADAPTER_UART_SEND_FAILED : ret;
 }
 
 void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
 {
     if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX) {
+        return;
+    }
+    if (jieli_uart_lock((uint8_t)port_id) != OPRT_OK) return;
+    if (s_uart_deinit_pending[port_id]) {
+        jieli_uart_unlock((uint8_t)port_id);
         return;
     }
 #if defined(JIELI_SELECTED_CHIP_WL83)
@@ -338,6 +455,7 @@ void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
      * notification stays unwired on that chip. */
     s_uart_rx_cb[port_id] = rx_cb;
     if (rx_cb == NULL || s_uart_handles[port_id] == NULL) {
+        jieli_uart_unlock((uint8_t)port_id);
         return;
     }
     /* Publish "should run" before anything else: if a previous task is still
@@ -348,6 +466,7 @@ void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
         tkl_semaphore_create_init(&s_uart_rx_sem[port_id], 0u, 1u) != OPRT_OK) {
         s_uart_rx_sem[port_id] = NULL;
         s_uart_rx_active[port_id] = 0;
+        jieli_uart_unlock((uint8_t)port_id);
         return;
     }
     if (s_uart_rx_thread[port_id] == NULL) {
@@ -355,6 +474,7 @@ void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
                               jieli_uart_rx_task, (void *)(uintptr_t)port_id) != OPRT_OK) {
             s_uart_rx_active[port_id] = 0;
             s_uart_rx_thread[port_id] = NULL;
+            jieli_uart_unlock((uint8_t)port_id);
             return;
         }
     }
@@ -363,6 +483,7 @@ void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
 #else
     s_uart_rx_cb[port_id] = rx_cb;
     if (rx_cb == NULL || s_uart_handles[port_id] == NULL) {
+        jieli_uart_unlock((uint8_t)port_id);
         return;
     }
     if (s_uart_rx_thread[port_id] == NULL) {
@@ -378,6 +499,7 @@ void tkl_uart_rx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB rx_cb)
         s_uart_rx_active[port_id] = 1;
     }
 #endif
+    jieli_uart_unlock((uint8_t)port_id);
 }
 
 void tkl_uart_tx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB tx_cb)
@@ -388,11 +510,16 @@ void tkl_uart_tx_irq_cb_reg(TUYA_UART_NUM_E port_id, TUYA_UART_IRQ_CB tx_cb)
 
 int tkl_uart_read(TUYA_UART_NUM_E port_id, void *buff, uint16_t len)
 {
-    if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX || s_uart_handles[port_id] == NULL ||
-        buff == NULL) {
+    if (port_id >= TUYA_UART_NUM_MAX || port_id >= TKL_UART_PORT_MAX || buff == NULL) {
+        return OPRT_INVALID_PARM;
+    }
+    if (jieli_uart_lock((uint8_t)port_id) != OPRT_OK) return OPRT_COM_ERROR;
+    if (s_uart_deinit_pending[port_id] || s_uart_handles[port_id] == NULL) {
+        jieli_uart_unlock((uint8_t)port_id);
         return OPRT_INVALID_PARM;
     }
     int ret = dev_read(s_uart_handles[port_id], buff, len);
+    jieli_uart_unlock((uint8_t)port_id);
     return ret < 0 ? OPRT_OS_ADAPTER_UART_READ_FAILED : ret;
 }
 

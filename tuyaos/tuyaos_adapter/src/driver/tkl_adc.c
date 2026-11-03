@@ -13,6 +13,8 @@
 #include "tuya_error_code.h"
 #include "generic/typedef.h"
 #include "asm/adc_api.h"
+#include "system/os/pthread.h"
+#include "system/tkl_system.h"
 
 #include <stdbool.h>
 
@@ -30,6 +32,35 @@ static uint16_t s_active_channel_mask;
 /* How many tkl_adc_init() calls are outstanding on the single supported port.
  * See tkl_adc_deinit() for why the mask cannot simply be cleared. */
 static uint8_t s_active_users;
+static pthread_mutex_t s_adc_mutex;
+static volatile int s_adc_mutex_state;
+
+static OPERATE_RET jieli_adc_lock(void)
+{
+    if (s_adc_mutex_state != 2) {
+        if (__sync_bool_compare_and_swap(&s_adc_mutex_state, 0, 1)) {
+            if (pthread_mutex_init(&s_adc_mutex, NULL) != 0) {
+                s_adc_mutex_state = -1;
+                return OPRT_COM_ERROR;
+            }
+            s_adc_mutex_state = 2;
+        } else {
+            while (s_adc_mutex_state == 1) {
+                (void)tkl_system_sleep(1U);
+            }
+        }
+    }
+
+    if (s_adc_mutex_state != 2 || pthread_mutex_lock(&s_adc_mutex) != 0) {
+        return OPRT_COM_ERROR;
+    }
+    return OPRT_OK;
+}
+
+static OPERATE_RET jieli_adc_unlock(void)
+{
+    return pthread_mutex_unlock(&s_adc_mutex) == 0 ? OPRT_OK : OPRT_COM_ERROR;
+}
 
 static uint8_t jieli_adc_channel_count(uint16_t mask)
 {
@@ -55,6 +86,7 @@ static OPERATE_RET jieli_adc_validate_port(TUYA_ADC_NUM_E port_num)
 
 static OPERATE_RET jieli_adc_read_raw(TUYA_ADC_NUM_E port_num, uint8_t ch_id, int32_t *data)
 {
+    OPERATE_RET ret;
     uint32_t raw;
 
     if (data == NULL) {
@@ -63,18 +95,26 @@ static OPERATE_RET jieli_adc_read_raw(TUYA_ADC_NUM_E port_num, uint8_t ch_id, in
     if (OPRT_OK != jieli_adc_validate_port(port_num)) {
         return OPRT_NOT_SUPPORTED;
     }
-    if (ch_id >= JIELI_ADC_EXTERNAL_CHANNEL_COUNT ||
-        (s_active_channel_mask & (uint16_t)(1U << ch_id)) == 0U) {
-        return OPRT_INVALID_PARM;
-    }
-
-    raw = adc_get_value(ch_id);
-    if (raw > JIELI_ADC_RAW_MAX) {
+    if (jieli_adc_lock() != OPRT_OK) {
         return OPRT_COM_ERROR;
     }
+    if (ch_id >= JIELI_ADC_EXTERNAL_CHANNEL_COUNT ||
+        (s_active_channel_mask & (uint16_t)(1U << ch_id)) == 0U) {
+        ret = OPRT_INVALID_PARM;
+    } else {
+        raw = adc_get_value(ch_id);
+        if (raw > JIELI_ADC_RAW_MAX) {
+            ret = OPRT_COM_ERROR;
+        } else {
+            *data = (int32_t)raw;
+            ret = OPRT_OK;
+        }
+    }
 
-    *data = (int32_t)raw;
-    return OPRT_OK;
+    if (jieli_adc_unlock() != OPRT_OK) {
+        return OPRT_COM_ERROR;
+    }
+    return ret;
 }
 
 OPERATE_RET tkl_adc_init(TUYA_ADC_NUM_E port_num, TUYA_ADC_BASE_CFG_T *cfg)
@@ -91,7 +131,7 @@ OPERATE_RET tkl_adc_init(TUYA_ADC_NUM_E port_num, TUYA_ADC_BASE_CFG_T *cfg)
     }
 
     if ((cfg->ch_list.data & 0xFFFF0000UL) != 0U || cfg->width != 10U ||
-        cfg->type != TUYA_ADC_EXTERNAL_SAMPLE_VOL || cfg->mode > TUYA_ADC_SCAN) {
+        cfg->type != TUYA_ADC_EXTERNAL_SAMPLE_VOL || cfg->mode != TUYA_ADC_SCAN) {
         return OPRT_NOT_SUPPORTED;
     }
 
@@ -100,6 +140,23 @@ OPERATE_RET tkl_adc_init(TUYA_ADC_NUM_E port_num, TUYA_ADC_BASE_CFG_T *cfg)
     if (requested_mask == 0U || (requested_mask & (uint16_t)~jieli_adc_supported_mask()) != 0U ||
         channel_count == 0U || cfg->ch_nums != channel_count) {
         return OPRT_INVALID_PARM;
+    }
+    /* The external pin mux has more choices than the vendor sampling queue has
+     * slots (WL82: 10, WL83: 8). Reject an impossible batch before adding any
+     * channels, which would otherwise leave a known partial queue update. */
+    if (channel_count > ADC_MAX_CH) {
+        return OPRT_EXCEED_UPPER_LIMIT;
+    }
+
+    if (jieli_adc_lock() != OPRT_OK) {
+        return OPRT_COM_ERROR;
+    }
+    /* Do not claim another successful client when the reference count cannot
+     * represent it; otherwise 255 deinit calls could clear channels while a
+     * 256th successful client is still active. */
+    if (s_active_users == 0xFFU) {
+        (void)jieli_adc_unlock();
+        return OPRT_EXCEED_UPPER_LIMIT;
     }
 
     for (channel = 0; channel < JIELI_ADC_EXTERNAL_CHANNEL_COUNT; channel++) {
@@ -112,21 +169,23 @@ OPERATE_RET tkl_adc_init(TUYA_ADC_NUM_E port_num, TUYA_ADC_BASE_CFG_T *cfg)
         /* adc_init() belongs to board startup; reinitializing it clears this shared queue. */
         queue_index = adc_add_sample_ch(channel);
         if (queue_index >= ADC_MAX_CH) {
+            (void)jieli_adc_unlock();
             return OPRT_COM_ERROR;
         }
     }
 
     s_active_channel_mask |= requested_mask;
-    if (s_active_users < 0xFFU) {
-        s_active_users++;
-    }
-    return OPRT_OK;
+    s_active_users++;
+    return jieli_adc_unlock();
 }
 
 OPERATE_RET tkl_adc_deinit(TUYA_ADC_NUM_E port_num)
 {
     if (OPRT_OK != jieli_adc_validate_port(port_num)) {
         return OPRT_NOT_SUPPORTED;
+    }
+    if (jieli_adc_lock() != OPRT_OK) {
+        return OPRT_COM_ERROR;
     }
 
     /* Do not remove vendor channels: the process-global queue can be shared.
@@ -147,7 +206,7 @@ OPERATE_RET tkl_adc_deinit(TUYA_ADC_NUM_E port_num)
     if (s_active_users == 0U) {
         s_active_channel_mask = 0U;
     }
-    return OPRT_OK;
+    return jieli_adc_unlock();
 }
 
 uint8_t tkl_adc_width_get(TUYA_ADC_NUM_E port_num)
@@ -167,6 +226,7 @@ int32_t tkl_adc_temperature_get(void)
 
 static OPERATE_RET jieli_adc_read_list(TUYA_ADC_NUM_E port_num, int32_t *buff, uint16_t len, bool voltage)
 {
+    OPERATE_RET ret;
     uint8_t channel;
     uint16_t read_count = 0;
 
@@ -176,11 +236,16 @@ static OPERATE_RET jieli_adc_read_list(TUYA_ADC_NUM_E port_num, int32_t *buff, u
     if (OPRT_OK != jieli_adc_validate_port(port_num)) {
         return OPRT_NOT_SUPPORTED;
     }
+    if (jieli_adc_lock() != OPRT_OK) {
+        return OPRT_COM_ERROR;
+    }
     if (s_active_channel_mask == 0U || len > jieli_adc_channel_count(s_active_channel_mask)) {
-        return OPRT_INVALID_PARM;
+        ret = OPRT_INVALID_PARM;
+    } else {
+        ret = OPRT_OK;
     }
 
-    for (channel = 0; channel < JIELI_ADC_EXTERNAL_CHANNEL_COUNT && read_count < len; channel++) {
+    for (channel = 0; ret == OPRT_OK && channel < JIELI_ADC_EXTERNAL_CHANNEL_COUNT && read_count < len; channel++) {
         uint32_t sample;
 
         if ((s_active_channel_mask & (uint16_t)(1U << channel)) == 0U) {
@@ -189,12 +254,19 @@ static OPERATE_RET jieli_adc_read_list(TUYA_ADC_NUM_E port_num, int32_t *buff, u
 
         sample = voltage ? adc_get_voltage(channel) : adc_get_value(channel);
         if (!voltage && sample > JIELI_ADC_RAW_MAX) {
-            return OPRT_COM_ERROR;
+            ret = OPRT_COM_ERROR;
+            break;
         }
         buff[read_count++] = (int32_t)sample;
     }
 
-    return (read_count == len) ? OPRT_OK : OPRT_COM_ERROR;
+    if (ret == OPRT_OK && read_count != len) {
+        ret = OPRT_COM_ERROR;
+    }
+    if (jieli_adc_unlock() != OPRT_OK) {
+        return OPRT_COM_ERROR;
+    }
+    return ret;
 }
 
 OPERATE_RET tkl_adc_read_data(TUYA_ADC_NUM_E port_num, int32_t *buff, uint16_t len)

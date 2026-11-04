@@ -1021,7 +1021,22 @@ def configure_lowpower(
         raise BuildError(f"no Jieli low-power profile for chip '{chip_name}'")
 
 
-def configure_usb_download_app_config(app_config_file: Path) -> None:
+def _usb_class_block(usb_cdc_log: bool) -> str:
+    """The USB class list, decided here rather than by the C preprocessor.
+
+    The vendor make never sees a TuyaOpen ``-D``, so a ``#if defined(CONFIG_*)``
+    in the generated header is always false: it silently left the CDC class out
+    and cdc.c compiled to an empty object, which then failed to link against the
+    log output. The switch is a Kconfig value the caller already has, so the
+    class list is written literally. ``usb_common_def.h`` derives
+    TCFG_USB_SLAVE_CDC_ENABLE from MASSSTORAGE_CLASS/CDC_CLASS, so that macro
+    must not be set here as well.
+    """
+    classes = "MASSSTORAGE_CLASS | CDC_CLASS" if usb_cdc_log else "MASSSTORAGE_CLASS"
+    return f"#define USB_DEVICE_CLASS_CONFIG             ({classes})\n"
+
+
+def configure_usb_download_app_config(app_config_file: Path, usb_cdc_log: bool = False) -> None:
     """Enable the AC79 USB slave/MSD stack that serves download-mode requests.
 
     MASSSTORAGE_CLASS is what pulls in msd.c/msd_upgrade.c and enables the SCSI
@@ -1041,14 +1056,8 @@ def configure_usb_download_app_config(app_config_file: Path) -> None:
         '#include "board_com_api.h"\n'
         "#endif\n"
         "#endif\n"
-        "#if (defined(ENABLE_JIELI_USB_CDC_LOG) && ENABLE_JIELI_USB_CDC_LOG) || \\\n"
-        "    (defined(CONFIG_ENABLE_JIELI_USB_CDC_LOG) && CONFIG_ENABLE_JIELI_USB_CDC_LOG)\n"
-        "#define TCFG_USB_SLAVE_CDC_ENABLE           1\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS | CDC_CLASS)\n"
-        "#else\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS)\n"
-        "#endif\n"
-        "#define TCFG_HOST_AUDIO_ENABLE              0\n"
+        + _usb_class_block(usb_cdc_log)
+        + "#define TCFG_HOST_AUDIO_ENABLE              0\n"
         "#define TCFG_HOST_UVC_ENABLE                0\n"
         "#define TCFG_HID_HOST_ENABLE                0\n"
         "#define TCFG_UDISK_ENABLE                   0\n"
@@ -1059,7 +1068,9 @@ def configure_usb_download_app_config(app_config_file: Path) -> None:
     _insert_before_final_endif(app_config_file, block)
 
 
-def configure_usb_download_board_header(board_header: Path, facts: BoardFacts) -> None:
+def configure_usb_download_board_header(
+    board_header: Path, facts: BoardFacts, usb_cdc_log: bool = False
+) -> None:
     """Enable the AC792 USB slave/MSD stack in the staged board profile.
 
     board_demo.h is reached from the USB sources through
@@ -1080,14 +1091,8 @@ def configure_usb_download_board_header(board_header: Path, facts: BoardFacts) -
         '#include "board_com_api.h"\n'
         "#endif\n"
         "#endif\n"
-        "#if (defined(ENABLE_JIELI_USB_CDC_LOG) && ENABLE_JIELI_USB_CDC_LOG) || \\\n"
-        "    (defined(CONFIG_ENABLE_JIELI_USB_CDC_LOG) && CONFIG_ENABLE_JIELI_USB_CDC_LOG)\n"
-        "#define TCFG_USB_SLAVE_CDC_ENABLE           1\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS | CDC_CLASS)\n"
-        "#else\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS)\n"
-        "#endif\n"
-        '#include "usb_std_class_def.h"\n'
+        + _usb_class_block(usb_cdc_log)
+        + '#include "usb_std_class_def.h"\n'
         '#include "usb_common_def.h"\n\n'
     )
     _insert_before_final_endif(board_header, block)

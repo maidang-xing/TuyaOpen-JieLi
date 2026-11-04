@@ -36,8 +36,9 @@ from .errors import BuildError
 from .toolchain import resolve_tool_path
 from .feature_map import (
     FEATURES,
-    enabled_features,
     SDK_SOURCE_PREFIX,
+    TRUTHY,
+    enabled_features,
     feature_defines,
     feature_sources,
     link_libraries,
@@ -51,8 +52,10 @@ OPTIONAL_ADAPTER_SOURCE_GATES = frozenset({"CONFIG_ENABLE_MIPI_DSI"})
 # SDK-root-relative sources that keep the vendor USB slave stack serviced while
 # the Tuya app runs. msd_upgrade.c owns go_mask_usb_updata() and user_setup.c
 # answers the private GET_STATUS download-mode request; task_pc.c owns the
-# persistent usb_msd0 worker. The adapter event hook below routes OTG events
-# without compiling the SDK's unrelated SD mount implementation.
+# persistent usb_msd0 worker; cdc.c provides the CDC-ACM class and the
+# cdc_write_data() sink the TKL log output uses when USB CDC logging is on.
+# The adapter event hook below routes OTG events without compiling the SDK's
+# unrelated SD mount implementation.
 USB_DEVICE_SOURCES = (
     "apps/common/usb/usb_config.c",
     "apps/common/usb/usb_epbuf_manager.c",
@@ -62,6 +65,7 @@ USB_DEVICE_SOURCES = (
     "apps/common/usb/device/msd.c",
     "apps/common/usb/device/msd_upgrade.c",
     "apps/common/usb/device/task_pc.c",
+    "apps/common/usb/device/cdc.c",
 )
 
 # Paths the vendor USB device stack expects on the include search path. The
@@ -508,6 +512,7 @@ def staging_input_components(
     uart_log_port: int,
     uart_log_baudrate: int,
     adapter_source_selection: str = "",
+    usb_cdc_log: str = "n",
 ) -> dict[str, str]:
     """Name every input the staged bytes depend on, one digest each.
 
@@ -534,6 +539,8 @@ def staging_input_components(
         "board_facts": board_facts,
         "features": features,
         "adapter_sources": adapter_source_selection,
+        # Written into the staged USB board header, so it is staged bytes.
+        "usb_cdc_log": usb_cdc_log,
         "audio_config": _file_digest(audio_config_source),
         # The staging hooks themselves. An edit to any of them can change the
         # staged bytes without changing any other input.
@@ -743,6 +750,13 @@ def create_staging_tree(
     if features is None:
         raise BuildError("the enabled feature set is required to stage a Jieli build")
     features = tuple(features)
+    # The USB class list is compiled into the vendor header, so the switch has
+    # to be resolved here from the evaluated config: the vendor make is handed
+    # no TuyaOpen -D, and a #if on a Kconfig symbol there is always false.
+    usb_cdc_log = (
+        str((config_values or {}).get("CONFIG_ENABLE_JIELI_USB_CDC_LOG", "")).strip()
+        in TRUTHY
+    )
     adapter_sources = read_adapter_sources(platform_root, chip.name, config_values)
     board_name = facts.board
     profile = AUDIO_PROFILES.get(chip.name)
@@ -765,6 +779,7 @@ def create_staging_tree(
         uart_log_port=uart_log_port,
         uart_log_baudrate=uart_log_baudrate,
         adapter_source_selection="\n".join(adapter_sources),
+        usb_cdc_log="y" if usb_cdc_log else "n",
     )
     if staging_tree_is_current(staging_root, staging_input_digest(**components)):
         return staging_root / "build"
@@ -822,7 +837,7 @@ def create_staging_tree(
         board_file, "TCFG_USB_DEVICE" if chip.name == "wl83" else "0x03",
     )
     if chip.name == "wl83":
-        configure_usb_download_board_header(board_header, facts)
+        configure_usb_download_board_header(board_header, facts, usb_cdc_log)
         configure_board_memory(
             source_overlay_root / "apps/demo/demo_hello/board/wl83/chip_cfg.h",
             facts,
@@ -833,7 +848,7 @@ def create_staging_tree(
             configure_lcd_app_config(app_config_file)
             configure_lcd_board(board_file)
     else:
-        configure_usb_download_app_config(app_config_file)
+        configure_usb_download_app_config(app_config_file, usb_cdc_log)
     if profile is not None and profile.board_declarations:
         configure_audio_board(board_file, audio_config_source, profile)
     if chip.name == "wl83":

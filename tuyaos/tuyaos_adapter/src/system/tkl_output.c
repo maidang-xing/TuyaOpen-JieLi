@@ -30,7 +30,14 @@ void tkl_log_output(const char *format, ...)
 
     if (len > 0) {
         unsigned int write_len = (len < (int)sizeof(log_buf)) ? (unsigned int)len : (sizeof(log_buf) - 1);
-        cdc_write_data(0, (const unsigned char *)log_buf, write_len);
+        /* Which USB id the CDC class bound to depends on the board's port: the
+         * high-speed port is id 1, the full-speed port id 0. The inactive id
+         * has no CDC handle and returns 0, so writing to both is what the
+         * vendor's own debug_user.c does and what keeps the log alive whichever
+         * port a board wires up. */
+        if (cdc_write_data(0, (const unsigned char *)log_buf, write_len) == 0u) {
+            (void)cdc_write_data(1, (const unsigned char *)log_buf, write_len);
+        }
     }
 #else
     va_start(args, format);

@@ -130,8 +130,14 @@ OPERATE_RET tkl_adc_init(TUYA_ADC_NUM_E port_num, TUYA_ADC_BASE_CFG_T *cfg)
         return OPRT_NOT_SUPPORTED;
     }
 
+    /* The TKL contract leaves the sampling mode to the platform: the shared
+     * button TDD asks for TUYA_ADC_CONTINUOUS (one channel, sampled
+     * repeatedly) while other callers ask for TUYA_ADC_SCAN. Both map onto the
+     * vendor sampling queue, so accept either. TUYA_ADC_SINGLE is a one-shot
+     * conversion that this queue does not implement. */
     if ((cfg->ch_list.data & 0xFFFF0000UL) != 0U || cfg->width != 10U ||
-        cfg->type != TUYA_ADC_EXTERNAL_SAMPLE_VOL || cfg->mode != TUYA_ADC_SCAN) {
+        cfg->type != TUYA_ADC_EXTERNAL_SAMPLE_VOL ||
+        (cfg->mode != TUYA_ADC_SCAN && cfg->mode != TUYA_ADC_CONTINUOUS)) {
         return OPRT_NOT_SUPPORTED;
     }
 

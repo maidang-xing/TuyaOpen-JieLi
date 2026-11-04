@@ -11,33 +11,31 @@
 #if defined(JIELI_SELECTED_CHIP_WL83)
 #include "asm/gpio.h"
 #include "asm/iic.h"
+#include "init.h"
 
-/* Keep the WL83 ordinary hardware-IIC configuration complete. The board's
- * stock iic1 registration is removed from the staged board copy so this node
- * owns the name consistently with the platform adapter. */
-static iic_device_t s_iic1_dev;
-static struct hw_iic_platform_data s_iic1_pd = {
-    .head = { .type = IIC_TYPE_HW, .p_iic_device = &s_iic1_dev },
-    .iic = {
-        .index = 1,
-        .role = IIC_ROLE_MASTER,
-        .hd_level = GPIO_DRIVE_STRENGTH_2p5mA,
-        .clk_pin = IO_PORTA_06,
-        .dat_pin = IO_PORTA_07,
-        .io_filter = IIC_FILTER_CLOSE,
-        .internal_pull_up_enable = 1,
-        .fast_resp = 0,
-        .slave_addr = 0,
-        .adv_enable = 0,
-        .ie_enable = 0,
-        .stretch_disable = 0,
-        .baudrate = 100000,
-        .timeout_cnt = 40,
-        .reg = NULL,
-        .dma_reg = JL_IIC1,
-    },
-};
-REGISTER_DEVICE(iic1_node) = { "iic1", &iic_dev_ops, &s_iic1_pd };
+/* HW_IIC1_PLATFORM_DATA_BEGIN does more than fill the platform data: it also
+ * emits a platform_initcall that pulls hw_iic_ops into the image. A hand-written
+ * struct leaves the node in the .device table with no ops behind it, and
+ * devices_init() stalls on that node before the application ever runs - the
+ * board then shows neither its panel nor its USB device. Use the vendor macro
+ * and state only the fields the board chose. */
+HW_IIC1_PLATFORM_DATA_BEGIN(s_iic1_pd)
+    .role = IIC_ROLE_MASTER,
+    .hd_level = GPIO_DRIVE_STRENGTH_2p5mA,
+    .clk_pin = IO_PORTA_06,
+    .dat_pin = IO_PORTA_07,
+    .io_filter = IIC_FILTER_CLOSE,
+    .internal_pull_up_enable = 1,
+    .fast_resp = 0,
+    .slave_addr = 0,
+    .adv_enable = 0,
+    .ie_enable = 0,
+    .stretch_disable = 0,
+    .baudrate = 100000,
+    .timeout_cnt = 40,
+    .reg = NULL,
+HW_IIC1_PLATFORM_DATA_END()
+REGISTER_DEVICE(iic1_node) = { "iic1", &iic_dev_ops, (void *)&s_iic1_pd };
 #endif
 
 #if defined(JIELI_SELECTED_CHIP_WL82)

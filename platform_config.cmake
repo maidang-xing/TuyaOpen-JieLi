@@ -57,7 +57,7 @@ set(PLATFORM_TKL_ROOT "${JIELI_ADAPTER_PATH}/include")
 # build_info.h would otherwise layer on top, which select the POSIX/Windows
 # timing, socket and file backends (and PSA ITS storage) the PI32V2 target
 # cannot build.
-set(PLATFORM_MBEDTLS_CONFIG_FILE "tuya_tls_config.h")
+add_compile_definitions(MBEDTLS_CONFIG_FILE=\"tuya_tls_config.h\")
 
 add_compile_definitions(MBEDTLS_AES_ROM_TABLES)
 

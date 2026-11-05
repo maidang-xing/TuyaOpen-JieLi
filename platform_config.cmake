@@ -59,6 +59,8 @@ set(PLATFORM_TKL_ROOT "${JIELI_ADAPTER_PATH}/include")
 # cannot build.
 set(PLATFORM_MBEDTLS_CONFIG_FILE "tuya_tls_config.h")
 
+add_compile_definitions(MBEDTLS_AES_ROM_TABLES)
+
 list(APPEND PLATFORM_PUBINC
     "${JIELI_ADAPTER_PATH}/include"
     "${JIELI_ADAPTER_PATH}/include/uart"

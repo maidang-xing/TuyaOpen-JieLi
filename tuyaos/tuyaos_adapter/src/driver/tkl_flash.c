@@ -6,20 +6,26 @@
 #include <string.h>
 
 /*
- * The wl82 image reserves the upper part of the 4 MiB flash for Tuya data.
- * The exact bootloader layout is board-owned; keep these offsets in one place
- * so a board can override them when its production partition table is known.
+ * The Tuya data partitions live in the vendor flash map declared by
+ * cpu/<chip>/tools/isd_config_rule.c. tools/jieli_build/board_config.py reads
+ * the hex literals below and declares their span as a fixed, OPT=1 reserved
+ * area, so the vendor downloader no longer erases it on every USB download.
+ * Keep the format: NAME_START / NAME_SIZE, one plain hex literal per line.
  */
-#define JIELI_FLASH_SIZE       (4U * 1024U * 1024U)
-#define JIELI_FLASH_BLOCK      (4U * 1024U)
+#if defined(JIELI_BOARD_FLASH_MIB)
+#define JIELI_FLASH_SIZE       ((uint32_t)JIELI_BOARD_FLASH_MIB * 1024U * 1024U)
+#else
+#define JIELI_FLASH_SIZE       (8U * 1024U * 1024U)
+#endif
+#define JIELI_FLASH_BLOCK      0x00001000U
 #define JIELI_KV_KEY_START     0x00300000U
-#define JIELI_KV_KEY_SIZE      JIELI_FLASH_BLOCK
+#define JIELI_KV_KEY_SIZE      0x00001000U
 #define JIELI_KV_DATA_START    0x00301000U
-#define JIELI_KV_DATA_SIZE     (64U * 1024U)
+#define JIELI_KV_DATA_SIZE     0x00010000U
 #define JIELI_UF_START         0x00311000U
-#define JIELI_UF_SIZE          (512U * 1024U)
+#define JIELI_UF_SIZE          0x00080000U
 #define JIELI_RCD_START        0x00391000U
-#define JIELI_RCD_SIZE         (256U * 1024U)
+#define JIELI_RCD_SIZE         0x00040000U
 
 static OPERATE_RET jieli_flash_check_range(uint32_t addr, uint32_t size)
 {

@@ -569,6 +569,87 @@ def configure_board_memory(
         )
     ddr_config_file.write_text(content, encoding="utf-8")
 
+
+_TUYA_FLASH_PARTITIONS = ("KV_KEY", "KV_DATA", "UF", "RCD")
+
+
+def _c_hex_literal(content: str, name: str, source: Path) -> int:
+    """Read one plain hex #define; the flash map is parsed, not duplicated."""
+    match = re.search(rf"(?m)^[ \t]*#define[ \t]+{name}[ \t]+(0x[0-9A-Fa-f]+)U?[ \t]*$", content)
+    if match is None:
+        raise BuildError(
+            f"Expected one hex-literal {name} in {source}; the vendor reserved area "
+            f"is derived from it"
+        )
+    return int(match.group(1), 16)
+
+
+def tuya_flash_reserved_area(tkl_flash_c: Path) -> tuple[int, int]:
+    """Return the (start, length) span of the TuyaOpen flash partitions."""
+    if not tkl_flash_c.is_file():
+        raise BuildError(f"TuyaOpen flash map not found: {tkl_flash_c}")
+
+    content = tkl_flash_c.read_text(encoding="utf-8")
+    spans = []
+    for partition in _TUYA_FLASH_PARTITIONS:
+        start = _c_hex_literal(content, f"JIELI_{partition}_START", tkl_flash_c)
+        size = _c_hex_literal(content, f"JIELI_{partition}_SIZE", tkl_flash_c)
+        if size == 0:
+            raise BuildError(f"Zero-sized TuyaOpen flash partition: JIELI_{partition}_SIZE")
+        spans.append((start, start + size))
+
+    start = min(span[0] for span in spans)
+    end = max(span[1] for span in spans)
+    if start % 0x1000 or (end - start) % 0x1000:
+        raise BuildError("TuyaOpen flash partitions must be 4 KiB aligned")
+    return start, end - start
+
+
+def configure_flash_reserved_area(
+    rule_file: Path, tkl_flash_c: Path, facts: BoardFacts
+) -> None:
+    """Reserve the TuyaOpen partition span in the vendor flash map.
+
+    ``_OPT=1`` tells the downloader not to touch the area, so the KV
+    credentials and the UF/RCD partitions survive a USB download. The address
+    is read from tkl_flash.c, the map the runtime actually uses.
+    """
+    if not rule_file.is_file():
+        raise BuildError(f"Vendor flash rule not found: {rule_file}")
+
+    start, length = tuya_flash_reserved_area(tkl_flash_c)
+    flash_size = facts.memory.flash_mib * 1024 * 1024
+    if start + length > flash_size:
+        raise BuildError(
+            f"TuyaOpen flash area 0x{start:06X}+0x{length:06X} exceeds the "
+            f"{facts.board} {facts.memory.flash_mib} MiB flash"
+        )
+
+    block = (
+        "// TUYAOPEN_RESERVED_AREA_BEGIN\n"
+        f"TUYAOPEN_ADR=0x{start:06X}; [TuyaOpen KV/UF/RCD]\n"
+        f"TUYAOPEN_LEN=0x{length:06X};\n"
+        "TUYAOPEN_OPT=1;\n"
+        "// TUYAOPEN_RESERVED_AREA_END\n"
+    )
+    content = rule_file.read_text(encoding="utf-8")
+    content, count = re.subn(
+        r"(?ms)^[ \t]*// TUYAOPEN_RESERVED_AREA_BEGIN.*?// TUYAOPEN_RESERVED_AREA_END\r?\n?",
+        block,
+        content,
+    )
+    if count == 0:
+        anchor = "BTIF_ADR=AUTO;"
+        if anchor not in content:
+            raise BuildError(f"Vendor flash rule has no {anchor}: {rule_file}")
+        content = content.replace(anchor, block + "\n" + anchor, 1)
+    elif count != 1:
+        raise BuildError(
+            f"Expected at most one TUYAOPEN_RESERVED_AREA block in {rule_file}, found {count}"
+        )
+    rule_file.write_text(content, encoding="utf-8")
+
+
 def configure_audio_board(board_file: Path, audio_config_header: Path, board: "AudioProfile") -> None:
     """Patch the staged board file with the profile's audio device and init.
 

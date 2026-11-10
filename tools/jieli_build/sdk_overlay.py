@@ -24,11 +24,12 @@ from typing import Iterable, Mapping, Optional
 
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
-    configure_audio_board, configure_board_memory, configure_full_stack_app_config,
-    configure_full_stack_board, configure_lcd_app_config, configure_lcd_board,
-    configure_lcd_board_header, configure_log_uart_baudrate, configure_log_uart_block,
-    configure_lowpower, configure_service_uart, configure_usb_download_app_config,
-    configure_usb_download_board, configure_usb_download_board_header,
+    configure_audio_board, configure_board_memory, configure_flash_reserved_area,
+    configure_full_stack_app_config, configure_full_stack_board, configure_lcd_app_config,
+    configure_lcd_board, configure_lcd_board_header, configure_log_uart_baudrate,
+    configure_log_uart_block, configure_lowpower, configure_service_uart,
+    configure_usb_download_app_config, configure_usb_download_board,
+    configure_usb_download_board_header,
 )
 from .board_facts import BoardFacts, board_facts_digest
 from .chip_profiles import JIELI_CHIPS, PLATFORM_ROOT, resolve_chip
@@ -833,6 +834,11 @@ def create_staging_tree(
     )
     configure_full_stack_board(board_file, reference_board_file)
     configure_full_stack_app_config(app_config_file)
+    configure_flash_reserved_area(
+        source_overlay_root / "cpu" / chip.cpu / "tools" / "isd_config_rule.c",
+        platform_root / "tuyaos" / "tuyaos_adapter" / "src" / "driver" / "tkl_flash.c",
+        facts,
+    )
     configure_usb_download_board(
         board_file, "TCFG_USB_DEVICE" if chip.name == "wl83" else "0x03",
     )

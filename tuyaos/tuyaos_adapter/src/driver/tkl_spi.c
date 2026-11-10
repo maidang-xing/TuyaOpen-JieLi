@@ -6,11 +6,69 @@
 #include "device.h"
 #include "asm/spi.h"
 
-/* The WL82/WL83 adapter has no verified SPI master path. Keep the entry point
- * present for API compatibility, but do not register or open vendor nodes. */
+#if defined(JIELI_SELECTED_CHIP_WL83)
+#include "asm/gpio.h"
+
+/* The adapter owns SPI1: the platform strips the vendor board's spi1 node, so
+ * this is the only registration of that name.
+ *
+ * Pins are on port B because port A is already spoken for by the IIC adapter
+ * (IIC0 PA4/PA5, IIC1 PA6/PA7, software IIC2 PA2/PA3). WL83 muxes SPI through
+ * the crossbar, so any GPIO can carry these signals.
+ *
+ * CS is left unconnected: the vendor driver has no automatic chip-select on a
+ * dev_write/dev_read, and the vendor master example drives CS as a plain GPIO
+ * around each transfer. tkl_spi_send/tkl_spi_recv keep the same contract. */
+SPI1_PLATFORM_DATA_BEGIN(s_spi1_pd)
+    .io = {
+        .cs_pin  = -1,
+        .di_pin  = IO_PORTB_06,
+        .do_pin  = IO_PORTB_05,
+        .clk_pin = IO_PORTB_04,
+        .d2_pin  = -1,
+        .d3_pin  = -1,
+    },
+    .clk                = 1000000,
+    .mode               = SPI_STD_MODE,
+    .priority           = 6,
+    .cpu_id             = 1,
+    .hd_level           = 0,
+    .attr               = SPI_SCLK_L_UPL_SMPH,
+    .role               = SPI_MODE_MASTER,
+    .sync_wait_timeout  = 1000,
+SPI1_PLATFORM_DATA_END()
+#else
+
+/* WL82 picks one pin group out of the SDK's fixed table, and the baud rate is
+ * baked into the platform data at compile time (there is no SET_BAUDRATE
+ * ioctl). Group 0 of SPI1 is PB6 CLK / PB7 DO / PB5 DI, the same route the
+ * vendor DevKitBoard uses.
+ *
+ * asm/spi.h needs the pin macros and the register map from the chip headers,
+ * and its own SPI_STD_MODE enum is commented out, so the mode comes from
+ * device/spiflash.h's identical enum value. */
+#include "asm/gpio.h"
+#include "asm/WL82.h"
+#include "asm/hwi.h"
+#define SPI_STD_MODE 1
+
+SPI1_PLATFORM_DATA_BEGIN(s_spi1_pd)
+    .clk    = 1000000,
+    .mode   = SPI_STD_MODE,
+    .port   = 'B',
+    .attr   = SPI_SCLK_L_UPH_SMPH | SPI_BIDIR_MODE,
+SPI1_PLATFORM_DATA_END()
+#define JIELI_WL82_SPI1_BAUDRATE 1000000u
+#endif
+
+REGISTER_DEVICE(spi1_node) = { "spi1", &spi_dev_ops, (void *)&s_spi1_pd };
+
+/* Only SPI1 has a node. SPI0/SPI2 stay in the port table so a caller asking
+ * for them gets OPRT_NOT_SUPPORTED from dev_open rather than a wrong bus. */
 #define TKL_SPI_PORT_MAX 3
 
 static void *s_spi_handles[TKL_SPI_PORT_MAX];
+static uint8_t s_spi_lsb_first[TKL_SPI_PORT_MAX];
 
 #if defined(JIELI_SELECTED_CHIP_WL82)
 static int8_t s_wl82_spi_pin_group[TKL_SPI_PORT_MAX] = {-1, -1, -1};
@@ -35,7 +93,6 @@ OPERATE_RET jieli_wl82_spi_pinmux_select(uint32_t spi_port, uint32_t group)
     s_wl82_spi_pin_group[spi_port] = (int8_t)group;
     return OPRT_OK;
 }
-
 #endif
 
 static const char *jieli_spi_device_name(TUYA_SPI_NUM_E port)
@@ -54,22 +111,144 @@ static int jieli_spi_valid(TUYA_SPI_NUM_E port)
            jieli_spi_device_name(port) != NULL;
 }
 
-OPERATE_RET tkl_spi_init(TUYA_SPI_NUM_E port, const TUYA_SPI_BASE_CFG_T *cfg)
+/* The vendor path is byte oriented and clocks MSB first; the SDK offers no
+ * bit-order register, and its own LSB demo reverses the bits in software. Do
+ * the same here so TUYA_SPI_ORDER_LSB2MSB means what it says.
+ *
+ * Chunked so nothing has to be allocated: the caller's buffer is walked in
+ * fixed-size pieces and reversed in place (receive) or into a scratch buffer
+ * (send). */
+#define JIELI_SPI_REVERSE_CHUNK 64u
+
+static uint8_t jieli_spi_reverse_byte(uint8_t value)
 {
+    value = (uint8_t)(((value & 0xF0u) >> 4) | ((value & 0x0Fu) << 4));
+    value = (uint8_t)(((value & 0xCCu) >> 2) | ((value & 0x33u) << 2));
+    value = (uint8_t)(((value & 0xAAu) >> 1) | ((value & 0x55u) << 1));
+    return value;
+}
+
+static void jieli_spi_reverse_bits(uint8_t *from, uint8_t *to, uint32_t size)
+{
+    uint32_t i;
+
+    for (i = 0u; i < size; i++) {
+        to[i] = jieli_spi_reverse_byte(from[i]);
+    }
+}
+
+static OPERATE_RET jieli_spi_write(void *handle, uint8_t *data, uint32_t size, int lsb_first)
+{
+    uint8_t scratch[JIELI_SPI_REVERSE_CHUNK];
+    uint32_t offset = 0u;
+
+    while (offset < size) {
+        uint32_t chunk = size - offset;
+        uint8_t *out = data + offset;
+        int ret;
+
+        if (chunk > JIELI_SPI_REVERSE_CHUNK) {
+            chunk = JIELI_SPI_REVERSE_CHUNK;
+        }
+        if (lsb_first) {
+            jieli_spi_reverse_bits(out, scratch, chunk);
+            out = scratch;
+        }
+        ret = dev_write(handle, out, chunk);
+#if defined(JIELI_SELECTED_CHIP_WL83)
+        /* dev_write returns the accepted byte count on WL83. */
+        if (ret != (int)chunk) {
+            return OPRT_OS_ADAPTER_SPI_BUS_ERR;
+        }
+#else
+        /* The WL82 device layer returns 0 on success. */
+        if (ret != 0 && ret != (int)chunk) {
+            return OPRT_OS_ADAPTER_SPI_BUS_ERR;
+        }
+#endif
+        offset += chunk;
+    }
+    return OPRT_OK;
+}
+
+static OPERATE_RET jieli_spi_read(void *handle, uint8_t *data, uint32_t size, int lsb_first)
+{
+    uint32_t offset = 0u;
+
+    while (offset < size) {
+        uint32_t chunk = size - offset;
+        uint8_t *in = data + offset;
+        int ret;
+
+        if (chunk > JIELI_SPI_REVERSE_CHUNK) {
+            chunk = JIELI_SPI_REVERSE_CHUNK;
+        }
+        ret = dev_read(handle, in, chunk);
+#if defined(JIELI_SELECTED_CHIP_WL83)
+        if (ret != (int)chunk) {
+            return OPRT_OS_ADAPTER_SPI_BUS_ERR;
+        }
+#else
+        if (ret != 0 && ret != (int)chunk) {
+            return OPRT_OS_ADAPTER_SPI_BUS_ERR;
+        }
+#endif
+        if (lsb_first) {
+            uint32_t i;
+
+            for (i = 0u; i < chunk; i++) {
+                in[i] = jieli_spi_reverse_byte(in[i]);
+            }
+        }
+        offset += chunk;
+    }
+    return OPRT_OK;
+}
+
+OPERATE_RET tkl_spi_init(TUYA_SPI_NUM_E port, const TUYA_SPI_BASE_CFG_T *cfg){
     if (cfg == NULL || !jieli_spi_valid(port)) {
+        return OPRT_INVALID_PARM;
+    }
+    if (cfg->freq_hz == 0u) {
         return OPRT_INVALID_PARM;
     }
     if (cfg->role != TUYA_SPI_ROLE_MASTER) {
         /* Slave has no data path through the device layer. */
         return OPRT_NOT_SUPPORTED;
     }
-    if (cfg->freq_hz == 0u) {
-        return OPRT_INVALID_PARM;
+    if (cfg->databits != TUYA_SPI_DATA_BIT8) {
+        /* The vendor transfers are byte counts; there is no 16-bit frame. */
+        return OPRT_NOT_SUPPORTED;
     }
-    /* Neither supported chip profile has a verified Tuya SPI path. In
-     * particular, do not derive support from SDK TCFG defaults: WL83's vendor
-     * demo may enable spi1 independently of this adapter. */
-    return OPRT_NOT_SUPPORTED;
+    if (cfg->mode != TUYA_SPI_MODE0) {
+        /* CPOL/CPHA live in the const platform data and no ioctl changes them
+         * at runtime. SPI_SCLK_L_UPL_SMPH is clock-idle-low, sample on the
+         * first edge, which is mode 0. */
+        return OPRT_NOT_SUPPORTED;
+    }
+#if defined(JIELI_SELECTED_CHIP_WL82)
+    if (cfg->freq_hz != JIELI_WL82_SPI1_BAUDRATE) {
+        /* WL82 has no baud-rate ioctl: the rate is fixed in the staged
+         * platform data, so a different request cannot be honoured. */
+        return OPRT_NOT_SUPPORTED;
+    }
+#endif
+
+    if (s_spi_handles[port] == NULL) {
+        s_spi_handles[port] = dev_open((char *)jieli_spi_device_name(port), NULL);
+        if (s_spi_handles[port] == NULL) {
+            return OPRT_NOT_SUPPORTED;
+        }
+    }
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    if (dev_ioctl(s_spi_handles[port], IOCTL_SPI_SET_BAUDRATE, cfg->freq_hz) < 0) {
+        dev_close(s_spi_handles[port]);
+        s_spi_handles[port] = NULL;
+        return OPRT_OS_ADAPTER_SPI_INIT_FAILED;
+    }
+#endif
+    s_spi_lsb_first[port] = (cfg->bitorder == TUYA_SPI_ORDER_LSB2MSB) ? 1u : 0u;
+    return OPRT_OK;
 }
 
 OPERATE_RET tkl_spi_deinit(TUYA_SPI_NUM_E port)
@@ -82,39 +261,30 @@ OPERATE_RET tkl_spi_deinit(TUYA_SPI_NUM_E port)
     }
     dev_close(s_spi_handles[port]);
     s_spi_handles[port] = NULL;
+    s_spi_lsb_first[port] = 0u;
     return OPRT_OK;
 }
 
 OPERATE_RET tkl_spi_send(TUYA_SPI_NUM_E port, void *data, uint32_t size)
 {
-    int ret;
-
     if (!jieli_spi_valid(port) || s_spi_handles[port] == NULL || data == NULL || size == 0u) {
         return OPRT_INVALID_PARM;
     }
     if (size > SPI_MAX_SIZE) {
         return OPRT_INVALID_PARM;
     }
-    ret = dev_write(s_spi_handles[port], data, size);
-    /* dev_write returns the number of bytes accepted (see device.h users and
-     * the vendor video decoder). A short write is a failed TKL transfer. */
-    return ret == (int)size ? OPRT_OK : OPRT_OS_ADAPTER_SPI_BUS_ERR;
+    return jieli_spi_write(s_spi_handles[port], (uint8_t *)data, size, s_spi_lsb_first[port]);
 }
 
 OPERATE_RET tkl_spi_recv(TUYA_SPI_NUM_E port, void *data, uint32_t size)
 {
-    int ret;
-
     if (!jieli_spi_valid(port) || s_spi_handles[port] == NULL || data == NULL || size == 0u) {
         return OPRT_INVALID_PARM;
     }
     if (size > SPI_MAX_SIZE) {
         return OPRT_INVALID_PARM;
     }
-    ret = dev_read(s_spi_handles[port], data, size);
-    /* dev_read also returns a byte count; accepting a short read would leave
-     * the caller with partially initialized receive data. */
-    return ret == (int)size ? OPRT_OK : OPRT_OS_ADAPTER_SPI_BUS_ERR;
+    return jieli_spi_read(s_spi_handles[port], (uint8_t *)data, size, s_spi_lsb_first[port]);
 }
 
 OPERATE_RET tkl_spi_transfer(TUYA_SPI_NUM_E port, void *send_buf, void *receive_buf, uint32_t length)
@@ -122,10 +292,10 @@ OPERATE_RET tkl_spi_transfer(TUYA_SPI_NUM_E port, void *send_buf, void *receive_
     if (length == 0u || length > SPI_MAX_SIZE) {
         return OPRT_INVALID_PARM;
     }
-    /* Full duplex is a separate vendor path (IOCTL_SPI_FDX_TR_DATA on both
-     * chips, spi_fdx_data_t shape). It is used when both buffers are given and
-     * the chip exposes it; otherwise this falls back to half duplex, which is
-     * what the callers in this tree (display, LED pixel) actually need. */
+    /* Full duplex is a separate vendor path (IOCTL_SPI_FDX_TR_DATA, defined on
+     * WL83 only). It is used when both buffers are given; otherwise this falls
+     * back to half duplex. The vendor path is MSB-first, so LSB-order callers
+     * take the half-duplex path. */
 #if defined(JIELI_SELECTED_CHIP_WL83)
     if (send_buf != NULL && receive_buf != NULL) {
         spi_fdx_data_t fdx;
@@ -133,6 +303,13 @@ OPERATE_RET tkl_spi_transfer(TUYA_SPI_NUM_E port, void *send_buf, void *receive_
 
         if (!jieli_spi_valid(port) || s_spi_handles[port] == NULL) {
             return OPRT_INVALID_PARM;
+        }
+        if (s_spi_lsb_first[port]) {
+            OPERATE_RET rt = tkl_spi_send(port, send_buf, length);
+            if (rt != OPRT_OK) {
+                return rt;
+            }
+            return tkl_spi_recv(port, receive_buf, length);
         }
         fdx.send_buf = (u8 *)send_buf;
         fdx.recv_buf = (u8 *)receive_buf;

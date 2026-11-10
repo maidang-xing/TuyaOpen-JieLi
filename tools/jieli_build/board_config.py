@@ -11,6 +11,7 @@ from typing import Optional
 from .errors import BuildError
 from .audio_profile import AudioProfile
 from .board_facts import BoardFacts, LogUart, ServiceUart
+from .staging_fs import write_staged_bytes, write_staged_text
 
 # The UART platform data names both the pins and the port group they belong to
 # (``.port = PORTA_5_6`` next to ``.tx_pin = IO_PORTA_05``). The board states the
@@ -325,7 +326,7 @@ def configure_log_uart_block(
     )
     if count != 1:
         raise BuildError(f"Jieli debug_uart_init does not initialize UART2 in {board_file}")
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)
 
 def configure_log_uart_baudrate(
     board_header: Path, uart_port: int, baudrate: int, facts: BoardFacts
@@ -353,7 +354,7 @@ def configure_log_uart_baudrate(
         raise BuildError(
             f"UART{log_uart.port} baudrate was not found in {board_header}"
         )
-    board_header.write_text(content, encoding="utf-8")
+    write_staged_text(board_header, content)
 
 def configure_service_uart(board_file: Path, facts: BoardFacts) -> None:
     """Route the Tuya logical UART0/TAL CLI to the board's service UART.
@@ -431,7 +432,7 @@ def configure_service_uart(board_file: Path, facts: BoardFacts) -> None:
             1,
         )
 
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)
 
 def configure_full_stack_wifi(board_file: Path, reference_board_file: Optional[Path] = None) -> None:
     """Add the chip-specific RF calibration required by the WiFi SDK libraries."""
@@ -474,7 +475,7 @@ def configure_full_stack_wifi(board_file: Path, reference_board_file: Optional[P
         if board_init_marker not in content:
             raise BuildError(f"Jieli board file has no calibration insertion point: {board_file}")
         content = content.replace(board_init_marker, calibration + board_init_marker, 1)
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)
 
 def configure_full_stack_app_config(app_config_file: Path) -> None:
     """Enable the vendor Wi-Fi/BLE pieces used by the Tuya full-stack image."""
@@ -505,7 +506,7 @@ def configure_full_stack_app_config(app_config_file: Path) -> None:
     insert_at = content.rfind("#endif")
     if insert_at < 0:
         raise BuildError(f"Jieli app_config.h has no final #endif: {app_config_file}")
-    app_config_file.write_text(content[:insert_at] + config + content[insert_at:], encoding="utf-8")
+    write_staged_text(app_config_file, content[:insert_at] + config + content[insert_at:])
 
 def _rewrite_memory_macros(config_file: Path, sizes: dict[str, int]) -> None:
     """Set named memory macros exactly once in an SDK staging config."""
@@ -524,7 +525,7 @@ def _rewrite_memory_macros(config_file: Path, sizes: dict[str, int]) -> None:
                 f"Expected exactly one {macro} definition in {config_file}, found {count}"
             )
 
-    config_file.write_text(content, encoding="utf-8")
+    write_staged_text(config_file, content)
 
 def configure_board_memory(
     config_file: Path, facts: BoardFacts, ddr_config_file: Optional[Path] = None
@@ -567,7 +568,7 @@ def configure_board_memory(
             f"Expected exactly one CONFIG_NO_SDRAM_ENABLE definition in "
             f"{ddr_config_file}, found {count}"
         )
-    ddr_config_file.write_text(content, encoding="utf-8")
+    write_staged_text(ddr_config_file, content)
 
 
 _TUYA_FLASH_PARTITIONS = ("KV_KEY", "KV_DATA", "UF", "RCD")
@@ -647,7 +648,7 @@ def configure_flash_reserved_area(
         raise BuildError(
             f"Expected at most one TUYAOPEN_RESERVED_AREA block in {rule_file}, found {count}"
         )
-    rule_file.write_text(content, encoding="utf-8")
+    write_staged_text(rule_file, content)
 
 
 def configure_audio_board(board_file: Path, audio_config_header: Path, board: "AudioProfile") -> None:
@@ -681,8 +682,8 @@ def configure_audio_board(board_file: Path, audio_config_header: Path, board: "A
                 board_audio_include + '\n#include "server/audio_dev.h"',
                 1,
             )
-        board_file.write_text(content, encoding="utf-8")
-        staged_header.write_bytes(audio_config_header.read_bytes())
+        write_staged_text(board_file, content)
+        write_staged_bytes(staged_header, audio_config_header.read_bytes())
         return
 
     include_marker = '#include "asm/includes.h"'
@@ -757,8 +758,8 @@ def configure_audio_board(board_file: Path, audio_config_header: Path, board: "A
         content = content[: table_open + 1] + (
             '\n    {"audio", &audio_dev_ops, (void *)&tuya_audio_data },'
         ) + content[table_open + 1 :]
-    board_file.write_text(content, encoding="utf-8")
-    staged_header.write_bytes(audio_config_header.read_bytes())
+    write_staged_text(board_file, content)
+    write_staged_bytes(staged_header, audio_config_header.read_bytes())
 
 
 def configure_full_stack_board(board_file: Path, reference_board_file: Optional[Path] = None) -> None:
@@ -778,7 +779,7 @@ def configure_full_stack_board(board_file: Path, reference_board_file: Optional[
             raise BuildError(f"Jieli board file has no board_init function: {board_file}")
         replacement = board_init_marker + "\n#ifdef CONFIG_BT_ENABLE\n    void cfg_file_parse(void);\n    cfg_file_parse();\n#endif"
         content = content.replace(board_init_marker, replacement, 1)
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)
 
 
 # The vendor SDK already implements the download-mode entry point: msd_upgrade.c
@@ -805,7 +806,7 @@ def _insert_before_final_endif(
     insert_at = content.rfind("#endif")
     if insert_at < 0:
         raise BuildError(f"Jieli config has no final #endif: {config_file}")
-    config_file.write_text(content[:insert_at] + block + content[insert_at:], encoding="utf-8")
+    write_staged_text(config_file, content[:insert_at] + block + content[insert_at:])
 
 
 # ---------------------------------------------------------------------------
@@ -890,7 +891,7 @@ def _redefine_macro(config_file: Path, name: str, value: str) -> None:
     updated, count = pattern.subn(f"#define {name} {value}", content, count=1)
     if count == 0:
         raise BuildError(f"Jieli config has no #define {name}: {config_file}")
-    config_file.write_text(updated, encoding="utf-8")
+    write_staged_text(config_file, updated)
 
 
 def _define_macro(config_file: Path, name: str) -> None:
@@ -1217,7 +1218,7 @@ def configure_usb_download_board(board_file: Path, usb_ports: str = "0x03") -> N
         device_table + '\n    { "otg", &usb_dev_ops, (void *)&otg_data},',
         1,
     )
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)
 
 
 # The vendor LCD driver has no compile-time default of its own: the panel is
@@ -1366,4 +1367,4 @@ def configure_lcd_board(board_file: Path) -> None:
         "#endif\n"
     )
     content = content.replace(device_table, device_table + "\n" + lcd_entry, 1)
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)

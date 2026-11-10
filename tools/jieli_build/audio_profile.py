@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 from .errors import BuildError
+from .staging_fs import write_staged_text
 
 
 class AudioProfile:
@@ -342,7 +343,7 @@ def apply_audio_profile(makefile: Path, app_main: Path, chip_name: str) -> None:
         )
         content = content[: end_group.start()] + entries + content[end_group.start():]
 
-    makefile.write_text(content, encoding="utf-8")
+    write_staged_text(makefile, content)
 
     app = app_main.read_text(encoding="utf-8")
     table_start = app.index("const struct task_info task_info_table[]")
@@ -358,4 +359,4 @@ def apply_audio_profile(makefile: Path, app_main: Path, chip_name: str) -> None:
             raise BuildError(f"Jieli app task table has no sentinel row: {app_main}")
         insert_at = table_start + sentinel.start()
         app = app[:insert_at] + "".join(missing_tasks) + app[insert_at:]
-        app_main.write_text(app, encoding="utf-8")
+        write_staged_text(app_main, app)

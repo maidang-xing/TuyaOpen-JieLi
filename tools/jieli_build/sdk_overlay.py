@@ -34,6 +34,7 @@ from .board_config import (
 from .board_facts import BoardFacts, board_facts_digest
 from .chip_profiles import JIELI_CHIPS, PLATFORM_ROOT, resolve_chip
 from .errors import BuildError
+from .staging_fs import write_staged_text
 from .toolchain import resolve_tool_path
 from .feature_map import (
     FEATURES,
@@ -602,8 +603,9 @@ def write_staging_state(staging_root: Path, components: dict[str, str]) -> None:
         "digest": staging_input_digest(**components),
         "components": components,
     }
-    (staging_root / STAGING_STATE_NAME).write_text(
-        json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    write_staged_text(
+        staging_root / STAGING_STATE_NAME,
+        json.dumps(state, indent=2, sort_keys=True) + "\n",
     )
 
 
@@ -862,7 +864,7 @@ def create_staging_tree(
         board_content = remove_vendor_spi1_registration(board_content)
         board_content = remove_vendor_iic1_registration(board_content)
         board_content = remove_vendor_uart2_registration(board_content)
-        board_file.write_text(board_content, encoding="utf-8")
+        write_staged_text(board_file, board_content)
     shutil.copytree(
         platform_root / "tuyaos" / "entry",
         source_overlay_root / "tuyaos" / "entry",
@@ -1019,7 +1021,7 @@ def create_staging_tree(
     content += "    --end-group\n"
     if header_dir is not None:
         content += f"INCLUDES += -I{_make_path(header_dir)}\n"
-    makefile.write_text(content, encoding="utf-8")
+    write_staged_text(makefile, content)
 
     if profile is not None:
         # The staged entry replaced app_main.c in the Makefile, and it owns

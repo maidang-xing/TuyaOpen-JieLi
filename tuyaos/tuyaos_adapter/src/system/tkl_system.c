@@ -24,6 +24,30 @@ static int __jieli_is_ram_ptr(const void *ptr)
     return address >= (uintptr_t)&RAM_HEAP_BEGIN && address <= (uintptr_t)&RAM_HEAP_END;
 }
 
+/* wl83's internal heap is only about 90 KB and the vendor audio/wifi code keeps
+ * allocating from it directly, while TuyaOpen asks for 16-20 KB buffers (AI
+ * ringbufs) that no longer fit after provisioning. Keep a reserve for the
+ * vendor and serve the oversized requests from SDRAM; the frees above already
+ * dispatch on the address, so both heaps stay balanced. */
+#define JIELI_RAM_RESERVE (16U * 1024U)
+
+static void *__jieli_malloc(size_t size)
+{
+#if defined(ENABLE_EXT_RAM) && (ENABLE_EXT_RAM == 1)
+    u32 free_size = get_ram_free_heap_size();
+
+    if (free_size > size && (free_size - size) >= JIELI_RAM_RESERVE) {
+        return ram_malloc(size);
+    }
+
+    void *ptr = malloc(size);
+    if (ptr != NULL) {
+        return ptr;
+    }
+#endif
+    return ram_malloc(size);
+}
+
 static TKL_ABILITY_T s_jieli_ability = {
     .uart = TRUE,
     .wifi = TRUE,
@@ -57,7 +81,7 @@ TKL_ABILITY_T *tkl_get_ability(void)
     return &s_jieli_ability;
 }
 
-void *tkl_system_malloc(size_t size) { return ram_malloc(size); }
+void *tkl_system_malloc(size_t size) { return __jieli_malloc(size); }
 
 void tkl_system_free(void *ptr)
 {
@@ -82,7 +106,7 @@ void *tkl_system_calloc(size_t nitems, size_t size)
     if (size != 0 && total / size != nitems) {
         return NULL;
     }
-    ptr = ram_malloc(total);
+    ptr = __jieli_malloc(total);
     if (ptr != NULL) {
         memset(ptr, 0, total);
     }
@@ -92,7 +116,7 @@ void *tkl_system_calloc(size_t nitems, size_t size)
 void *tkl_system_realloc(void *ptr, size_t size)
 {
     if (ptr == NULL) {
-        return ram_malloc(size);
+        return __jieli_malloc(size);
     }
     return __jieli_is_ram_ptr(ptr) ? ram_realloc(ptr, size) : realloc(ptr, size);
 }

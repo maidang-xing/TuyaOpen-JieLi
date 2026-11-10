@@ -6,11 +6,23 @@
 #include "system/malloc.h"
 #include "system/sys_time.h"
 
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 
 extern u32 get_ram_free_heap_size(void);
 extern int get_malloc_remain_heap_size(void);
+extern u32 RAM_HEAP_BEGIN;
+extern u32 RAM_HEAP_END;
+
+/* Shared TuyaOpen code occasionally frees a PSRAM/psram-API allocation through
+ * tal_free() or vice versa. Route each free to the heap that owns the pointer
+ * instead of asserting in the vendor ram_free() range check. */
+static int __jieli_is_ram_ptr(const void *ptr)
+{
+    uintptr_t address = (uintptr_t)ptr;
+    return address >= (uintptr_t)&RAM_HEAP_BEGIN && address <= (uintptr_t)&RAM_HEAP_END;
+}
 
 static TKL_ABILITY_T s_jieli_ability = {
     .uart = TRUE,
@@ -49,8 +61,13 @@ void *tkl_system_malloc(size_t size) { return ram_malloc(size); }
 
 void tkl_system_free(void *ptr)
 {
-    if (ptr != NULL) {
+    if (ptr == NULL) {
+        return;
+    }
+    if (__jieli_is_ram_ptr(ptr)) {
         ram_free(ptr);
+    } else {
+        free(ptr);
     }
 }
 
@@ -72,13 +89,39 @@ void *tkl_system_calloc(size_t nitems, size_t size)
     return ptr;
 }
 
-void *tkl_system_realloc(void *ptr, size_t size) { return ram_realloc(ptr, size); }
+void *tkl_system_realloc(void *ptr, size_t size)
+{
+    if (ptr == NULL) {
+        return ram_malloc(size);
+    }
+    return __jieli_is_ram_ptr(ptr) ? ram_realloc(ptr, size) : realloc(ptr, size);
+}
+
 int tkl_system_memcmp(const void *str1, const void *str2, size_t n) { return memcmp(str1, str2, n); }
 
 void *tkl_system_psram_malloc(size_t size) { return malloc(size); }
-void tkl_system_psram_free(void *ptr) { free(ptr); }
+
+void tkl_system_psram_free(void *ptr)
+{
+    if (ptr == NULL) {
+        return;
+    }
+    if (__jieli_is_ram_ptr(ptr)) {
+        ram_free(ptr);
+    } else {
+        free(ptr);
+    }
+}
+
 void *tkl_system_psram_calloc(size_t nitems, size_t size) { return calloc(nitems, size); }
-void *tkl_system_psram_realloc(void *ptr, size_t size) { return realloc(ptr, size); }
+
+void *tkl_system_psram_realloc(void *ptr, size_t size)
+{
+    if (ptr == NULL) {
+        return malloc(size);
+    }
+    return __jieli_is_ram_ptr(ptr) ? ram_realloc(ptr, size) : realloc(ptr, size);
+}
 
 int tkl_system_get_free_heap_size(void) { return (int)get_ram_free_heap_size(); }
 

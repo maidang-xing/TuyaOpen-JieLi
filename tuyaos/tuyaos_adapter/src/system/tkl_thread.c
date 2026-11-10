@@ -66,6 +66,12 @@ OPERATE_RET tkl_thread_create(TKL_THREAD_HANDLE *thread, const char *name, uint3
     return OPRT_OK;
 }
 
+OPERATE_RET tkl_thread_create_in_psram(TKL_THREAD_HANDLE *thread, const char *name, uint32_t stack_size,
+                                       uint32_t priority, const THREAD_FUNC_T func, void *const arg)
+{
+    return tkl_thread_create(thread, name, stack_size, priority, func, arg);
+}
+
 OPERATE_RET tkl_thread_release(const TKL_THREAD_HANDLE thread)
 {
     JIELI_TKL_THREAD *jieli_thread = (JIELI_TKL_THREAD *)thread;

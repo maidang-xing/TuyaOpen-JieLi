@@ -9,6 +9,9 @@
 #include <string.h>
 #include <stdlib.h>
 
+extern u32 get_ram_free_heap_size(void);
+extern int get_malloc_remain_heap_size(void);
+
 static TKL_ABILITY_T s_jieli_ability = {
     .uart = TRUE,
     .wifi = TRUE,
@@ -42,44 +45,44 @@ TKL_ABILITY_T *tkl_get_ability(void)
     return &s_jieli_ability;
 }
 
-void *tkl_system_malloc(size_t size) { return malloc(size); }
-void tkl_system_free(void *ptr) { free(ptr); }
+void *tkl_system_malloc(size_t size) { return ram_malloc(size); }
+
+void tkl_system_free(void *ptr)
+{
+    if (ptr != NULL) {
+        ram_free(ptr);
+    }
+}
+
 void *tkl_system_memset(void *src, int ch, const size_t n) { return memset(src, ch, n); }
 void *tkl_system_memcpy(void *src, const void *dst, const size_t n) { return memcpy(src, dst, n); }
-void *tkl_system_calloc(size_t nitems, size_t size) { return calloc(nitems, size); }
-void *tkl_system_realloc(void *ptr, size_t size) { return realloc(ptr, size); }
+
+void *tkl_system_calloc(size_t nitems, size_t size)
+{
+    size_t total = nitems * size;
+    void *ptr;
+
+    if (size != 0 && total / size != nitems) {
+        return NULL;
+    }
+    ptr = ram_malloc(total);
+    if (ptr != NULL) {
+        memset(ptr, 0, total);
+    }
+    return ptr;
+}
+
+void *tkl_system_realloc(void *ptr, size_t size) { return ram_realloc(ptr, size); }
 int tkl_system_memcmp(const void *str1, const void *str2, size_t n) { return memcmp(str1, str2, n); }
 
-/* PSRAM aliases.
- *
- * JIELI defines no ENABLE_EXT_RAM, so tal_memory.h's Malloc() resolves to
- * tal_malloc() and the AI/audio path never asks for PSRAM. Direct callers do,
- * though - tal_psram_* and the shipped audio examples (output_speaker,
- * output_sdcard) call tkl_system_psram_* unconditionally, and without these
- * the whole image fails to link on JIELI with "undefined reference to
- * tkl_system_psram_malloc".
- *
- * The vendor exposes no PSRAM allocator on wl82 or wl83 (wl82 has no psram_api
- * at all), so route to the ordinary heap. That is the same memory the non-PSRAM
- * path uses, which is the honest answer on a platform with no external RAM -
- * callers asking for "large" buffers get the system heap and a NULL on failure,
- * exactly as before. */
 void *tkl_system_psram_malloc(size_t size) { return malloc(size); }
 void tkl_system_psram_free(void *ptr) { free(ptr); }
 void *tkl_system_psram_calloc(size_t nitems, size_t size) { return calloc(nitems, size); }
 void *tkl_system_psram_realloc(void *ptr, size_t size) { return realloc(ptr, size); }
 
-int tkl_system_get_free_heap_size(void)
-{
-    /* The vendor wl82 release does not export heap statistics to apps. */
-    return 0;
-}
+int tkl_system_get_free_heap_size(void) { return (int)get_ram_free_heap_size(); }
 
-int tkl_system_psram_get_free_heap_size(void)
-{
-    /* No separate PSRAM pool to report - see the aliases above. */
-    return 0;
-}
+int tkl_system_psram_get_free_heap_size(void) { return get_malloc_remain_heap_size(); }
 
 SYS_TICK_T tkl_system_get_tick_count(void)
 {

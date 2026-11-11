@@ -1076,6 +1076,10 @@ def create_staging_tree(
     for library in link_libraries(chip.name, features):
         content += f"    {liba}/{library} \\\n"
     content += "    --end-group\n"
+    # The two TuyaOpen archives live outside the staged SDK tree, so the vendor
+    # "$(OUT_ELF): $(OBJS)" rule never sees them change and an app-only edit
+    # leaves the image one build behind. Declare them as extra prerequisites.
+    content += f"$(OUT_ELF): {tuya_lib_dir_make}/libtuyaapp.a {tuya_lib_dir_make}/libtuyaos.a\n"
     if header_dir is not None:
         content += f"INCLUDES += -I{_make_path(header_dir)}\n"
     write_staged_text(makefile, content)

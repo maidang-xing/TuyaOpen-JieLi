@@ -11,18 +11,44 @@
 #include "asm/gpio.h"
 
 /* WL83 board remap: the four MCPWM channels get a complementary H/L pin pair
- * each. CH1 keeps the PA8/PA10 assignment this adapter has always carried; the
- * other three use port B pins so they do not collide with the IIC adapter
- * (PA2..PA7) or the panel and audio pins the board fixes at build time.
- * WL83 muxes MCPWM through the crossbar, so the pairing is a software choice;
- * only CH1 has been carried over from an earlier revision. */
+ * each. The pins come from the board's Kconfig through the generated
+ * tuya_board_periph_config.h; the defaults below only apply to a board that
+ * declares nothing. CH1 keeps PA8/PA10, which is where this adapter has always
+ * carried it. */
+#ifndef TUYA_BOARD_PWM0_H_PIN
+#define TUYA_BOARD_PWM0_H_PIN IO_PORTB_08
+#endif
+#ifndef TUYA_BOARD_PWM0_L_PIN
+#define TUYA_BOARD_PWM0_L_PIN IO_PORTB_09
+#endif
+#ifndef TUYA_BOARD_PWM1_H_PIN
+#define TUYA_BOARD_PWM1_H_PIN IO_PORTA_08
+#endif
+#ifndef TUYA_BOARD_PWM1_L_PIN
+#define TUYA_BOARD_PWM1_L_PIN IO_PORTA_10
+#endif
+#ifndef TUYA_BOARD_PWM2_H_PIN
+#define TUYA_BOARD_PWM2_H_PIN IO_PORTB_10
+#endif
+#ifndef TUYA_BOARD_PWM2_L_PIN
+#define TUYA_BOARD_PWM2_L_PIN IO_PORTB_11
+#endif
+#ifndef TUYA_BOARD_PWM3_H_PIN
+#define TUYA_BOARD_PWM3_H_PIN IO_PORTB_12
+#endif
+#ifndef TUYA_BOARD_PWM3_L_PIN
+#define TUYA_BOARD_PWM3_L_PIN IO_PORTB_13
+#endif
+
 static struct pwm_platform_data s_pwm1_pd = {
     .timer_pwm_port = { -1, -1, -1, -1 },
     .mcpwm_port = {
         /* MCPWM0H .. MCPWM3H */
-        IO_PORTB_08, IO_PORTA_08, IO_PORTB_10, IO_PORTB_12,
+        TUYA_BOARD_PWM0_H_PIN, TUYA_BOARD_PWM1_H_PIN,
+        TUYA_BOARD_PWM2_H_PIN, TUYA_BOARD_PWM3_H_PIN,
         /* MCPWM0L .. MCPWM3L */
-        IO_PORTB_09, IO_PORTA_10, IO_PORTB_11, IO_PORTB_13,
+        TUYA_BOARD_PWM0_L_PIN, TUYA_BOARD_PWM1_L_PIN,
+        TUYA_BOARD_PWM2_L_PIN, TUYA_BOARD_PWM3_L_PIN,
     },
     .pwm_config = {
         .pwm_ch = PWMCH1_H | PWMCH1_L,
@@ -63,15 +89,20 @@ REGISTER_DEVICE(pwm1_node) = { "pwm1", &pwm_dev_ops, &s_pwm1_pd };
 
 /* WL82 PWM runs on TIMER2/TIMER3 output channels, not MCPWM. A timer output
  * takes one pin and one channel per device, so the adapter registers pwm1 with
- * TIMER2 on PH2 - the pin the vendor DevKitBoard configuration uses for its own
- * PWM sample. TKL PWM0 is that single channel; it is not a complementary pair,
- * so only the forward direction exists. */
+ * TIMER2 on the pin the board declares (PH2 by default, which is what the
+ * vendor DevKitBoard uses for its own PWM sample). TKL PWM0 is that single
+ * channel; it is not a complementary pair, so only the forward direction
+ * exists. */
 #include "asm/gpio.h"
 
 /* asm/pwm.h is not includable here (it pulls vendor filesystem declarations
  * that conflict with libc), so its channel bit is spelled out: TIME_PWM_OFFSET
  * is 20 and TIMER2 is the first timer output. */
 #define PWM_TIMER2_OPCH2  (1U << 20)
+
+#ifndef TUYA_BOARD_PWM0_PIN
+#define TUYA_BOARD_PWM0_PIN IO_PORTH_02
+#endif
 
 typedef struct {
     uint32_t con;
@@ -105,12 +136,12 @@ static const struct pwm_platform_data s_pwm1_pd = {
     .duty = 50.0f,
     .deathtime = 0u,
     .point_bit = 0u,
-    .port = IO_PORTH_02,
+    .port = TUYA_BOARD_PWM0_PIN,
     .pwm_ch = PWM_TIMER2_OPCH2,
     .freq = 1000u,
 };
 REGISTER_DEVICE(pwm1_node) = { "pwm1", &pwm_dev_ops, (void *)&s_pwm1_pd };
-#define JIELI_WL82_PWM_PORT IO_PORTH_02
+#define JIELI_WL82_PWM_PORT TUYA_BOARD_PWM0_PIN
 #endif
 
 /* PWM, built on each chip's `pwm1` device.

@@ -8,24 +8,41 @@
 
 #if defined(JIELI_SELECTED_CHIP_WL83)
 #include "asm/gpio.h"
+#include "jieli_pinmux_internal.h"
+
+/* The board states its SPI1 pins once, in its Kconfig; the platform stages
+ * them into tuya_board_periph_config.h, which is force-included into every
+ * object of the build. The defaults below only matter for a board that
+ * declares nothing (or a build that bypasses the platform staging). */
+#ifndef TUYA_BOARD_SPI1_CLK_PIN
+#define TUYA_BOARD_SPI1_CLK_PIN IO_PORTC_00
+#endif
+#ifndef TUYA_BOARD_SPI1_DO_PIN
+#define TUYA_BOARD_SPI1_DO_PIN IO_PORTC_01
+#endif
+#ifndef TUYA_BOARD_SPI1_DI_PIN
+#define TUYA_BOARD_SPI1_DI_PIN IO_PORTC_02
+#endif
 
 /* The adapter owns SPI1: the platform strips the vendor board's spi1 node, so
  * this is the only registration of that name.
  *
- * Pins are on port C: port A belongs to the IIC adapter (IIC0 PA4/PA5, IIC1
- * PA6/PA7, software IIC2 PA2/PA3), and PB4/PB5 are this adapter's UART1
- * (SDK uart2) pads while PB8..PB13 carry the MCPWM channels. WL83 muxes SPI
- * through the crossbar, so any GPIO can carry these signals.
+ * The pins come from the board header and can be moved at run time with
+ * tkl_io_pinmux_config(pin, TUYA_SPI1_CLK/MOSI/MISO) before the first
+ * tkl_spi_init(): the vendor driver latches whatever is in this struct at
+ * dev_open(), so the request has to be in place by then. Port A holds the IIC
+ * adapter's pins, PB4/PB5 are this adapter's UART1 pads and PB8..PB13 carry
+ * the MCPWM channels, which is why the board default is port C.
  *
  * CS is left unconnected: the vendor driver has no automatic chip-select on a
  * dev_write/dev_read, and the vendor master example drives CS as a plain GPIO
  * around each transfer. tkl_spi_send/tkl_spi_recv keep the same contract. */
-SPI1_PLATFORM_DATA_BEGIN(s_spi1_pd)
+static struct spi_platform_data s_spi1_pd = {
     .io = {
         .cs_pin  = -1,
-        .di_pin  = IO_PORTC_02,
-        .do_pin  = IO_PORTC_01,
-        .clk_pin = IO_PORTC_00,
+        .di_pin  = TUYA_BOARD_SPI1_DI_PIN,
+        .do_pin  = TUYA_BOARD_SPI1_DO_PIN,
+        .clk_pin = TUYA_BOARD_SPI1_CLK_PIN,
         .d2_pin  = -1,
         .d3_pin  = -1,
     },
@@ -37,7 +54,23 @@ SPI1_PLATFORM_DATA_BEGIN(s_spi1_pd)
     .attr               = SPI_SCLK_L_UPL_SMPH,
     .role               = SPI_MODE_MASTER,
     .sync_wait_timeout  = 1000,
-SPI1_PLATFORM_DATA_END()
+    .irq                = IRQ_SPI1_IDX,
+    .reg                = JL_SPI1,
+};
+
+/* Fold in whatever tkl_io_pinmux_config() recorded. Must run before dev_open()
+ * because that is where the vendor driver muxes the pins. */
+static void jieli_spi1_apply_requested_pins(void)
+{
+    uint32_t clk_pin;
+    uint32_t do_pin;
+    uint32_t di_pin;
+
+    jieli_pinmux_spi1_pins_get(&clk_pin, &do_pin, &di_pin);
+    if (clk_pin != UINT32_MAX) s_spi1_pd.io.clk_pin = (int)clk_pin;
+    if (do_pin != UINT32_MAX) s_spi1_pd.io.do_pin = (int)do_pin;
+    if (di_pin != UINT32_MAX) s_spi1_pd.io.di_pin = (int)di_pin;
+}
 #else
 
 /* WL82 picks one pin group out of the SDK's fixed table, and the baud rate is
@@ -236,6 +269,11 @@ OPERATE_RET tkl_spi_init(TUYA_SPI_NUM_E port, const TUYA_SPI_BASE_CFG_T *cfg){
 #endif
 
     if (s_spi_handles[port] == NULL) {
+#if defined(JIELI_SELECTED_CHIP_WL83)
+        if (port == TUYA_SPI_NUM_1) {
+            jieli_spi1_apply_requested_pins();
+        }
+#endif
         s_spi_handles[port] = dev_open((char *)jieli_spi_device_name(port), NULL);
         if (s_spi_handles[port] == NULL) {
             return OPRT_NOT_SUPPORTED;

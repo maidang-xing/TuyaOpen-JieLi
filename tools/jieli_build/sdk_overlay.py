@@ -27,7 +27,8 @@ from .board_config import (
     configure_audio_board, configure_board_memory, configure_flash_reserved_area,
     configure_full_stack_app_config, configure_full_stack_board, configure_lcd_app_config,
     configure_lcd_board, configure_lcd_board_header, configure_log_uart_baudrate,
-    configure_log_uart_block, configure_lowpower, configure_service_uart,
+    configure_log_uart_block, configure_lowpower, configure_peripheral_header,
+    configure_service_uart,
     configure_usb_download_app_config, configure_usb_download_board,
     configure_usb_download_board_header,
 )
@@ -499,6 +500,27 @@ def _staged_vendor_fingerprint(vendor_root: Path, chip) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def peripheral_pin_digest(config_values: Optional[Mapping[str, str]]) -> str:
+    """Join the board's adapter pin symbols so staging notices a change."""
+    if config_values is None:
+        return ""
+    symbols = (
+        "CONFIG_JIELI_BOARD_SPI1_CLK_PIN",
+        "CONFIG_JIELI_BOARD_SPI1_DO_PIN",
+        "CONFIG_JIELI_BOARD_SPI1_DI_PIN",
+        "CONFIG_JIELI_BOARD_PWM0_H_PIN",
+        "CONFIG_JIELI_BOARD_PWM0_L_PIN",
+        "CONFIG_JIELI_BOARD_PWM1_H_PIN",
+        "CONFIG_JIELI_BOARD_PWM1_L_PIN",
+        "CONFIG_JIELI_BOARD_PWM2_H_PIN",
+        "CONFIG_JIELI_BOARD_PWM2_L_PIN",
+        "CONFIG_JIELI_BOARD_PWM3_H_PIN",
+        "CONFIG_JIELI_BOARD_PWM3_L_PIN",
+        "CONFIG_JIELI_BOARD_PWM0_PIN",
+    )
+    return ",".join(f"{name}={str(config_values.get(name, '')).strip()}" for name in symbols)
+
+
 def staging_input_components(
     *,
     sdk_root: Path,
@@ -515,6 +537,7 @@ def staging_input_components(
     uart_log_baudrate: int,
     adapter_source_selection: str = "",
     usb_cdc_log: str = "n",
+    peripheral_pins: str = "",
 ) -> dict[str, str]:
     """Name every input the staged bytes depend on, one digest each.
 
@@ -543,6 +566,9 @@ def staging_input_components(
         "adapter_sources": adapter_source_selection,
         # Written into the staged USB board header, so it is staged bytes.
         "usb_cdc_log": usb_cdc_log,
+        # Pin facts the board declares for the adapters; they land in the
+        # generated peripheral header, so a change must restage.
+        "peripheral_pins": peripheral_pins,
         "audio_config": _file_digest(audio_config_source),
         # The staging hooks themselves. An edit to any of them can change the
         # staged bytes without changing any other input.
@@ -783,6 +809,7 @@ def create_staging_tree(
         uart_log_baudrate=uart_log_baudrate,
         adapter_source_selection="\n".join(adapter_sources),
         usb_cdc_log="y" if usb_cdc_log else "n",
+        peripheral_pins=peripheral_pin_digest(config_values),
     )
     if staging_tree_is_current(staging_root, staging_input_digest(**components)):
         return staging_root / "build"
@@ -857,6 +884,7 @@ def create_staging_tree(
             configure_lcd_board(board_file)
     else:
         configure_usb_download_app_config(app_config_file, usb_cdc_log)
+    configure_peripheral_header(board_file, config_values)
     if profile is not None and profile.board_declarations:
         configure_audio_board(board_file, audio_config_source, profile)
     if chip.name == "wl83":
@@ -984,6 +1012,14 @@ def create_staging_tree(
     if chip.name == "wl82" and board_name == "AC79_DevKitBoard":
         content += "DEFINES += -DJIELI_AC79_DEVKIT_BOARD=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
+    # The board's peripheral pins come from its Kconfig through a generated
+    # header next to board.c, so the adapter has one source of truth for them.
+    board_relative = chip.board_build_relative.as_posix()
+    content += (
+        "CFLAGS += -include ../../../../../"
+        + board_relative
+        + "/tuya_board_periph_config.h\n"
+    )
     content += "DEFINES += " + " ".join(
         "-D" + define for define in feature_defines(features)
     ) + "\n"

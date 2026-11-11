@@ -18,6 +18,7 @@
 #define JIELI_FLASH_SIZE       (8U * 1024U * 1024U)
 #endif
 #define JIELI_FLASH_BLOCK      0x00001000U
+#define JIELI_FLASH_BOUNCE     256U
 #define JIELI_KV_KEY_START     0x00300000U
 #define JIELI_KV_KEY_SIZE      0x00001000U
 #define JIELI_KV_DATA_START    0x00301000U
@@ -80,6 +81,19 @@ static int jieli_flash_is_owned(uint32_t addr, uint32_t size)
     return 0;
 }
 
+/* norflash_write() shifts the data out over the flash's own SPI bus, so the
+ * source buffer must not sit in the flash-mapped window itself: writing while
+ * reading from the same chip hangs it. A string literal or any const table is
+ * exactly that, and the shared flash example passes one, so such buffers are
+ * copied to RAM first. */
+static int jieli_flash_src_in_flash(const void *src)
+{
+    uint32_t base = flash_addr2cpu_addr(0);
+    uint32_t addr = (uint32_t)src;
+
+    return addr >= base && addr < base + JIELI_FLASH_SIZE;
+}
+
 OPERATE_RET tkl_flash_read(uint32_t addr, uint8_t *dst, uint32_t size)
 {
     if (NULL == dst || OPRT_OK != jieli_flash_check_range(addr, size)) {
@@ -91,6 +105,9 @@ OPERATE_RET tkl_flash_read(uint32_t addr, uint8_t *dst, uint32_t size)
 
 OPERATE_RET tkl_flash_write(uint32_t addr, const uint8_t *src, uint32_t size)
 {
+    uint32_t offset;
+    uint32_t chunk;
+
     if (NULL == src || OPRT_OK != jieli_flash_check_range(addr, size)) {
         return OPRT_INVALID_PARM;
     }
@@ -101,6 +118,23 @@ OPERATE_RET tkl_flash_write(uint32_t addr, const uint8_t *src, uint32_t size)
     /* The downloader leaves the flash write-protected; the vendor's own flash
      * example releases it before every write, so do the same here. */
     norflash_ioctl(NULL, IOCTL_SET_WRITE_PROTECT, 0);
+    if (jieli_flash_src_in_flash(src)) {
+        uint8_t bounce[JIELI_FLASH_BOUNCE];
+
+        offset = 0u;
+        while (offset < size) {
+            chunk = size - offset;
+            if (chunk > sizeof(bounce)) {
+                chunk = sizeof(bounce);
+            }
+            memcpy(bounce, src + offset, chunk);
+            if (norflash_write(NULL, bounce, chunk, addr + offset) != (int)chunk) {
+                return OPRT_COM_ERROR;
+            }
+            offset += chunk;
+        }
+        return OPRT_OK;
+    }
     return (norflash_write(NULL, (void *)src, size, addr) == (int)size) ? OPRT_OK : OPRT_COM_ERROR;
 }
 

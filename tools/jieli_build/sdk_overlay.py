@@ -24,7 +24,8 @@ from typing import Iterable, Mapping, Optional
 
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
-    configure_audio_board, configure_board_memory, configure_flash_reserved_area,
+    configure_audio_board, configure_board_memory, configure_dual_bank_app_config,
+    configure_flash_reserved_area,
     configure_full_stack_app_config, configure_full_stack_board, configure_lcd_app_config,
     configure_lcd_board, configure_lcd_board_header, configure_log_uart_baudrate,
     configure_log_uart_block, configure_lowpower, configure_peripheral_header,
@@ -190,6 +191,15 @@ def remove_vendor_spi1_registration(content: str) -> str:
             "Expected exactly one vendor TCFG_SPI1_ENABLE spi1 device registration; "
             f"found {count}"
         )
+    # spi2 only appears when a project turns TCFG_SPI2_ENABLE on; the adapter
+    # registers that name too, so drop it when it is there.
+    pattern = re.compile(
+        r"(?m)^#if[ \t]+TCFG_SPI2_ENABLE\r?\n"
+        r"[ \t]*\{[ \t]*\"spi2\",[ \t]*&spi_dev_ops,[ \t]*"
+        r"\(void \*\)&spi2_data[ \t]*\},[ \t]*\r?\n"
+        r"#endif(?:[ \t]*//[^\r\n]*)?\r?\n?"
+    )
+    updated = pattern.sub("", updated)
     return updated
 
 
@@ -900,6 +910,7 @@ def create_staging_tree(
     )
     configure_full_stack_board(board_file, reference_board_file)
     configure_full_stack_app_config(app_config_file)
+    configure_dual_bank_app_config(app_config_file, config_values)
     configure_flash_reserved_area(
         source_overlay_root / "cpu" / chip.cpu / "tools" / "isd_config_rule.c",
         platform_root / "tuyaos" / "tuyaos_adapter" / "src" / "driver" / "tkl_flash.c",

@@ -661,9 +661,15 @@ def configure_peripheral_header(board_file: Path, config_values) -> Path:
     build's -include never points at a missing file.
     """
     pins = (
+        ("CONFIG_JIELI_BOARD_SPI0_CLK_PIN", "TUYA_BOARD_SPI0_CLK_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI0_DO_PIN", "TUYA_BOARD_SPI0_DO_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI0_DI_PIN", "TUYA_BOARD_SPI0_DI_PIN"),
         ("CONFIG_JIELI_BOARD_SPI1_CLK_PIN", "TUYA_BOARD_SPI1_CLK_PIN"),
         ("CONFIG_JIELI_BOARD_SPI1_DO_PIN", "TUYA_BOARD_SPI1_DO_PIN"),
         ("CONFIG_JIELI_BOARD_SPI1_DI_PIN", "TUYA_BOARD_SPI1_DI_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI2_CLK_PIN", "TUYA_BOARD_SPI2_CLK_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI2_DO_PIN", "TUYA_BOARD_SPI2_DO_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI2_DI_PIN", "TUYA_BOARD_SPI2_DI_PIN"),
         ("CONFIG_JIELI_BOARD_UART1_TX_PIN", "TUYA_BOARD_UART1_TX_PIN"),
         ("CONFIG_JIELI_BOARD_UART1_RX_PIN", "TUYA_BOARD_UART1_RX_PIN"),
         ("CONFIG_JIELI_BOARD_PWM0_H_PIN", "TUYA_BOARD_PWM0_H_PIN"),
@@ -1184,6 +1190,23 @@ def _usb_class_block(usb_cdc_log: bool) -> str:
     """
     classes = "MASSSTORAGE_CLASS | CDC_CLASS" if usb_cdc_log else "MASSSTORAGE_CLASS"
     return f"#define USB_DEVICE_CLASS_CONFIG             ({classes})\n"
+
+
+def configure_dual_bank_app_config(app_config_file: Path, config_values) -> None:
+    """Turn on the vendor's dual-bank OTA engine when the board asks for it.
+
+    ``lib_update_config.c`` maps CONFIG_DOUBLE_BANK_ENABLE onto
+    ``support_dual_bank_update_en``, which is what ota_impl.h's
+    dual_bank_passive_update_* path and the uboot bank switch key off.
+    """
+    if config_values is None:
+        return
+    if str(config_values.get("CONFIG_JIELI_BOARD_DUAL_BANK", "")).strip() not in ("y", "true", "True"):
+        return
+    # The vendor profile defines both together: a dual-bank image needs the
+    # duplicated uboot, or the boot side cannot switch between banks.
+    _define_macro(app_config_file, "CONFIG_DOUBLE_BANK_ENABLE")
+    _define_macro(app_config_file, "CONFIG_SUPPORT_DOUBLE_UBOOT")
 
 
 def configure_usb_download_app_config(app_config_file: Path, usb_cdc_log: bool = False) -> None:

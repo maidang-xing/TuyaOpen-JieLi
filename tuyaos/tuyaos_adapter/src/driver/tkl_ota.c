@@ -1,37 +1,173 @@
 #include "tkl_ota.h"
+
+#include <stdint.h>
+#include <stdio.h>
+
+#include "tkl_semaphore.h"
+#include "tkl_system.h"
 #include "tuya_error_code.h"
+
+#if defined(JIELI_SELECTED_CHIP_WL83)
+#include "generic/typedef.h"
+#include "ota_impl.h"
+#include "db_updata_api.h"
+#else
+#include "generic/typedef.h"
+#include "dual_bank_updata_api.h"
+#endif
+
+/* The vendor engine copies each dev_write through an internal buffer whose
+ * size it reports; a Tuya pack larger than that has to be split. */
+#define JIELI_OTA_CHUNK_DEFAULT 4096u
+#define JIELI_OTA_FINISH_TIMEOUT_MS 20000u
+
+/* Advertised ceiling for a cloud image. The flash map splits the vendor's
+ * application region into two equal banks (0xF3000 each on the reference
+ * layout, 0x99000..0x18C000 and 0x18C000..0x27F000); a request larger than the
+ * inactive bank is rejected by dual_bank_update_allow_check() at start time. */
+#define JIELI_OTA_IMAGE_MAX (0xF0000u)
+
+static uint8_t s_ota_active;
+static uint32_t s_ota_chunk = JIELI_OTA_CHUNK_DEFAULT;
+static TKL_SEM_HANDLE s_ota_finish_sem;
+static volatile int s_ota_finish_state; /* 0 running, 1 done, -1 failed */
+
+static int jieli_ota_burn_cb(int err)
+{
+    s_ota_finish_state = (err == 0) ? 1 : -1;
+    if (s_ota_finish_sem != NULL) {
+        (void)tkl_semaphore_post(s_ota_finish_sem);
+    }
+    return 0;
+}
+
+static int jieli_ota_verify_cb(int result)
+{
+    if (result) {
+        /* Read-back verified: program the boot info that points at this bank.
+         * Completion is reported through jieli_ota_burn_cb(). */
+        (void)dual_bank_update_burn_boot_info(jieli_ota_burn_cb);
+        return 0;
+    }
+    s_ota_finish_state = -1;
+    if (s_ota_finish_sem != NULL) {
+        (void)tkl_semaphore_post(s_ota_finish_sem);
+    }
+    return -1;
+}
+
+static void jieli_ota_cleanup(void)
+{
+    (void)dual_bank_passive_update_exit(NULL);
+    s_ota_active = 0;
+    if (s_ota_finish_sem != NULL) {
+        (void)tkl_semaphore_release(s_ota_finish_sem);
+        s_ota_finish_sem = NULL;
+    }
+}
 
 OPERATE_RET tkl_ota_get_ability(uint32_t *image_size, TUYA_OTA_TYPE_E *type)
 {
     if (NULL == image_size || NULL == type) {
         return OPRT_INVALID_PARM;
     }
-    *image_size = 512U * 1024U;
+    *image_size = JIELI_OTA_IMAGE_MAX;
     *type = TUYA_OTA_FULL;
     return OPRT_OK;
 }
 
 OPERATE_RET tkl_ota_start_notify(uint32_t image_size, TUYA_OTA_TYPE_E type, TUYA_OTA_PATH_E path)
 {
-    (void)image_size;
-    (void)type;
+    uint32_t max_buf;
+
     (void)path;
-    return OPRT_NOT_SUPPORTED;
+    if (image_size == 0u || image_size > JIELI_OTA_IMAGE_MAX) {
+        return OPRT_INVALID_PARM;
+    }
+    if (type != TUYA_OTA_FULL) {
+        /* The vendor engine takes a full image; it has its own patching path
+         * but the Tuya difference package is not what it expects. */
+        return OPRT_NOT_SUPPORTED;
+    }
+    if (s_ota_active) {
+        jieli_ota_cleanup();
+    }
+    if (dual_bank_passive_update_init(0u, image_size, (uint16_t)JIELI_OTA_CHUNK_DEFAULT, NULL) != 0) {
+        printf("[JIELI_OTA] passive_update_init failed, image 0x%x\n", (unsigned)image_size);
+        return OPRT_COM_ERROR;
+    }
+    max_buf = get_dual_bank_passive_update_max_buf();
+    if (max_buf >= JIELI_OTA_CHUNK_DEFAULT) {
+        s_ota_chunk = max_buf;
+    }
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    {
+        uint32_t bank_base = 0u;
+        uint32_t bank_size = 0u;
+
+        if (db_update_target_base(&bank_base, &bank_size) == 0) {
+            printf("[JIELI_OTA] target bank 0x%x size 0x%x, image 0x%x\n",
+                   (unsigned)bank_base, (unsigned)bank_size, (unsigned)image_size);
+        }
+    }
+#endif
+    if (dual_bank_update_allow_check(image_size) != 0) {
+        printf("[JIELI_OTA] allow_check failed, image 0x%x\n", (unsigned)image_size);
+        (void)dual_bank_passive_update_exit(NULL);
+        return OPRT_COM_ERROR;
+    }
+    s_ota_active = 1;
+    return OPRT_OK;
 }
 
 OPERATE_RET tkl_ota_data_process(TUYA_OTA_DATA_T *pack, uint32_t *remain_len)
 {
-    (void)pack;
-    if (remain_len) {
-        *remain_len = 0;
+    uint32_t offset = 0u;
+
+    if (remain_len != NULL) {
+        *remain_len = 0u;
     }
-    return OPRT_NOT_SUPPORTED;
+    if (!s_ota_active || pack == NULL || pack->data == NULL || pack->len == 0u) {
+        return OPRT_INVALID_PARM;
+    }
+    while (offset < pack->len) {
+        uint32_t chunk = pack->len - offset;
+
+        if (chunk > s_ota_chunk) {
+            chunk = s_ota_chunk;
+        }
+        if (dual_bank_update_write(pack->data + offset, (uint16_t)chunk, NULL) != 0) {
+            return OPRT_COM_ERROR;
+        }
+        offset += chunk;
+    }
+    return OPRT_OK;
 }
 
 OPERATE_RET tkl_ota_end_notify(BOOL_T reset)
 {
-    (void)reset;
-    return OPRT_NOT_SUPPORTED;
+    OPERATE_RET rt = OPRT_COM_ERROR;
+
+    if (!s_ota_active) {
+        return OPRT_INVALID_PARM;
+    }
+    s_ota_finish_state = 0;
+    if (tkl_semaphore_create_init(&s_ota_finish_sem, 0u, 1u) != OPRT_OK) {
+        jieli_ota_cleanup();
+        return OPRT_COM_ERROR;
+    }
+    if (dual_bank_update_verify(NULL, NULL, jieli_ota_verify_cb) == 0) {
+        (void)tkl_semaphore_wait(s_ota_finish_sem, JIELI_OTA_FINISH_TIMEOUT_MS);
+    }
+    if (s_ota_finish_state == 1 && reset) {
+        /* Leave the engine alone; the reset drops the handle with the task. */
+        tkl_system_reset();
+    }
+    if (s_ota_finish_state == 1) {
+        rt = OPRT_OK;
+    }
+    jieli_ota_cleanup();
+    return rt;
 }
 
 OPERATE_RET tkl_ota_get_old_firmware_info(TUYA_OTA_FIRMWARE_INFO_T **info)

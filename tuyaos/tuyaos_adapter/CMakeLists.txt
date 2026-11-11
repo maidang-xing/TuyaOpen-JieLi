@@ -201,6 +201,7 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${JIELI_SDK_ROOT}/include_lib/driver/device
         ${JIELI_SDK_ROOT}/include_lib/driver/cpu/${JIELI_CPU}
         ${JIELI_SDK_ROOT}/include_lib/system
+        ${JIELI_SDK_ROOT}/include_lib/update
         ${JIELI_SDK_ROOT}/include_lib/utils
         ${JIELI_SDK_ROOT}/include_lib/utils/syscfg
         ${JIELI_SDK_ROOT}/include_lib/utils/event

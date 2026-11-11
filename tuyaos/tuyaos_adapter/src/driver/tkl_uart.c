@@ -169,6 +169,40 @@ static void jieli_uart_rx_task(void *arg)
     jieli_uart_worker_exited(port_id);
 }
 #else /* JIELI_SELECTED_CHIP_WL82 */
+/* TuyaOpen's logical UART1 is the SDK's uart2 on WL82. It is opt-in
+ * (JIELI_BOARD_UART1_ENABLE) because opening that block stops the vendor debug
+ * console on this SDK: output stops on PB3 and does not appear on the uart2
+ * pins either, so a board can have a second UART or logs, not both.
+ *
+ * The pins are the block's fixed group, PH2/PH3. PH2 is also the PWM0 timer
+ * output, so those two are mutually exclusive as well. PORT_REMAP was tried and
+ * behaves exactly like the fixed group. */
+#if defined(TUYA_BOARD_UART1_ENABLE)
+#ifndef TUYA_BOARD_UART1_TX_PIN
+#define TUYA_BOARD_UART1_TX_PIN IO_PORTH_02
+#endif
+#ifndef TUYA_BOARD_UART1_RX_PIN
+#define TUYA_BOARD_UART1_RX_PIN IO_PORTH_03
+#endif
+
+#include "asm/gpio.h"
+#include "asm/uart.h"
+
+static const struct uart_platform_data s_uart2_pd = {
+    .baudrate = 115200,
+    .port = PORTH_2_3,
+    .tx_pin = TUYA_BOARD_UART1_TX_PIN,
+    .rx_pin = TUYA_BOARD_UART1_RX_PIN,
+    .max_continue_recv_cnt = 1024,
+    .idle_sys_clk_cnt = 500000,
+    .clk_src = PLL_48M,
+    .flags = 0,
+    .rts_pin = -1,
+    .cts_pin = -1,
+};
+REGISTER_DEVICE(uart2_node) = {"uart2", &uart_dev_ops, (void *)&s_uart2_pd};
+#endif /* TUYA_BOARD_UART1_ENABLE */
+
 /* WL82 exposes no IRQ-event callback. Poll unread-byte count every 10 ms and
  * notify TAL in task context; the SDK's awtk caller confirms GET_RECV_CNT uses
  * a pointer argument. This adds polling latency; bytes remain buffered until
@@ -188,7 +222,7 @@ static const char *jieli_uart_device_name(TUYA_UART_NUM_E port_id)
     if (port_id == 0u) {
         return "uart0";
     }
-#if defined(JIELI_SELECTED_CHIP_WL83)
+#if defined(JIELI_SELECTED_CHIP_WL83) || defined(TUYA_BOARD_UART1_ENABLE)
     if (port_id == 1u) {
         return "uart2";
     }

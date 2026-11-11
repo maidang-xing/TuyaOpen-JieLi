@@ -236,6 +236,26 @@ def remove_vendor_uart2_registration(content: str) -> str:
     return updated
 
 
+def remove_vendor_wl82_uart2_registration(content: str) -> str:
+    """Remove the WL82 demo board's uart2 node so the adapter owns its name.
+
+    That board registers uart2 on the debug console's PB3 with no RX, so the
+    name was unusable as a second port. The adapter registers uart2 itself with
+    the pins the board's Kconfig declares.
+    """
+    pattern = re.compile(
+        r"(?m)^[ \t]*\{[ \t]*\"uart2\",[ \t]*&uart_dev_ops,[ \t]*"
+        r"\(void[ \t]*\*\)[ \t]*&uart2_data[ \t]*\},[ \t]*\r?\n"
+    )
+    updated, count = pattern.subn("", content)
+    if count != 1:
+        raise BuildError(
+            "Expected exactly one vendor uart2 device registration in the WL82 demo board; "
+            f"found {count}"
+        )
+    return updated
+
+
 def link_directory(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)
@@ -910,6 +930,15 @@ def create_staging_tree(
         board_content = remove_vendor_iic1_registration(board_content)
         board_content = remove_vendor_uart2_registration(board_content)
         write_staged_text(board_file, board_content)
+    else:
+        uart1_enabled = (
+            str((config_values or {}).get("CONFIG_JIELI_BOARD_UART1_ENABLE", "")).strip()
+            in TRUTHY
+        )
+        if uart1_enabled:
+            board_content = board_file.read_text(encoding="utf-8")
+            board_content = remove_vendor_wl82_uart2_registration(board_content)
+            write_staged_text(board_file, board_content)
     shutil.copytree(
         platform_root / "tuyaos" / "entry",
         source_overlay_root / "tuyaos" / "entry",

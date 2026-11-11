@@ -571,7 +571,7 @@ def configure_board_memory(
     write_staged_text(ddr_config_file, content)
 
 
-_TUYA_FLASH_PARTITIONS = ("KV_KEY", "KV_DATA", "UF", "RCD")
+_TUYA_FLASH_PARTITIONS = ("KV_KEY", "KV_DATA", "UF", "RCD", "USER0")
 
 
 def _c_hex_literal(content: str, name: str, source: Path) -> int:
@@ -628,7 +628,7 @@ def configure_flash_reserved_area(
 
     block = (
         "// TUYAOPEN_RESERVED_AREA_BEGIN\n"
-        f"TUYAOPEN_ADR=0x{start:06X}; [TuyaOpen KV/UF/RCD]\n"
+        f"TUYAOPEN_ADR=0x{start:06X}; [TuyaOpen KV/UF/RCD/USER0]\n"
         f"TUYAOPEN_LEN=0x{length:06X};\n"
         "TUYAOPEN_OPT=1;\n"
         "// TUYAOPEN_RESERVED_AREA_END\n"

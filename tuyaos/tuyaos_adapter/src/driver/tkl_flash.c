@@ -1,7 +1,7 @@
 #include "tkl_flash.h"
 #include "tuya_error_code.h"
 #include "asm/sfc_norflash_api.h"
-#include "vm.h"
+#include "device/ioctl_cmds.h"
 
 #include <string.h>
 
@@ -26,6 +26,11 @@
 #define JIELI_UF_SIZE          0x00080000U
 #define JIELI_RCD_START        0x00391000U
 #define JIELI_RCD_SIZE         0x00040000U
+/* The generic user partition. It sits at the end of the TuyaOpen span, so
+ * extending it only moves the vendor's AUTO-placed BTIF/USER areas up, and it
+ * is inside the OPT=1 reserved block so a USB download leaves it alone. */
+#define JIELI_USER0_START      0x003D1000U
+#define JIELI_USER0_SIZE       0x00010000U
 
 static OPERATE_RET jieli_flash_check_range(uint32_t addr, uint32_t size)
 {
@@ -48,16 +53,30 @@ OPERATE_RET tkl_flash_write(uint32_t addr, const uint8_t *src, uint32_t size)
     if (NULL == src || OPRT_OK != jieli_flash_check_range(addr, size)) {
         return OPRT_INVALID_PARM;
     }
+    /* The downloader leaves the flash write-protected; the vendor's own flash
+     * example releases it before every write, so do the same here. */
+    norflash_ioctl(NULL, IOCTL_SET_WRITE_PROTECT, 0);
     return (norflash_write(NULL, (void *)src, size, addr) == (int)size) ? OPRT_OK : OPRT_COM_ERROR;
 }
 
 OPERATE_RET tkl_flash_erase(uint32_t addr, uint32_t size)
 {
+    uint32_t offset;
+
     if (0U == size || (addr % JIELI_FLASH_BLOCK) != 0U || (size % JIELI_FLASH_BLOCK) != 0U ||
         OPRT_OK != jieli_flash_check_range(addr, size)) {
         return OPRT_INVALID_PARM;
     }
-    return sfc_erase_zone(addr, size) ? OPRT_OK : OPRT_COM_ERROR;
+    /* Erase a sector at a time through the norflash ioctl the vendor's own
+     * flash example uses. sfc_erase_zone() belongs to the VM path and stalls
+     * the chip when it is handed an address outside that area. */
+    norflash_ioctl(NULL, IOCTL_SET_WRITE_PROTECT, 0);
+    for (offset = 0u; offset < size; offset += JIELI_FLASH_BLOCK) {
+        if (norflash_ioctl(NULL, IOCTL_ERASE_SECTOR, addr + offset) < 0) {
+            return OPRT_COM_ERROR;
+        }
+    }
+    return OPRT_OK;
 }
 
 OPERATE_RET tkl_flash_lock(uint32_t addr, uint32_t size)
@@ -99,6 +118,10 @@ OPERATE_RET tkl_flash_get_one_type_info(TUYA_FLASH_TYPE_E type, TUYA_FLASH_BASE_
     case TUYA_FLASH_TYPE_RCD:
         info->partition[0].start_addr = JIELI_RCD_START;
         info->partition[0].size = JIELI_RCD_SIZE;
+        break;
+    case TUYA_FLASH_TYPE_USER0:
+        info->partition[0].start_addr = JIELI_USER0_START;
+        info->partition[0].size = JIELI_USER0_SIZE;
         break;
     default:
         memset(info, 0, sizeof(*info));

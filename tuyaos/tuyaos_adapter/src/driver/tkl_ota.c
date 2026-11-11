@@ -79,6 +79,7 @@ OPERATE_RET tkl_ota_get_ability(uint32_t *image_size, TUYA_OTA_TYPE_E *type)
 OPERATE_RET tkl_ota_start_notify(uint32_t image_size, TUYA_OTA_TYPE_E type, TUYA_OTA_PATH_E path)
 {
     uint32_t max_buf;
+    int ret;
 
     (void)path;
     if (image_size == 0u || image_size > JIELI_OTA_IMAGE_MAX) {
@@ -92,8 +93,18 @@ OPERATE_RET tkl_ota_start_notify(uint32_t image_size, TUYA_OTA_TYPE_E type, TUYA
     if (s_ota_active) {
         jieli_ota_cleanup();
     }
-    if (dual_bank_passive_update_init(0u, image_size, (uint16_t)JIELI_OTA_CHUNK_DEFAULT, NULL) != 0) {
-        printf("[JIELI_OTA] passive_update_init failed, image 0x%x\n", (unsigned)image_size);
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    {
+        struct BootInfo info = {0};
+
+        (void)get_current_boot_info(&info);
+        printf("[JIELI_OTA] boot info: code=0x%x base=0x%x ver=%u\n",
+               (unsigned)info.codeLength, (unsigned)info.baseAddress, (unsigned)info.version);
+    }
+#endif
+    ret = dual_bank_passive_update_init(0u, image_size, (uint16_t)JIELI_OTA_CHUNK_DEFAULT, NULL);
+    if (ret != 0) {
+        printf("[JIELI_OTA] passive_update_init failed %d, image 0x%x\n", (int)ret, (unsigned)image_size);
         return OPRT_COM_ERROR;
     }
     max_buf = get_dual_bank_passive_update_max_buf();

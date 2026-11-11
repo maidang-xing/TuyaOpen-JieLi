@@ -489,8 +489,9 @@ static OPERATE_RET tkl_io_pinmux_config_unlocked(TUYA_PIN_NAME_E pin, TUYA_PIN_F
     {
         uint32_t spi_port;
         if (jieli_wl82_spi_role(pin_func, &spi_port) >= 0) {
-            /* WL82 tkl_spi_init() is deliberately unsupported, so pinmux must
-             * not claim a route that no supported SPI device can apply. */
+            /* WL82 SPI is a fixed group table, not a per-pin mux: the pins come
+             * from the group the platform data names, so a single pin request
+             * cannot be honoured. Use jieli_wl82_spi_pinmux_select() instead. */
             return OPRT_NOT_SUPPORTED;
         }
     }

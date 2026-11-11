@@ -21,10 +21,26 @@
 
 **配置读取时机**（决定哪些外设运行期可配）：
 
-| 外设 | 何时读 `arg` |
-|---|---|
-| UART / PWM | `*_open(arg)`，运行期可改 |
-| SPI / IIC | `devices_init()` 时锁存，运行期不可改 |
+| 外设 | 何时读平台数据 | 运行期换脚 |
+|---|---|---|
+| UART | `*_open()` | 可以（`tkl_io_pinmux_config`） |
+| PWM | `*_open()`，引脚来自板级配置 | wl82 由板级配置决定；wl83 通道是互补对，不支持 |
+| SPI | `dev_open()`，`tkl_spi_init()` 可在 open 前改写引脚 | wl83 可以；wl82 是固定分组 |
+| IIC | 编译期平台数据 | 硬件端口可以（open 后适配层重新应用）；软件 IIC 不行 |
+
+## 板级引脚从哪来
+
+外设引脚只有一个来源：板的 Kconfig（`boards/JIELI/<board>/Kconfig` 里的
+`JIELI_BOARD_SPI1_*_PIN`、`JIELI_BOARD_PWM*_PIN`、`JIELI_BOARD_IIC*_PIN`）。
+
+构建期 `tools/jieli_build/board_config.py` 把这些值写成 `board.c` 旁边的
+`tuya_board_periph_config.h`，`sdk_overlay.py` 用
+`CFLAGS += -include .../tuya_board_periph_config.h` 强制包含进整个构建，适配层
+再用 `TUYA_BOARD_*` 宏初始化平台数据。板子不声明某个符号时适配层退回自己的
+默认值，所以老工程不会因为缺符号而编译失败。
+
+改了引脚值会改变 staging 摘要（`peripheral_pins` 分量），下一次构建会重新
+staging，不会沿用旧头文件。
 
 ## 构建门控
 

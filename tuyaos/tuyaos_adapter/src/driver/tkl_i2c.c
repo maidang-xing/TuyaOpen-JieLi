@@ -36,11 +36,40 @@ HW_IIC1_PLATFORM_DATA_BEGIN(s_iic1_pd)
     .reg = NULL,
 HW_IIC1_PLATFORM_DATA_END()
 REGISTER_DEVICE(iic1_node) = { "iic1", &iic_dev_ops, (void *)&s_iic1_pd };
+
+/* IIC0 is the 792's enhanced hardware IIC. The vendor board registers it only
+ * under TCFG_IIC_ENABLE, which the staged demo configuration leaves off, so the
+ * adapter registers its own node with the vendor demo pins. */
+HW_IIC0_PLATFORM_DATA_BEGIN(s_iic0_pd)
+    .role = IIC_ROLE_MASTER,
+    .hd_level = GPIO_DRIVE_STRENGTH_2p5mA,
+    .clk_pin = IO_PORTA_04,
+    .dat_pin = IO_PORTA_05,
+    .io_filter = 2,
+    .internal_pull_up_enable = 1,
+    .fast_resp = 0,
+    .ie_enable = 0,
+    .baudrate = 100000,
+    .timeout_cnt = 40,
+HW_IIC0_PLATFORM_DATA_END()
+REGISTER_DEVICE(iic0_node) = { "iic0", &iic_dev_ops, (void *)&s_iic0_pd };
+
+/* Software IIC (SDK iic2) owns its pins directly, so no pinmux is applied for
+ * this port. PA2/PA3 keep it clear of IIC0 (PA4/PA5) and IIC1 (PA6/PA7). */
+SW_IIC_PLATFORM_DATA_BEGIN(s_iic2_pd)
+    .clk_pin = IO_PORTA_02,
+    .dat_pin = IO_PORTA_03,
+    .sw_iic_delay = 80,
+    .sw_iic_byte_gap_time = 300,
+    .hd_level = GPIO_DRIVE_STRENGTH_2p5mA,
+SW_IIC_PLATFORM_DATA_END()
+REGISTER_DEVICE(iic2_node) = { "iic2", &iic_dev_ops, (void *)&s_iic2_pd };
 #endif
 
 #if defined(JIELI_SELECTED_CHIP_WL82)
 #include "asm/gpio.h"
 #include "asm/iic.h"
+#include "init.h"
 #include "ioctl_cmds.h"
 
 /* Mirror the WL82 SDK hardware-IIC platform data for the default PA7/PA8
@@ -70,6 +99,16 @@ static struct hw_iic_platform_data s_iic1_pd = {
 };
 
 REGISTER_DEVICE(iic1_node) = {"iic1", &iic_dev_ops, &s_iic1_pd};
+
+/* WL82 has no hardware IIC0: its iic0 is the vendor software IIC. Register it
+ * here because the staged demo board does not, and keep it on pins the board
+ * leaves free (PA0/PA1). */
+SW_IIC_PLATFORM_DATA_BEGIN(s_iic0_pd)
+    .clk_pin = IO_PORTA_00,
+    .dat_pin = IO_PORTA_01,
+    .sw_iic_delay = 50,
+SW_IIC_PLATFORM_DATA_END()
+REGISTER_DEVICE(iic0_node) = {"iic0", &iic_dev_ops, (void *)&s_iic0_pd};
 #endif
 
 /* Master transfers use byte-level device ioctls. WL82 and WL83 have different
@@ -190,6 +229,17 @@ static int jieli_i2c_valid(TUYA_I2C_NUM_E port)
            jieli_i2c_device_name(port) != NULL;
 }
 
+/* Software IIC drives its own pins and has fixed timing: TKL must not route a
+ * pinmux for it, and a requested speed cannot be applied. */
+static int jieli_i2c_is_software(TUYA_I2C_NUM_E port)
+{
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    return port == TUYA_I2C_NUM_2;
+#else
+    return port == TUYA_I2C_NUM_0;
+#endif
+}
+
 /* Translate SDK ioctl failures to a TKL bus error. */
 static OPERATE_RET jieli_i2c_ioctl(void *handle, uint32_t cmd, uint32_t arg)
 {
@@ -202,6 +252,9 @@ static OPERATE_RET jieli_i2c_ioctl(void *handle, uint32_t cmd, uint32_t arg)
 
 static OPERATE_RET jieli_i2c_set_speed(TUYA_I2C_NUM_E port, uint32_t speed_hz)
 {
+    if (jieli_i2c_is_software(port)) {
+        return OPRT_OK;
+    }
 #if defined(JIELI_SELECTED_CHIP_WL82)
     (void)speed_hz;
     /* The selected WL82 board's hardware IIC divider maps to about 385 kHz. */
@@ -221,11 +274,6 @@ OPERATE_RET tkl_i2c_init(TUYA_I2C_NUM_E port, const TUYA_IIC_BASE_CFG_T *cfg)
     }
     name = jieli_i2c_device_name(port);
     if (name == NULL) return OPRT_NOT_SUPPORTED;
-#if defined(JIELI_SELECTED_CHIP_WL83)
-    /* This board's iic2 is fixed-pin software IIC. Its baud ioctl is a no-op,
-     * so it cannot truthfully apply arbitrary TKL speed configurations. */
-    if (port == TUYA_I2C_NUM_2) return OPRT_NOT_SUPPORTED;
-#endif
     if (cfg->role != TUYA_IIC_MODE_MASTER) {
         return OPRT_NOT_SUPPORTED;
     }
@@ -238,9 +286,13 @@ OPERATE_RET tkl_i2c_init(TUYA_I2C_NUM_E port, const TUYA_IIC_BASE_CFG_T *cfg)
         return OPRT_INVALID_PARM;
     }
 #if defined(JIELI_SELECTED_CHIP_WL82)
-    /* WL82 iic0 is software IIC with fixed timing. Hardware iic1 uses the
-     * DevKit divider 0x3f (~385 kHz); IOCTL_SET_SPEED expects a divider. */
-    if (port != TUYA_I2C_NUM_1 || cfg->speed != TUYA_IIC_BUS_SPEED_400K) {
+    /* WL82's hardware iic1 has a fixed divider (about 385 kHz); port 0 is the
+     * software IIC whose timing comes from its own delay field. */
+    if (port == TUYA_I2C_NUM_1) {
+        if (cfg->speed != TUYA_IIC_BUS_SPEED_400K) {
+            return OPRT_NOT_SUPPORTED;
+        }
+    } else if (port != TUYA_I2C_NUM_0) {
         return OPRT_NOT_SUPPORTED;
     }
 #else
@@ -271,7 +323,7 @@ OPERATE_RET tkl_i2c_init(TUYA_I2C_NUM_E port, const TUYA_IIC_BASE_CFG_T *cfg)
         return OPRT_NOT_SUPPORTED;
     }
     /* Apply any saved route after the SDK's board/device open setup. */
-    if (jieli_pinmux_iic_apply(port) != OPRT_OK) {
+    if (!jieli_i2c_is_software(port) && jieli_pinmux_iic_apply(port) != OPRT_OK) {
         dev_close(s_i2c_handles[port]);
         s_i2c_handles[port] = NULL;
         jieli_i2c_state_unlock(port);

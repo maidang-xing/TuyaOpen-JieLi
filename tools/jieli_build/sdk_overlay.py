@@ -194,7 +194,12 @@ def remove_vendor_spi1_registration(content: str) -> str:
 
 
 def remove_vendor_iic1_registration(content: str) -> str:
-    """Remove the WL83 demo board's iic1 table entry for the adapter-owned node."""
+    """Remove the WL83 demo board's iic entries for the adapter-owned nodes.
+
+    iic1 is required: the adapter always registers it. iic0 and iic2 only appear
+    when a project turns TCFG_IIC_ENABLE on, and the adapter registers those too,
+    so a duplicate node name would otherwise reach the device table.
+    """
     pattern = re.compile(
         r"(?m)^[ \t]*\{[ \t]*\"iic1\",[ \t]*&iic_dev_ops,[ \t]*"
         r"\(void \*\)&hw_iic1_data[ \t]*\},[ \t]*\r?\n"
@@ -205,6 +210,12 @@ def remove_vendor_iic1_registration(content: str) -> str:
             "Expected exactly one vendor iic1 device registration in the WL83 demo board; "
             f"found {count}"
         )
+    for node in ("iic0", "iic2"):
+        pattern = re.compile(
+            r"(?m)^[ \t]*\{[ \t]*\"" + node + r"\",[ \t]*&iic_dev_ops,[ \t]*"
+            r"\(void \*\)&[a-z_]*" + node + r"_data[ \t]*\},[ \t]*\r?\n"
+        )
+        updated = pattern.sub("", updated)
     return updated
 
 
@@ -919,14 +930,18 @@ def create_staging_tree(
         "../../../../../tuyaos_adapter/" + source
         for source in adapter_sources
     ]
-    wl82_iic_core_source = "../../../../../apps/common/iic/iic.c"
+    wl82_iic_core_sources = (
+        "../../../../../apps/common/iic/iic.c",
+        "../../../../../apps/common/iic/software_iic.c",
+    )
     if chip.name == "wl82" and "src/driver/tkl_i2c.c" in adapter_sources:
         listed_sources = {
             line.strip().removesuffix("\\").strip()
             for line in content.splitlines()
         }
-        if wl82_iic_core_source not in listed_sources:
-            extra_sources_list.append(wl82_iic_core_source)
+        for source in wl82_iic_core_sources:
+            if source not in listed_sources:
+                extra_sources_list.append(source)
     extra_sources_list.extend(
         [
             "../../../../../tuya_utilities/src/tuya_hashmap.c",

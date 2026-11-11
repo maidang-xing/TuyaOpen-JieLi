@@ -25,11 +25,11 @@
 #define JIELI_UF_START         0x00311000U
 #define JIELI_UF_SIZE          0x00080000U
 #define JIELI_RCD_START        0x00391000U
-#define JIELI_RCD_SIZE         0x00040000U
-/* The generic user partition. It sits at the end of the TuyaOpen span, so
- * extending it only moves the vendor's AUTO-placed BTIF/USER areas up, and it
- * is inside the OPT=1 reserved block so a USB download leaves it alone. */
-#define JIELI_USER0_START      0x003D1000U
+#define JIELI_RCD_SIZE         0x00030000U
+/* The generic user partition takes the last 64 KiB of the RCD area, so the
+ * TuyaOpen span keeps its original end and the vendor's AUTO-placed BTIF/USER
+ * areas do not move. Nothing in the tree consumes TUYA_FLASH_TYPE_RCD. */
+#define JIELI_USER0_START      0x003C1000U
 #define JIELI_USER0_SIZE       0x00010000U
 
 static OPERATE_RET jieli_flash_check_range(uint32_t addr, uint32_t size)

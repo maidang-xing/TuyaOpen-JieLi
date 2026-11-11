@@ -528,6 +528,12 @@ def peripheral_pin_digest(config_values: Optional[Mapping[str, str]]) -> str:
         "CONFIG_JIELI_BOARD_PWM3_H_PIN",
         "CONFIG_JIELI_BOARD_PWM3_L_PIN",
         "CONFIG_JIELI_BOARD_PWM0_PIN",
+        "CONFIG_JIELI_BOARD_IIC0_SCL_PIN",
+        "CONFIG_JIELI_BOARD_IIC0_SDA_PIN",
+        "CONFIG_JIELI_BOARD_IIC1_SCL_PIN",
+        "CONFIG_JIELI_BOARD_IIC1_SDA_PIN",
+        "CONFIG_JIELI_BOARD_IIC2_SCL_PIN",
+        "CONFIG_JIELI_BOARD_IIC2_SDA_PIN",
     )
     return ",".join(f"{name}={str(config_values.get(name, '')).strip()}" for name in symbols)
 

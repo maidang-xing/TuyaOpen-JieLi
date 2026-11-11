@@ -40,11 +40,52 @@ static OPERATE_RET jieli_flash_check_range(uint32_t addr, uint32_t size)
     return OPRT_OK;
 }
 
+/* The vendor documents norflash_open() as the first call of any user of the
+ * flash API. It is idempotent, and the device it opens is what the NULL-handle
+ * read/write/ioctl calls below resolve against. */
+static void jieli_flash_open_once(void)
+{
+    static uint8_t opened;
+
+    if (!opened) {
+        norflash_open(NULL, NULL, NULL);
+        opened = 1u;
+    }
+}
+
+/* Only the partitions this adapter owns may be written or erased. Without this
+ * an application could hand tkl_flash_erase() an address inside the firmware
+ * image, which is a bricked board rather than an error code. */
+static int jieli_flash_is_owned(uint32_t addr, uint32_t size)
+{
+    static const struct {
+        uint32_t start;
+        uint32_t size;
+    } partitions[] = {
+        {JIELI_KV_KEY_START, JIELI_KV_KEY_SIZE},
+        {JIELI_KV_DATA_START, JIELI_KV_DATA_SIZE},
+        {JIELI_UF_START, JIELI_UF_SIZE},
+        {JIELI_RCD_START, JIELI_RCD_SIZE},
+        {JIELI_USER0_START, JIELI_USER0_SIZE},
+    };
+    unsigned int i;
+
+    for (i = 0u; i < sizeof(partitions) / sizeof(partitions[0]); i++) {
+        if (addr >= partitions[i].start &&
+            size <= partitions[i].size &&
+            size <= partitions[i].start + partitions[i].size - addr) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 OPERATE_RET tkl_flash_read(uint32_t addr, uint8_t *dst, uint32_t size)
 {
     if (NULL == dst || OPRT_OK != jieli_flash_check_range(addr, size)) {
         return OPRT_INVALID_PARM;
     }
+    jieli_flash_open_once();
     return (norflash_read(NULL, dst, size, addr) == (int)size) ? OPRT_OK : OPRT_COM_ERROR;
 }
 
@@ -53,6 +94,10 @@ OPERATE_RET tkl_flash_write(uint32_t addr, const uint8_t *src, uint32_t size)
     if (NULL == src || OPRT_OK != jieli_flash_check_range(addr, size)) {
         return OPRT_INVALID_PARM;
     }
+    if (!jieli_flash_is_owned(addr, size)) {
+        return OPRT_INVALID_PARM;
+    }
+    jieli_flash_open_once();
     /* The downloader leaves the flash write-protected; the vendor's own flash
      * example releases it before every write, so do the same here. */
     norflash_ioctl(NULL, IOCTL_SET_WRITE_PROTECT, 0);
@@ -64,9 +109,10 @@ OPERATE_RET tkl_flash_erase(uint32_t addr, uint32_t size)
     uint32_t offset;
 
     if (0U == size || (addr % JIELI_FLASH_BLOCK) != 0U || (size % JIELI_FLASH_BLOCK) != 0U ||
-        OPRT_OK != jieli_flash_check_range(addr, size)) {
+        OPRT_OK != jieli_flash_check_range(addr, size) || !jieli_flash_is_owned(addr, size)) {
         return OPRT_INVALID_PARM;
     }
+    jieli_flash_open_once();
     /* Erase a sector at a time through the norflash ioctl the vendor's own
      * flash example uses. sfc_erase_zone() belongs to the VM path and stalls
      * the chip when it is handed an address outside that area. */

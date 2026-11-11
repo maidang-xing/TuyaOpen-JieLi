@@ -12,9 +12,10 @@
 /* The adapter owns SPI1: the platform strips the vendor board's spi1 node, so
  * this is the only registration of that name.
  *
- * Pins are on port B because port A is already spoken for by the IIC adapter
- * (IIC0 PA4/PA5, IIC1 PA6/PA7, software IIC2 PA2/PA3). WL83 muxes SPI through
- * the crossbar, so any GPIO can carry these signals.
+ * Pins are on port C: port A belongs to the IIC adapter (IIC0 PA4/PA5, IIC1
+ * PA6/PA7, software IIC2 PA2/PA3), and PB4/PB5 are this adapter's UART1
+ * (SDK uart2) pads while PB8..PB13 carry the MCPWM channels. WL83 muxes SPI
+ * through the crossbar, so any GPIO can carry these signals.
  *
  * CS is left unconnected: the vendor driver has no automatic chip-select on a
  * dev_write/dev_read, and the vendor master example drives CS as a plain GPIO
@@ -22,9 +23,9 @@
 SPI1_PLATFORM_DATA_BEGIN(s_spi1_pd)
     .io = {
         .cs_pin  = -1,
-        .di_pin  = IO_PORTB_06,
-        .do_pin  = IO_PORTB_05,
-        .clk_pin = IO_PORTB_04,
+        .di_pin  = IO_PORTC_02,
+        .do_pin  = IO_PORTC_01,
+        .clk_pin = IO_PORTC_00,
         .d2_pin  = -1,
         .d3_pin  = -1,
     },

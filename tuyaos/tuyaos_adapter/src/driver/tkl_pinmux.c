@@ -44,19 +44,45 @@ static int tkl_pinmux_pin_exists(uint32_t pin, TUYA_PIN_FUNC_E pin_func)
 static gpio_function_t s_pin_fn[TKL_PINMUX_PIN_MAX];
 static u8 s_pin_claimed[TKL_PINMUX_PIN_MAX];
 
-/* SPI1 pins requested through tkl_io_pinmux_config(). Unlike the other
+/* SPI pins requested through tkl_io_pinmux_config(). Unlike the other
  * functions these are not enabled here: the vendor SPI driver muxes its own
  * pins inside dev_open(), so the request is held until tkl_spi_init() can put
  * it into the platform data first. */
-static uint32_t s_spi1_clk_pin = UINT32_MAX;
-static uint32_t s_spi1_do_pin = UINT32_MAX;
-static uint32_t s_spi1_di_pin = UINT32_MAX;
+#define JIELI_SPI_PORTS 3u
+#define JIELI_SPI_CLK   0u
+#define JIELI_SPI_DO    1u
+#define JIELI_SPI_DI    2u
 
-void jieli_pinmux_spi1_pins_get(uint32_t *clk_pin, uint32_t *do_pin, uint32_t *di_pin)
+static uint32_t s_spi_pins[JIELI_SPI_PORTS][3] = {
+    {UINT32_MAX, UINT32_MAX, UINT32_MAX},
+    {UINT32_MAX, UINT32_MAX, UINT32_MAX},
+    {UINT32_MAX, UINT32_MAX, UINT32_MAX},
+};
+
+void jieli_pinmux_spi_pins_get(TUYA_SPI_NUM_E port, uint32_t *clk_pin, uint32_t *do_pin, uint32_t *di_pin)
 {
-    if (clk_pin != NULL) *clk_pin = s_spi1_clk_pin;
-    if (do_pin != NULL) *do_pin = s_spi1_do_pin;
-    if (di_pin != NULL) *di_pin = s_spi1_di_pin;
+    if ((uint32_t)port >= JIELI_SPI_PORTS) {
+        return;
+    }
+    if (clk_pin != NULL) *clk_pin = s_spi_pins[port][JIELI_SPI_CLK];
+    if (do_pin != NULL) *do_pin = s_spi_pins[port][JIELI_SPI_DO];
+    if (di_pin != NULL) *di_pin = s_spi_pins[port][JIELI_SPI_DI];
+}
+
+static int jieli_spi_pin_index(TUYA_PIN_FUNC_E pin_func, uint32_t *port, uint32_t *index)
+{
+    switch (pin_func) {
+    case TUYA_SPI0_CLK:  *port = 0u; *index = JIELI_SPI_CLK; return 0;
+    case TUYA_SPI0_MOSI: *port = 0u; *index = JIELI_SPI_DO; return 0;
+    case TUYA_SPI0_MISO: *port = 0u; *index = JIELI_SPI_DI; return 0;
+    case TUYA_SPI1_CLK:  *port = 1u; *index = JIELI_SPI_CLK; return 0;
+    case TUYA_SPI1_MOSI: *port = 1u; *index = JIELI_SPI_DO; return 0;
+    case TUYA_SPI1_MISO: *port = 1u; *index = JIELI_SPI_DI; return 0;
+    case TUYA_SPI2_CLK:  *port = 2u; *index = JIELI_SPI_CLK; return 0;
+    case TUYA_SPI2_MOSI: *port = 2u; *index = JIELI_SPI_DO; return 0;
+    case TUYA_SPI2_MISO: *port = 2u; *index = JIELI_SPI_DI; return 0;
+    default: return -1;
+    }
 }
 
 static int tkl_pinmux_lookup(TUYA_PIN_FUNC_E pin_func, gpio_function_t *fn)
@@ -81,12 +107,17 @@ static int tkl_pinmux_lookup(TUYA_PIN_FUNC_E pin_func, gpio_function_t *fn)
      * ports must not claim a WL83 function without a matching device route. */
 
     /* SPI clock and data lines. The SDK names the data pins DA0/DA1 in the
-     * same order as d2/d3 below them, so DA0 is DI and DA1 is DO. */
+     * same order as d2/d3 below them, so DA0 is DI and DA1 is DO. The request
+     * path above records them for the driver instead of muxing here. */
     case TUYA_SPI0_CLK: *fn = GPIO_FUNC_SPI0_CLK; return 0;
+    case TUYA_SPI0_MISO: *fn = GPIO_FUNC_SPI0_DA0; return 0;
+    case TUYA_SPI0_MOSI: *fn = GPIO_FUNC_SPI0_DA1; return 0;
     case TUYA_SPI1_CLK: *fn = GPIO_FUNC_SPI1_CLK; return 0;
     case TUYA_SPI1_MISO: *fn = GPIO_FUNC_SPI1_DA0; return 0;
     case TUYA_SPI1_MOSI: *fn = GPIO_FUNC_SPI1_DA1; return 0;
     case TUYA_SPI2_CLK: *fn = GPIO_FUNC_SPI2_CLK; return 0;
+    case TUYA_SPI2_MISO: *fn = GPIO_FUNC_SPI2_DA0; return 0;
+    case TUYA_SPI2_MOSI: *fn = GPIO_FUNC_SPI2_DA1; return 0;
 
     /* ADC - the vendor has a single GPADC function and the pin itself picks
      * the channel, so every Tuya ADC index maps to the same selector. */
@@ -393,6 +424,8 @@ static OPERATE_RET tkl_io_pinmux_config_unlocked(TUYA_PIN_NAME_E pin, TUYA_PIN_F
 #if defined(JIELI_SELECTED_CHIP_WL83)
     {
         gpio_function_t fn;
+        uint32_t spi_port = 0u;
+        uint32_t spi_index = 0u;
 
         /* TUYA_GPIO releases a previously claimed peripheral function. */
         if (pin_func == TUYA_GPIO) {
@@ -406,14 +439,8 @@ static OPERATE_RET tkl_io_pinmux_config_unlocked(TUYA_PIN_NAME_E pin, TUYA_PIN_F
             return OPRT_OK;
         }
 
-        if (pin_func == TUYA_SPI1_CLK || pin_func == TUYA_SPI1_MISO || pin_func == TUYA_SPI1_MOSI) {
-            if (pin_func == TUYA_SPI1_CLK) {
-                s_spi1_clk_pin = (uint32_t)pin;
-            } else if (pin_func == TUYA_SPI1_MISO) {
-                s_spi1_di_pin = (uint32_t)pin;
-            } else {
-                s_spi1_do_pin = (uint32_t)pin;
-            }
+        if (jieli_spi_pin_index(pin_func, &spi_port, &spi_index) == 0) {
+            s_spi_pins[spi_port][spi_index] = (uint32_t)pin;
             return OPRT_OK;
         }
 

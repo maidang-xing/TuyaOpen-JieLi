@@ -10,10 +10,19 @@
 #include "asm/gpio.h"
 #include "jieli_pinmux_internal.h"
 
-/* The board states its SPI1 pins once, in its Kconfig; the platform stages
+/* The board states its SPI pins once, in its Kconfig; the platform stages
  * them into tuya_board_periph_config.h, which is force-included into every
  * object of the build. The defaults below only matter for a board that
  * declares nothing (or a build that bypasses the platform staging). */
+#ifndef TUYA_BOARD_SPI0_CLK_PIN
+#define TUYA_BOARD_SPI0_CLK_PIN IO_PORTC_03
+#endif
+#ifndef TUYA_BOARD_SPI0_DO_PIN
+#define TUYA_BOARD_SPI0_DO_PIN IO_PORTC_04
+#endif
+#ifndef TUYA_BOARD_SPI0_DI_PIN
+#define TUYA_BOARD_SPI0_DI_PIN IO_PORTC_05
+#endif
 #ifndef TUYA_BOARD_SPI1_CLK_PIN
 #define TUYA_BOARD_SPI1_CLK_PIN IO_PORTC_00
 #endif
@@ -23,20 +32,50 @@
 #ifndef TUYA_BOARD_SPI1_DI_PIN
 #define TUYA_BOARD_SPI1_DI_PIN IO_PORTC_02
 #endif
+#ifndef TUYA_BOARD_SPI2_CLK_PIN
+#define TUYA_BOARD_SPI2_CLK_PIN IO_PORTD_02
+#endif
+#ifndef TUYA_BOARD_SPI2_DO_PIN
+#define TUYA_BOARD_SPI2_DO_PIN IO_PORTD_03
+#endif
+#ifndef TUYA_BOARD_SPI2_DI_PIN
+#define TUYA_BOARD_SPI2_DI_PIN IO_PORTD_04
+#endif
 
-/* The adapter owns SPI1: the platform strips the vendor board's spi1 node, so
- * this is the only registration of that name.
+/* The adapter owns all three controllers: the platform strips the vendor
+ * board's spi nodes, so these are the only registrations of those names.
  *
  * The pins come from the board header and can be moved at run time with
- * tkl_io_pinmux_config(pin, TUYA_SPI1_CLK/MOSI/MISO) before the first
+ * tkl_io_pinmux_config(pin, TUYA_SPIn_CLK/MOSI/MISO) before the first
  * tkl_spi_init(): the vendor driver latches whatever is in this struct at
  * dev_open(), so the request has to be in place by then. Port A holds the IIC
  * adapter's pins, PB4/PB5 are this adapter's UART1 pads and PB8..PB13 carry
- * the MCPWM channels, which is why the board default is port C.
+ * the MCPWM channels, which is why the board defaults avoid them.
  *
  * CS is left unconnected: the vendor driver has no automatic chip-select on a
  * dev_write/dev_read, and the vendor master example drives CS as a plain GPIO
  * around each transfer. tkl_spi_send/tkl_spi_recv keep the same contract. */
+static struct spi_platform_data s_spi0_pd = {
+    .io = {
+        .cs_pin  = -1,
+        .di_pin  = TUYA_BOARD_SPI0_DI_PIN,
+        .do_pin  = TUYA_BOARD_SPI0_DO_PIN,
+        .clk_pin = TUYA_BOARD_SPI0_CLK_PIN,
+        .d2_pin  = -1,
+        .d3_pin  = -1,
+    },
+    .clk                = 1000000,
+    .mode               = SPI_STD_MODE,
+    .priority           = 6,
+    .cpu_id             = 1,
+    .hd_level           = 0,
+    .attr               = SPI_SCLK_L_UPL_SMPH,
+    .role               = SPI_MODE_MASTER,
+    .sync_wait_timeout  = 1000,
+    .irq                = IRQ_SPI0_IDX,
+    .reg                = JL_SPI0,
+};
+
 static struct spi_platform_data s_spi1_pd = {
     .io = {
         .cs_pin  = -1,
@@ -58,18 +97,49 @@ static struct spi_platform_data s_spi1_pd = {
     .reg                = JL_SPI1,
 };
 
-/* Fold in whatever tkl_io_pinmux_config() recorded. Must run before dev_open()
- * because that is where the vendor driver muxes the pins. */
-static void jieli_spi1_apply_requested_pins(void)
+static struct spi_platform_data s_spi2_pd = {
+    .io = {
+        .cs_pin  = -1,
+        .di_pin  = TUYA_BOARD_SPI2_DI_PIN,
+        .do_pin  = TUYA_BOARD_SPI2_DO_PIN,
+        .clk_pin = TUYA_BOARD_SPI2_CLK_PIN,
+        .d2_pin  = -1,
+        .d3_pin  = -1,
+    },
+    .clk                = 1000000,
+    .mode               = SPI_STD_MODE,
+    .priority           = 6,
+    .cpu_id             = 1,
+    .hd_level           = 0,
+    .attr               = SPI_SCLK_L_UPL_SMPH,
+    .role               = SPI_MODE_MASTER,
+    .sync_wait_timeout  = 1000,
+    .irq                = IRQ_SPI2_IDX,
+    .reg                = JL_SPI2,
+};
+
+REGISTER_DEVICE(spi0_node) = { "spi0", &spi_dev_ops, (void *)&s_spi0_pd };
+REGISTER_DEVICE(spi2_node) = { "spi2", &spi_dev_ops, (void *)&s_spi2_pd };
+
+static struct spi_platform_data *s_spi_pd[3] = {&s_spi0_pd, &s_spi1_pd, &s_spi2_pd};
+
+/* Fold in whatever tkl_io_pinmux_config() recorded for this port. Must run
+ * before dev_open() because that is where the vendor driver muxes the pins. */
+static void jieli_spi_apply_requested_pins(TUYA_SPI_NUM_E port)
 {
     uint32_t clk_pin;
     uint32_t do_pin;
     uint32_t di_pin;
+    struct spi_platform_data *pd;
 
-    jieli_pinmux_spi1_pins_get(&clk_pin, &do_pin, &di_pin);
-    if (clk_pin != UINT32_MAX) s_spi1_pd.io.clk_pin = (int)clk_pin;
-    if (do_pin != UINT32_MAX) s_spi1_pd.io.do_pin = (int)do_pin;
-    if (di_pin != UINT32_MAX) s_spi1_pd.io.di_pin = (int)di_pin;
+    if ((uint32_t)port >= sizeof(s_spi_pd) / sizeof(s_spi_pd[0])) {
+        return;
+    }
+    pd = s_spi_pd[port];
+    jieli_pinmux_spi_pins_get(port, &clk_pin, &do_pin, &di_pin);
+    if (clk_pin != UINT32_MAX) pd->io.clk_pin = (int)clk_pin;
+    if (do_pin != UINT32_MAX) pd->io.do_pin = (int)do_pin;
+    if (di_pin != UINT32_MAX) pd->io.di_pin = (int)di_pin;
 }
 #else
 
@@ -292,9 +362,7 @@ OPERATE_RET tkl_spi_init(TUYA_SPI_NUM_E port, const TUYA_SPI_BASE_CFG_T *cfg){
 
     if (s_spi_handles[port] == NULL) {
 #if defined(JIELI_SELECTED_CHIP_WL83)
-        if (port == TUYA_SPI_NUM_1) {
-            jieli_spi1_apply_requested_pins();
-        }
+        jieli_spi_apply_requested_pins(port);
 #endif
         s_spi_handles[port] = dev_open((char *)jieli_spi_device_name(port), NULL);
         if (s_spi_handles[port] == NULL) {

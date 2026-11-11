@@ -93,12 +93,34 @@ SPI1_PLATFORM_DATA_BEGIN(s_spi1_pd)
     .attr   = SPI_SCLK_L_UPH_SMPH | SPI_BIDIR_MODE,
 SPI1_PLATFORM_DATA_END()
 #define JIELI_WL82_SPI1_BAUDRATE 1000000u
+
+/* SPI0 and SPI2 are the other two controllers WL82 exposes. WL82 has no
+ * per-pin SPI mux: each controller carries a fixed group table in asm/spi.h and
+ * `port` picks the group. The defaults below are the groups this board can
+ * actually use, and jieli_wl82_spi_pinmux_select() moves a controller to
+ * another group before it is opened. */
+SPI0_PLATFORM_DATA_BEGIN(s_spi0_pd)
+    .clk    = 1000000,
+    .mode   = SPI_STD_MODE,
+    .port   = 'B',
+    .attr   = SPI_SCLK_L_UPH_SMPH | SPI_BIDIR_MODE,
+SPI0_PLATFORM_DATA_END()
+REGISTER_DEVICE(spi0_node) = { "spi0", &spi_dev_ops, (void *)&s_spi0_pd };
+
+SPI2_PLATFORM_DATA_BEGIN(s_spi2_pd)
+    .clk    = 1000000,
+    .mode   = SPI_STD_MODE,
+    .port   = 'A',
+    .attr   = SPI_SCLK_L_UPH_SMPH | SPI_BIDIR_MODE,
+SPI2_PLATFORM_DATA_END()
+REGISTER_DEVICE(spi2_node) = { "spi2", &spi_dev_ops, (void *)&s_spi2_pd };
 #endif
 
 REGISTER_DEVICE(spi1_node) = { "spi1", &spi_dev_ops, (void *)&s_spi1_pd };
 
-/* Only SPI1 has a node. SPI0/SPI2 stay in the port table so a caller asking
- * for them gets OPRT_NOT_SUPPORTED from dev_open rather than a wrong bus. */
+/* WL82 registers SPI0/1/2 itself; WL83 only has SPI1. A port with no node still
+ * stays in the table so a caller asking for it gets OPRT_NOT_SUPPORTED from
+ * dev_open rather than a wrong bus. */
 #define TKL_SPI_PORT_MAX 3
 
 static void *s_spi_handles[TKL_SPI_PORT_MAX];

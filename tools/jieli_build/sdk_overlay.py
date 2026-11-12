@@ -24,10 +24,12 @@ from typing import Iterable, Mapping, Optional
 
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
-    configure_audio_board, configure_board_memory, configure_flash_reserved_area,
+    configure_audio_board, configure_board_memory, configure_dual_bank_app_config,
+    configure_flash_reserved_area,
     configure_full_stack_app_config, configure_full_stack_board, configure_lcd_app_config,
     configure_lcd_board, configure_lcd_board_header, configure_log_uart_baudrate,
-    configure_log_uart_block, configure_lowpower, configure_service_uart,
+    configure_log_uart_block, configure_lowpower, configure_peripheral_header,
+    configure_service_uart,
     configure_usb_download_app_config, configure_usb_download_board,
     configure_usb_download_board_header,
 )
@@ -189,6 +191,15 @@ def remove_vendor_spi1_registration(content: str) -> str:
             "Expected exactly one vendor TCFG_SPI1_ENABLE spi1 device registration; "
             f"found {count}"
         )
+    # spi2 only appears when a project turns TCFG_SPI2_ENABLE on; the adapter
+    # registers that name too, so drop it when it is there.
+    pattern = re.compile(
+        r"(?m)^#if[ \t]+TCFG_SPI2_ENABLE\r?\n"
+        r"[ \t]*\{[ \t]*\"spi2\",[ \t]*&spi_dev_ops,[ \t]*"
+        r"\(void \*\)&spi2_data[ \t]*\},[ \t]*\r?\n"
+        r"#endif(?:[ \t]*//[^\r\n]*)?\r?\n?"
+    )
+    updated = pattern.sub("", updated)
     return updated
 
 
@@ -230,6 +241,26 @@ def remove_vendor_uart2_registration(content: str) -> str:
     if count != 1:
         raise BuildError(
             "Expected exactly one vendor TCFG_UART2_ENABLE uart2 device registration; "
+            f"found {count}"
+        )
+    return updated
+
+
+def remove_vendor_wl82_uart2_registration(content: str) -> str:
+    """Remove the WL82 demo board's uart2 node so the adapter owns its name.
+
+    That board registers uart2 on the debug console's PB3 with no RX, so the
+    name was unusable as a second port. The adapter registers uart2 itself with
+    the pins the board's Kconfig declares.
+    """
+    pattern = re.compile(
+        r"(?m)^[ \t]*\{[ \t]*\"uart2\",[ \t]*&uart_dev_ops,[ \t]*"
+        r"\(void[ \t]*\*\)[ \t]*&uart2_data[ \t]*\},[ \t]*\r?\n"
+    )
+    updated, count = pattern.subn("", content)
+    if count != 1:
+        raise BuildError(
+            "Expected exactly one vendor uart2 device registration in the WL82 demo board; "
             f"found {count}"
         )
     return updated
@@ -510,6 +541,49 @@ def _staged_vendor_fingerprint(vendor_root: Path, chip) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def peripheral_pin_digest(config_values: Optional[Mapping[str, str]]) -> str:
+    """Join every board symbol the staging hooks write into staged bytes.
+
+    These are not part of BoardFacts (that covers the board's own hardware
+    facts), but staging bakes them into the generated peripheral header and
+    into the vendor app config, so each one has to force a restage when it
+    moves.
+    """
+    if config_values is None:
+        return ""
+    symbols = (
+        "CONFIG_JIELI_BOARD_DUAL_BANK",
+        "CONFIG_JIELI_BOARD_UART1_ENABLE",
+        "CONFIG_JIELI_BOARD_SPI0_CLK_PIN",
+        "CONFIG_JIELI_BOARD_SPI0_DO_PIN",
+        "CONFIG_JIELI_BOARD_SPI0_DI_PIN",
+        "CONFIG_JIELI_BOARD_SPI1_CLK_PIN",
+        "CONFIG_JIELI_BOARD_SPI1_DO_PIN",
+        "CONFIG_JIELI_BOARD_SPI1_DI_PIN",
+        "CONFIG_JIELI_BOARD_SPI2_CLK_PIN",
+        "CONFIG_JIELI_BOARD_SPI2_DO_PIN",
+        "CONFIG_JIELI_BOARD_SPI2_DI_PIN",
+        "CONFIG_JIELI_BOARD_UART1_TX_PIN",
+        "CONFIG_JIELI_BOARD_UART1_RX_PIN",
+        "CONFIG_JIELI_BOARD_PWM0_H_PIN",
+        "CONFIG_JIELI_BOARD_PWM0_L_PIN",
+        "CONFIG_JIELI_BOARD_PWM1_H_PIN",
+        "CONFIG_JIELI_BOARD_PWM1_L_PIN",
+        "CONFIG_JIELI_BOARD_PWM2_H_PIN",
+        "CONFIG_JIELI_BOARD_PWM2_L_PIN",
+        "CONFIG_JIELI_BOARD_PWM3_H_PIN",
+        "CONFIG_JIELI_BOARD_PWM3_L_PIN",
+        "CONFIG_JIELI_BOARD_PWM0_PIN",
+        "CONFIG_JIELI_BOARD_IIC0_SCL_PIN",
+        "CONFIG_JIELI_BOARD_IIC0_SDA_PIN",
+        "CONFIG_JIELI_BOARD_IIC1_SCL_PIN",
+        "CONFIG_JIELI_BOARD_IIC1_SDA_PIN",
+        "CONFIG_JIELI_BOARD_IIC2_SCL_PIN",
+        "CONFIG_JIELI_BOARD_IIC2_SDA_PIN",
+    )
+    return ",".join(f"{name}={str(config_values.get(name, '')).strip()}" for name in symbols)
+
+
 def staging_input_components(
     *,
     sdk_root: Path,
@@ -526,6 +600,7 @@ def staging_input_components(
     uart_log_baudrate: int,
     adapter_source_selection: str = "",
     usb_cdc_log: str = "n",
+    peripheral_pins: str = "",
 ) -> dict[str, str]:
     """Name every input the staged bytes depend on, one digest each.
 
@@ -554,6 +629,9 @@ def staging_input_components(
         "adapter_sources": adapter_source_selection,
         # Written into the staged USB board header, so it is staged bytes.
         "usb_cdc_log": usb_cdc_log,
+        # Pin facts the board declares for the adapters; they land in the
+        # generated peripheral header, so a change must restage.
+        "peripheral_pins": peripheral_pins,
         "audio_config": _file_digest(audio_config_source),
         # The staging hooks themselves. An edit to any of them can change the
         # staged bytes without changing any other input.
@@ -794,6 +872,7 @@ def create_staging_tree(
         uart_log_baudrate=uart_log_baudrate,
         adapter_source_selection="\n".join(adapter_sources),
         usb_cdc_log="y" if usb_cdc_log else "n",
+        peripheral_pins=peripheral_pin_digest(config_values),
     )
     if staging_tree_is_current(staging_root, staging_input_digest(**components)):
         return staging_root / "build"
@@ -847,6 +926,7 @@ def create_staging_tree(
     )
     configure_full_stack_board(board_file, reference_board_file)
     configure_full_stack_app_config(app_config_file)
+    configure_dual_bank_app_config(app_config_file, config_values)
     configure_flash_reserved_area(
         source_overlay_root / "cpu" / chip.cpu / "tools" / "isd_config_rule.c",
         platform_root / "tuyaos" / "tuyaos_adapter" / "src" / "driver" / "tkl_flash.c",
@@ -868,6 +948,7 @@ def create_staging_tree(
             configure_lcd_board(board_file)
     else:
         configure_usb_download_app_config(app_config_file, usb_cdc_log)
+    configure_peripheral_header(board_file, config_values)
     if profile is not None and profile.board_declarations:
         configure_audio_board(board_file, audio_config_source, profile)
     if chip.name == "wl83":
@@ -876,6 +957,15 @@ def create_staging_tree(
         board_content = remove_vendor_iic1_registration(board_content)
         board_content = remove_vendor_uart2_registration(board_content)
         write_staged_text(board_file, board_content)
+    else:
+        uart1_enabled = (
+            str((config_values or {}).get("CONFIG_JIELI_BOARD_UART1_ENABLE", "")).strip()
+            in TRUTHY
+        )
+        if uart1_enabled:
+            board_content = board_file.read_text(encoding="utf-8")
+            board_content = remove_vendor_wl82_uart2_registration(board_content)
+            write_staged_text(board_file, board_content)
     shutil.copytree(
         platform_root / "tuyaos" / "entry",
         source_overlay_root / "tuyaos" / "entry",
@@ -999,6 +1089,14 @@ def create_staging_tree(
     if chip.name == "wl82" and board_name == "AC79_DevKitBoard":
         content += "DEFINES += -DJIELI_AC79_DEVKIT_BOARD=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
+    # The board's peripheral pins come from its Kconfig through a generated
+    # header next to board.c, so the adapter has one source of truth for them.
+    board_relative = chip.board_build_relative.as_posix()
+    content += (
+        "CFLAGS += -include ../../../../../"
+        + board_relative
+        + "/tuya_board_periph_config.h\n"
+    )
     content += "DEFINES += " + " ".join(
         "-D" + define for define in feature_defines(features)
     ) + "\n"
@@ -1034,6 +1132,10 @@ def create_staging_tree(
     for library in link_libraries(chip.name, features):
         content += f"    {liba}/{library} \\\n"
     content += "    --end-group\n"
+    # The two TuyaOpen archives live outside the staged SDK tree, so the vendor
+    # "$(OUT_ELF): $(OBJS)" rule never sees them change and an app-only edit
+    # leaves the image one build behind. Declare them as extra prerequisites.
+    content += f"$(OUT_ELF): {tuya_lib_dir_make}/libtuyaapp.a {tuya_lib_dir_make}/libtuyaos.a\n"
     if header_dir is not None:
         content += f"INCLUDES += -I{_make_path(header_dir)}\n"
     write_staged_text(makefile, content)

@@ -50,6 +50,13 @@ const struct task_info task_info_table[] = {
 #endif
     { "usb_msd1", 1, 512, 128 },
 #endif
+#ifdef CONFIG_DOUBLE_BANK_ENABLE
+    /* tkl_ota drives the vendor dual-bank engine, and
+     * dual_bank_passive_update_init() creates this task by name; without the
+     * row task_create() fails and OTA start returns -112. The vendor
+     * application profiles all declare it. */
+    { "dw_update", 21, 512, 32 },
+#endif
     { 0, 0, 0, 0 },
 };
 

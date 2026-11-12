@@ -10,13 +10,45 @@
 #include "asm/pwm.h"
 #include "asm/gpio.h"
 
-/* WL83 board remap: MCPWM CH1 is assigned PA8/PA10 in software. The vendor
- * example uses those pins for CH2; this CH1 remap is not hardware-verified. */
+/* WL83 board remap: the four MCPWM channels get a complementary H/L pin pair
+ * each. The pins come from the board's Kconfig through the generated
+ * tuya_board_periph_config.h; the defaults below only apply to a board that
+ * declares nothing. CH1 keeps PA8/PA10, which is where this adapter has always
+ * carried it. */
+#ifndef TUYA_BOARD_PWM0_H_PIN
+#define TUYA_BOARD_PWM0_H_PIN IO_PORTB_08
+#endif
+#ifndef TUYA_BOARD_PWM0_L_PIN
+#define TUYA_BOARD_PWM0_L_PIN IO_PORTB_09
+#endif
+#ifndef TUYA_BOARD_PWM1_H_PIN
+#define TUYA_BOARD_PWM1_H_PIN IO_PORTA_08
+#endif
+#ifndef TUYA_BOARD_PWM1_L_PIN
+#define TUYA_BOARD_PWM1_L_PIN IO_PORTA_10
+#endif
+#ifndef TUYA_BOARD_PWM2_H_PIN
+#define TUYA_BOARD_PWM2_H_PIN IO_PORTB_10
+#endif
+#ifndef TUYA_BOARD_PWM2_L_PIN
+#define TUYA_BOARD_PWM2_L_PIN IO_PORTB_11
+#endif
+#ifndef TUYA_BOARD_PWM3_H_PIN
+#define TUYA_BOARD_PWM3_H_PIN IO_PORTB_12
+#endif
+#ifndef TUYA_BOARD_PWM3_L_PIN
+#define TUYA_BOARD_PWM3_L_PIN IO_PORTB_13
+#endif
+
 static struct pwm_platform_data s_pwm1_pd = {
     .timer_pwm_port = { -1, -1, -1, -1 },
     .mcpwm_port = {
-        -1, IO_PORTA_08, -1, -1,
-        -1, IO_PORTA_10, -1, -1,
+        /* MCPWM0H .. MCPWM3H */
+        TUYA_BOARD_PWM0_H_PIN, TUYA_BOARD_PWM1_H_PIN,
+        TUYA_BOARD_PWM2_H_PIN, TUYA_BOARD_PWM3_H_PIN,
+        /* MCPWM0L .. MCPWM3L */
+        TUYA_BOARD_PWM0_L_PIN, TUYA_BOARD_PWM1_L_PIN,
+        TUYA_BOARD_PWM2_L_PIN, TUYA_BOARD_PWM3_L_PIN,
     },
     .pwm_config = {
         .pwm_ch = PWMCH1_H | PWMCH1_L,
@@ -29,6 +61,10 @@ static struct pwm_platform_data s_pwm1_pd = {
     .hd_level = GPIO_DRIVE_STRENGTH_2p5mA,
 };
 REGISTER_DEVICE(pwm1_node) = { "pwm1", &pwm_dev_ops, &s_pwm1_pd };
+
+/* Only the channels in pwm_ch get their pins muxed by dev_open(); the others
+ * are added (and removed again) at run time. */
+static u8 s_pwm_added[MCPWM_MAX_NUM];
 #else
 /* WL82 asm/pwm.h pulls vendor filesystem declarations that conflict with
  * libc. Define its public _IOW('P', n, u32) command encoding locally instead:
@@ -55,8 +91,22 @@ REGISTER_DEVICE(pwm1_node) = { "pwm1", &pwm_dev_ops, &s_pwm1_pd };
 #define PWMCH2_L          (1U << (PWM_CHL_OFFSET + 2))
 #define PWMCH3_L          (1U << (PWM_CHL_OFFSET + 3))
 
-/* WL82 PWM uses TIMER2 output channels 2/3, not MCPWM. The TKL mapping in
- * this adapter only supports MCPWM, so WL82 intentionally registers no pwm1. */
+/* WL82 PWM runs on TIMER2/TIMER3 output channels, not MCPWM. A timer output
+ * takes one pin and one channel per device, so the adapter registers pwm1 with
+ * TIMER2 on the pin the board declares (PH2 by default, which is what the
+ * vendor DevKitBoard uses for its own PWM sample). TKL PWM0 is that single
+ * channel; it is not a complementary pair, so only the forward direction
+ * exists. */
+#include "asm/gpio.h"
+
+/* asm/pwm.h is not includable here (it pulls vendor filesystem declarations
+ * that conflict with libc), so its channel bit is spelled out: TIME_PWM_OFFSET
+ * is 20 and TIMER2 is the first timer output. */
+#define PWM_TIMER2_OPCH2  (1U << 20)
+
+#ifndef TUYA_BOARD_PWM0_PIN
+#define TUYA_BOARD_PWM0_PIN IO_PORTH_02
+#endif
 
 typedef struct {
     uint32_t con;
@@ -81,6 +131,21 @@ struct pwm_platform_data {
     uint32_t pwm_ch;
     uint32_t freq;
 };
+
+extern const struct device_operations pwm_dev_ops;
+
+static const struct pwm_platform_data s_pwm1_pd = {
+    .treg = NULL,
+    .creg = NULL,
+    .duty = 50.0f,
+    .deathtime = 0u,
+    .point_bit = 0u,
+    .port = TUYA_BOARD_PWM0_PIN,
+    .pwm_ch = PWM_TIMER2_OPCH2,
+    .freq = 1000u,
+};
+REGISTER_DEVICE(pwm1_node) = { "pwm1", &pwm_dev_ops, (void *)&s_pwm1_pd };
+#define JIELI_WL82_PWM_PORT TUYA_BOARD_PWM0_PIN
 #endif
 
 /* PWM, built on each chip's `pwm1` device.
@@ -100,21 +165,33 @@ struct pwm_platform_data {
  *         board level in the remap tables, so a channel with no declared pin
  *         cannot be driven.
  *
- * WL83 registers MCPWM CH1 at PA8/PA10 below. WL82 has no compatible MCPWM
- * route and intentionally registers no PWM device in this adapter.
+ * WL83 registers MCPWM CH0-CH3 below. WL82 registers MCPWM's alternative:
+ * TIMER2 output on a single pin, because that is the only PWM route in the
+ * AC791 SDK that is not shared with another peripheral's output channel.
  */
 static void *s_pwm_handle;
 static TUYA_PWM_BASE_CFG_T s_pwm_cfg[TUYA_PWM_NUM_MAX];
 static uint8_t s_pwm_inited[TUYA_PWM_NUM_MAX];
 static uint8_t s_pwm_running[TUYA_PWM_NUM_MAX];
 
-/* Only the channel groups each chip exposes: four complementary pairs. The TKL
- * enum goes to eleven, so the tail is refused rather than mapped to a channel
- * the vendor has no register for. */
+/* Only the channel groups each chip exposes: four complementary pairs on WL83,
+ * one timer output on WL82. The TKL enum goes to eleven, so the tail is refused
+ * rather than mapped to a channel the vendor has no register for. */
 #define TKL_PWM_MAX_CHANNEL 4u
+
+/* TUYA_PWM_BASE_CFG_T defines duty as one part of cycle. Callers that leave
+ * cycle at zero are using the 0-10000 scale several of the shared examples are
+ * written in, so zero means 10000 rather than an invalid period. */
+#define JIELI_PWM_DEFAULT_CYCLE 10000u
+
+static uint32_t jieli_pwm_cycle(const TUYA_PWM_BASE_CFG_T *cfg)
+{
+    return cfg->cycle != 0u ? cfg->cycle : JIELI_PWM_DEFAULT_CYCLE;
+}
 
 static uint32_t jieli_pwm_channel_bit(TUYA_PWM_NUM_E ch_id)
 {
+#if defined(JIELI_SELECTED_CHIP_WL83)
     switch (ch_id) {
     case TUYA_PWM_NUM_0: return PWMCH0_H | PWMCH0_L;
     case TUYA_PWM_NUM_1: return PWMCH1_H | PWMCH1_L;
@@ -122,6 +199,10 @@ static uint32_t jieli_pwm_channel_bit(TUYA_PWM_NUM_E ch_id)
     case TUYA_PWM_NUM_3: return PWMCH3_H | PWMCH3_L;
     default:             return 0u;
     }
+#else
+    /* WL82 exposes a single timer output; there is no H/L pair to select. */
+    return ch_id == TUYA_PWM_NUM_0 ? PWM_TIMER2_OPCH2 : 0u;
+#endif
 }
 
 static int jieli_pwm_valid(TUYA_PWM_NUM_E ch_id)
@@ -135,16 +216,15 @@ static int jieli_pwm_valid(TUYA_PWM_NUM_E ch_id)
 static int jieli_pwm_channel_has_pins(TUYA_PWM_NUM_E ch_id)
 {
 #if defined(JIELI_SELECTED_CHIP_WL83)
-    return ch_id == TUYA_PWM_NUM_1;
+    return ch_id < TKL_PWM_MAX_CHANNEL;
 #else
-    (void)ch_id;
-    return 0;
+    return ch_id == TUYA_PWM_NUM_0;
 #endif
 }
 
 static OPERATE_RET jieli_pwm_cfg_validate(const TUYA_PWM_BASE_CFG_T *cfg)
 {
-    if (cfg == NULL || cfg->frequency == 0u || cfg->cycle == 0u || cfg->duty > cfg->cycle) {
+    if (cfg == NULL || cfg->frequency == 0u || cfg->duty > jieli_pwm_cycle(cfg)) {
         return OPRT_INVALID_PARM;
     }
     if (cfg->count_mode != TUYA_PWM_CNT_UP) {
@@ -153,6 +233,13 @@ static OPERATE_RET jieli_pwm_cfg_validate(const TUYA_PWM_BASE_CFG_T *cfg)
     if (cfg->polarity != TUYA_PWM_POSITIVE && cfg->polarity != TUYA_PWM_NEGATIVE) {
         return OPRT_INVALID_PARM;
     }
+#if !defined(JIELI_SELECTED_CHIP_WL83)
+    /* The WL82 timer output has no inversion: the driver accepts REVDIRC for
+     * it and changes nothing. */
+    if (cfg->polarity == TUYA_PWM_NEGATIVE) {
+        return OPRT_NOT_SUPPORTED;
+    }
+#endif
     return OPRT_OK;
 }
 
@@ -164,12 +251,8 @@ static OPERATE_RET jieli_pwm_cfg_validate(const TUYA_PWM_BASE_CFG_T *cfg)
 static void jieli_pwm_duty_percent(const TUYA_PWM_BASE_CFG_T *cfg, float *duty, uint8_t *point_bit)
 {
     uint32_t freq = cfg->frequency;
+    uint32_t cycle = jieli_pwm_cycle(cfg);
 
-    if (cfg->cycle == 0u) {
-        *duty = 0.0f;
-        *point_bit = 0u;
-        return;
-    }
     if (freq != 0u && freq <= 4000u) {
         *point_bit = 2u;
     } else if (freq != 0u && freq <= 40000u) {
@@ -177,8 +260,31 @@ static void jieli_pwm_duty_percent(const TUYA_PWM_BASE_CFG_T *cfg, float *duty, 
     } else {
         *point_bit = 0u;
     }
-    *duty = (float)((double)cfg->duty * 100.0 / (double)cfg->cycle);
+    *duty = (float)((double)cfg->duty * 100.0 / (double)cycle);
 }
+
+#if defined(JIELI_SELECTED_CHIP_WL83)
+/* The add/remove ioctls take the same platform data as the device: the pins of
+ * this one channel, everything else disabled. */
+static void jieli_pwm_channel_pd(TUYA_PWM_NUM_E ch_id, const TUYA_PWM_BASE_CFG_T *cfg,
+                                 struct pwm_platform_data *pd)
+{
+    uint32_t i;
+
+    for (i = 0u; i < TIME_PWM_MAX; i++) {
+        pd->timer_pwm_port[i] = -1;
+    }
+    for (i = 0u; i < MCPWM_MAX_NUM * 2u; i++) {
+        pd->mcpwm_port[i] = (i == (uint32_t)ch_id || i == MCPWM_MAX_NUM + (uint32_t)ch_id)
+                            ? s_pwm1_pd.mcpwm_port[i] : -1;
+    }
+    pd->pwm_config.pwm_ch = jieli_pwm_channel_bit(ch_id);
+    pd->pwm_config.freq = cfg->frequency;
+    pd->pwm_config.deathtime = 0u;
+    jieli_pwm_duty_percent(cfg, &pd->pwm_config.duty, &pd->pwm_config.point_bit);
+    pd->hd_level = s_pwm1_pd.hd_level;
+}
+#endif
 
 /* A failed configure/run sequence may have already changed some registers.
  * Try to leave the channel in a known stopped state before returning the
@@ -215,6 +321,19 @@ OPERATE_RET tkl_pwm_init(TUYA_PWM_NUM_E ch_id, const TUYA_PWM_BASE_CFG_T *cfg)
             return OPRT_NOT_SUPPORTED;
         }
     }
+
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    if (!s_pwm_added[ch_id] &&
+        !(s_pwm1_pd.pwm_config.pwm_ch & jieli_pwm_channel_bit(ch_id))) {
+        struct pwm_platform_data pd;
+
+        jieli_pwm_channel_pd(ch_id, cfg, &pd);
+        if (dev_ioctl(s_pwm_handle, IOCTL_PWM_SET_ADD_CHANNEL, (u32)(uintptr_t)&pd) < 0) {
+            return OPRT_OS_ADAPTER_PWM_INIT_FAILED;
+        }
+        s_pwm_added[ch_id] = 1u;
+    }
+#endif
 
     /* Reinitializing an active channel must stop the old hardware configuration
      * before resetting its software state or replacing the configuration. */
@@ -287,7 +406,7 @@ static OPERATE_RET jieli_pwm_apply(TUYA_PWM_NUM_E ch_id, BOOL_T run)
         pd.duty = duty;
         pd.deathtime = 0u;
         pd.point_bit = point_bit;
-        pd.port = 0u;
+        pd.port = JIELI_WL82_PWM_PORT;
         pd.pwm_ch = jieli_pwm_channel_bit(ch_id);
         pd.freq = cfg->frequency;
         if (pd.freq != 0u) {
@@ -338,6 +457,18 @@ OPERATE_RET tkl_pwm_deinit(TUYA_PWM_NUM_E ch_id)
         }
     }
     if (s_pwm_handle != NULL) {
+#if defined(JIELI_SELECTED_CHIP_WL83)
+        /* A channel added at run time has to be removed before dev_close(). */
+        for (i = 0; i < MCPWM_MAX_NUM; i++) {
+            if (s_pwm_added[i]) {
+                struct pwm_platform_data pd;
+
+                jieli_pwm_channel_pd((TUYA_PWM_NUM_E)i, &s_pwm_cfg[i], &pd);
+                (void)dev_ioctl(s_pwm_handle, IOCTL_PWM_SET_REMOV_CHANNEL, (u32)(uintptr_t)&pd);
+                s_pwm_added[i] = 0u;
+            }
+        }
+#endif
         dev_close(s_pwm_handle);
         s_pwm_handle = NULL;
     }
@@ -373,7 +504,7 @@ OPERATE_RET tkl_pwm_duty_set(TUYA_PWM_NUM_E ch_id, uint32_t duty)
     if (!jieli_pwm_valid(ch_id) || !s_pwm_inited[ch_id]) {
         return OPRT_INVALID_PARM;
     }
-    if (duty > s_pwm_cfg[ch_id].cycle) {
+    if (duty > jieli_pwm_cycle(&s_pwm_cfg[ch_id])) {
         return OPRT_INVALID_PARM;
     }
     {
@@ -429,12 +560,15 @@ OPERATE_RET tkl_pwm_polarity_set(TUYA_PWM_NUM_E ch_id, TUYA_PWM_POLARITY_E polar
     {
         struct pwm_platform_data pd;
 
+        if (polarity == TUYA_PWM_NEGATIVE) {
+            return OPRT_NOT_SUPPORTED;
+        }
         pd.treg = NULL;
         pd.creg = NULL;
         pd.duty = 0.0f;
         pd.deathtime = 0u;
         pd.point_bit = 0u;
-        pd.port = 0u;
+        pd.port = JIELI_WL82_PWM_PORT;
         pd.pwm_ch = jieli_pwm_channel_bit(ch_id);
         pd.freq = 0u;
         if (dev_ioctl(s_pwm_handle,

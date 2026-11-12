@@ -19,11 +19,32 @@
  * devices_init() stalls on that node before the application ever runs - the
  * board then shows neither its panel nor its USB device. Use the vendor macro
  * and state only the fields the board chose. */
+/* Board-declared pins, staged into tuya_board_periph_config.h. The defaults
+ * below only apply to a board that declares nothing. */
+#ifndef TUYA_BOARD_IIC0_SCL_PIN
+#define TUYA_BOARD_IIC0_SCL_PIN IO_PORTA_04
+#endif
+#ifndef TUYA_BOARD_IIC0_SDA_PIN
+#define TUYA_BOARD_IIC0_SDA_PIN IO_PORTA_05
+#endif
+#ifndef TUYA_BOARD_IIC1_SCL_PIN
+#define TUYA_BOARD_IIC1_SCL_PIN IO_PORTA_06
+#endif
+#ifndef TUYA_BOARD_IIC1_SDA_PIN
+#define TUYA_BOARD_IIC1_SDA_PIN IO_PORTA_07
+#endif
+#ifndef TUYA_BOARD_IIC2_SCL_PIN
+#define TUYA_BOARD_IIC2_SCL_PIN IO_PORTA_02
+#endif
+#ifndef TUYA_BOARD_IIC2_SDA_PIN
+#define TUYA_BOARD_IIC2_SDA_PIN IO_PORTA_03
+#endif
+
 HW_IIC1_PLATFORM_DATA_BEGIN(s_iic1_pd)
     .role = IIC_ROLE_MASTER,
     .hd_level = GPIO_DRIVE_STRENGTH_2p5mA,
-    .clk_pin = IO_PORTA_06,
-    .dat_pin = IO_PORTA_07,
+    .clk_pin = TUYA_BOARD_IIC1_SCL_PIN,
+    .dat_pin = TUYA_BOARD_IIC1_SDA_PIN,
     .io_filter = IIC_FILTER_CLOSE,
     .internal_pull_up_enable = 1,
     .fast_resp = 0,
@@ -43,8 +64,8 @@ REGISTER_DEVICE(iic1_node) = { "iic1", &iic_dev_ops, (void *)&s_iic1_pd };
 HW_IIC0_PLATFORM_DATA_BEGIN(s_iic0_pd)
     .role = IIC_ROLE_MASTER,
     .hd_level = GPIO_DRIVE_STRENGTH_2p5mA,
-    .clk_pin = IO_PORTA_04,
-    .dat_pin = IO_PORTA_05,
+    .clk_pin = TUYA_BOARD_IIC0_SCL_PIN,
+    .dat_pin = TUYA_BOARD_IIC0_SDA_PIN,
     .io_filter = 2,
     .internal_pull_up_enable = 1,
     .fast_resp = 0,
@@ -57,8 +78,8 @@ REGISTER_DEVICE(iic0_node) = { "iic0", &iic_dev_ops, (void *)&s_iic0_pd };
 /* Software IIC (SDK iic2) owns its pins directly, so no pinmux is applied for
  * this port. PA2/PA3 keep it clear of IIC0 (PA4/PA5) and IIC1 (PA6/PA7). */
 SW_IIC_PLATFORM_DATA_BEGIN(s_iic2_pd)
-    .clk_pin = IO_PORTA_02,
-    .dat_pin = IO_PORTA_03,
+    .clk_pin = TUYA_BOARD_IIC2_SCL_PIN,
+    .dat_pin = TUYA_BOARD_IIC2_SDA_PIN,
     .sw_iic_delay = 80,
     .sw_iic_byte_gap_time = 300,
     .hd_level = GPIO_DRIVE_STRENGTH_2p5mA,
@@ -72,9 +93,23 @@ REGISTER_DEVICE(iic2_node) = { "iic2", &iic_dev_ops, (void *)&s_iic2_pd };
 #include "init.h"
 #include "ioctl_cmds.h"
 
-/* Mirror the WL82 SDK hardware-IIC platform data for the default PA7/PA8
- * outport. Keep every hardware_iic field initialized: iic_init() stores this
- * object directly as the device's hardware configuration. */
+/* Board-declared pins, staged into tuya_board_periph_config.h. */
+#ifndef TUYA_BOARD_IIC0_SCL_PIN
+#define TUYA_BOARD_IIC0_SCL_PIN IO_PORTA_00
+#endif
+#ifndef TUYA_BOARD_IIC0_SDA_PIN
+#define TUYA_BOARD_IIC0_SDA_PIN IO_PORTA_01
+#endif
+#ifndef TUYA_BOARD_IIC1_SCL_PIN
+#define TUYA_BOARD_IIC1_SCL_PIN IO_PORTA_07
+#endif
+#ifndef TUYA_BOARD_IIC1_SDA_PIN
+#define TUYA_BOARD_IIC1_SDA_PIN IO_PORTA_08
+#endif
+
+/* Mirror the WL82 SDK hardware-IIC platform data. The pins come from the board,
+ * and iic_init() stores this object directly as the device's hardware
+ * configuration, so every field stays initialized. */
 static struct iic_device s_iic1_dev;
 static struct hw_iic_platform_data s_iic1_pd = {
     .head = {
@@ -82,8 +117,8 @@ static struct hw_iic_platform_data s_iic1_pd = {
         .p_iic_device = &s_iic1_dev,
     },
     .iic = {
-        .clk_pin = IO_PORTA_07,
-        .dat_pin = IO_PORTA_08,
+        .clk_pin = TUYA_BOARD_IIC1_SCL_PIN,
+        .dat_pin = TUYA_BOARD_IIC1_SDA_PIN,
         .baudrate = 0x3fu,
         .occupy_reg = (u32)(uintptr_t)&JL_IOMAP->CON1,
         .occupy_io_mask = ~(BIT(18) | BIT(19)),
@@ -104,8 +139,8 @@ REGISTER_DEVICE(iic1_node) = {"iic1", &iic_dev_ops, &s_iic1_pd};
  * here because the staged demo board does not, and keep it on pins the board
  * leaves free (PA0/PA1). */
 SW_IIC_PLATFORM_DATA_BEGIN(s_iic0_pd)
-    .clk_pin = IO_PORTA_00,
-    .dat_pin = IO_PORTA_01,
+    .clk_pin = TUYA_BOARD_IIC0_SCL_PIN,
+    .dat_pin = TUYA_BOARD_IIC0_SDA_PIN,
     .sw_iic_delay = 50,
 SW_IIC_PLATFORM_DATA_END()
 REGISTER_DEVICE(iic0_node) = {"iic0", &iic_dev_ops, (void *)&s_iic0_pd};

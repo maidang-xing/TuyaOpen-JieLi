@@ -44,6 +44,89 @@ static int tkl_pinmux_pin_exists(uint32_t pin, TUYA_PIN_FUNC_E pin_func)
 static gpio_function_t s_pin_fn[TKL_PINMUX_PIN_MAX];
 static u8 s_pin_claimed[TKL_PINMUX_PIN_MAX];
 
+/* SPI pins requested through tkl_io_pinmux_config(). Unlike the other
+ * functions these are not enabled here: the vendor SPI driver muxes its own
+ * pins inside dev_open(), so the request is held until tkl_spi_init() can put
+ * it into the platform data first. */
+#define JIELI_SPI_PORTS 3u
+#define JIELI_SPI_CLK   0u
+#define JIELI_SPI_DO    1u
+#define JIELI_SPI_DI    2u
+
+static uint32_t s_spi_pins[JIELI_SPI_PORTS][3] = {
+    {UINT32_MAX, UINT32_MAX, UINT32_MAX},
+    {UINT32_MAX, UINT32_MAX, UINT32_MAX},
+    {UINT32_MAX, UINT32_MAX, UINT32_MAX},
+};
+
+void jieli_pinmux_spi_pins_get(TUYA_SPI_NUM_E port, uint32_t *clk_pin, uint32_t *do_pin, uint32_t *di_pin)
+{
+    if ((uint32_t)port >= JIELI_SPI_PORTS) {
+        return;
+    }
+    if (clk_pin != NULL) *clk_pin = s_spi_pins[port][JIELI_SPI_CLK];
+    if (do_pin != NULL) *do_pin = s_spi_pins[port][JIELI_SPI_DO];
+    if (di_pin != NULL) *di_pin = s_spi_pins[port][JIELI_SPI_DI];
+}
+
+/* These pins are muxed by the vendor driver, so they are not in s_pin_fn[].
+ * A pin may still belong to only one SPI port, and TUYA_GPIO releases it. */
+static int jieli_spi_pins_owned(uint32_t pin, uint32_t owner_port, uint32_t owner_index)
+{
+    uint32_t port;
+    uint32_t index;
+
+    for (port = 0u; port < JIELI_SPI_PORTS; port++) {
+        if (port == owner_port) {
+            continue;
+        }
+        for (index = 0u; index < 3u; index++) {
+            if (s_spi_pins[port][index] == pin) {
+                return 1;
+            }
+        }
+    }
+    for (index = 0u; index < 3u; index++) {
+        if (index != owner_index && s_spi_pins[owner_port][index] == pin) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int jieli_spi_pins_release(uint32_t pin)
+{
+    uint32_t port;
+    uint32_t index;
+    int released = 0;
+
+    for (port = 0u; port < JIELI_SPI_PORTS; port++) {
+        for (index = 0u; index < 3u; index++) {
+            if (s_spi_pins[port][index] == pin) {
+                s_spi_pins[port][index] = UINT32_MAX;
+                released = 1;
+            }
+        }
+    }
+    return released;
+}
+
+static int jieli_spi_pin_index(TUYA_PIN_FUNC_E pin_func, uint32_t *port, uint32_t *index)
+{
+    switch (pin_func) {
+    case TUYA_SPI0_CLK:  *port = 0u; *index = JIELI_SPI_CLK; return 0;
+    case TUYA_SPI0_MOSI: *port = 0u; *index = JIELI_SPI_DO; return 0;
+    case TUYA_SPI0_MISO: *port = 0u; *index = JIELI_SPI_DI; return 0;
+    case TUYA_SPI1_CLK:  *port = 1u; *index = JIELI_SPI_CLK; return 0;
+    case TUYA_SPI1_MOSI: *port = 1u; *index = JIELI_SPI_DO; return 0;
+    case TUYA_SPI1_MISO: *port = 1u; *index = JIELI_SPI_DI; return 0;
+    case TUYA_SPI2_CLK:  *port = 2u; *index = JIELI_SPI_CLK; return 0;
+    case TUYA_SPI2_MOSI: *port = 2u; *index = JIELI_SPI_DO; return 0;
+    case TUYA_SPI2_MISO: *port = 2u; *index = JIELI_SPI_DI; return 0;
+    default: return -1;
+    }
+}
+
 static int tkl_pinmux_lookup(TUYA_PIN_FUNC_E pin_func, gpio_function_t *fn)
 {
     switch (pin_func) {
@@ -65,10 +148,18 @@ static int tkl_pinmux_lookup(TUYA_PIN_FUNC_E pin_func, gpio_function_t *fn)
     /* This adapter registers only logical UART0 and UART1; unsupported TKL
      * ports must not claim a WL83 function without a matching device route. */
 
-    /* SPI clock only - see the DA0..DA3 note above. */
+    /* SPI clock and data lines. The SDK names the data pins DA0/DA1 in the
+     * same order as d2/d3 below them, so DA0 is DI and DA1 is DO. The request
+     * path above records them for the driver instead of muxing here. */
     case TUYA_SPI0_CLK: *fn = GPIO_FUNC_SPI0_CLK; return 0;
+    case TUYA_SPI0_MISO: *fn = GPIO_FUNC_SPI0_DA0; return 0;
+    case TUYA_SPI0_MOSI: *fn = GPIO_FUNC_SPI0_DA1; return 0;
     case TUYA_SPI1_CLK: *fn = GPIO_FUNC_SPI1_CLK; return 0;
+    case TUYA_SPI1_MISO: *fn = GPIO_FUNC_SPI1_DA0; return 0;
+    case TUYA_SPI1_MOSI: *fn = GPIO_FUNC_SPI1_DA1; return 0;
     case TUYA_SPI2_CLK: *fn = GPIO_FUNC_SPI2_CLK; return 0;
+    case TUYA_SPI2_MISO: *fn = GPIO_FUNC_SPI2_DA0; return 0;
+    case TUYA_SPI2_MOSI: *fn = GPIO_FUNC_SPI2_DA1; return 0;
 
     /* ADC - the vendor has a single GPADC function and the pin itself picks
      * the channel, so every Tuya ADC index maps to the same selector. */
@@ -375,16 +466,34 @@ static OPERATE_RET tkl_io_pinmux_config_unlocked(TUYA_PIN_NAME_E pin, TUYA_PIN_F
 #if defined(JIELI_SELECTED_CHIP_WL83)
     {
         gpio_function_t fn;
+        uint32_t spi_port = 0u;
+        uint32_t spi_index = 0u;
 
         /* TUYA_GPIO releases a previously claimed peripheral function. */
         if (pin_func == TUYA_GPIO) {
             if (!s_pin_claimed[pin]) {
-                return OPRT_OK; /* nothing to release */
+                (void)jieli_spi_pins_release((uint32_t)pin);
+                return OPRT_OK; /* nothing else to release */
             }
             if (gpio_disable_function((unsigned int)pin, s_pin_fn[pin], 1) != 0) {
                 return OPRT_COM_ERROR;
             }
             s_pin_claimed[pin] = 0;
+            return OPRT_OK;
+        }
+
+        if (jieli_spi_pin_index(pin_func, &spi_port, &spi_index) == 0) {
+            if (s_pin_claimed[pin] ||
+                jieli_spi_pins_owned((uint32_t)pin, spi_port, spi_index)) {
+                return OPRT_INVALID_PARM;
+            }
+#if defined(CONFIG_ENABLE_SPI)
+            if (jieli_spi_port_is_open((TUYA_SPI_NUM_E)spi_port)) {
+                /* dev_open() already latched the pins for this port. */
+                return OPRT_COM_ERROR;
+            }
+#endif
+            s_spi_pins[spi_port][spi_index] = (uint32_t)pin;
             return OPRT_OK;
         }
 
@@ -460,8 +569,9 @@ static OPERATE_RET tkl_io_pinmux_config_unlocked(TUYA_PIN_NAME_E pin, TUYA_PIN_F
     {
         uint32_t spi_port;
         if (jieli_wl82_spi_role(pin_func, &spi_port) >= 0) {
-            /* WL82 tkl_spi_init() is deliberately unsupported, so pinmux must
-             * not claim a route that no supported SPI device can apply. */
+            /* WL82 SPI is a fixed group table, not a per-pin mux: the pins come
+             * from the group the platform data names, so a single pin request
+             * cannot be honoured. Use jieli_wl82_spi_pinmux_select() instead. */
             return OPRT_NOT_SUPPORTED;
         }
     }

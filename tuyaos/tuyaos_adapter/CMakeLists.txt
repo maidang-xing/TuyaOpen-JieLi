@@ -182,6 +182,12 @@ if(media_value STREQUAL "y")
 elseif(NOT media_value STREQUAL "n")
     message(FATAL_ERROR "CONFIG_ENABLE_MEDIA is not a Kconfig bool: '${media_value}'")
 endif()
+# tkl_ota is only usable when the board staged the vendor dual-bank engine; the
+# adapter reports the TKL as unsupported otherwise instead of failing at start.
+jieli_lookup_evaluated_config("CONFIG_JIELI_BOARD_DUAL_BANK" dual_bank_value)
+if(dual_bank_value STREQUAL "y")
+    target_compile_definitions(${JIELI_ADAPTER_NAME} PRIVATE CONFIG_DOUBLE_BANK_ENABLE=1)
+endif()
 if(CONFIG_CHIP_CHOICE STREQUAL "wl82" AND CONFIG_BOARD_CHOICE STREQUAL "AC79_DevKitBoard")
     target_compile_definitions(${JIELI_ADAPTER_NAME} PRIVATE JIELI_AC79_DEVKIT_BOARD=1)
 endif()
@@ -201,6 +207,7 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${JIELI_SDK_ROOT}/include_lib/driver/device
         ${JIELI_SDK_ROOT}/include_lib/driver/cpu/${JIELI_CPU}
         ${JIELI_SDK_ROOT}/include_lib/system
+        ${JIELI_SDK_ROOT}/include_lib/update
         ${JIELI_SDK_ROOT}/include_lib/utils
         ${JIELI_SDK_ROOT}/include_lib/utils/syscfg
         ${JIELI_SDK_ROOT}/include_lib/utils/event

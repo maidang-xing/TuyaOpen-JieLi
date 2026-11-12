@@ -69,12 +69,20 @@ static void jieli_ota_cleanup(void)
 
 OPERATE_RET tkl_ota_get_ability(uint32_t *image_size, TUYA_OTA_TYPE_E *type)
 {
+#if !defined(CONFIG_DOUBLE_BANK_ENABLE)
+    /* The board did not turn on JIELI_BOARD_DUAL_BANK, so the staged vendor
+     * image has no second bank to write into. */
+    (void)image_size;
+    (void)type;
+    return OPRT_NOT_SUPPORTED;
+#else
     if (NULL == image_size || NULL == type) {
         return OPRT_INVALID_PARM;
     }
     *image_size = JIELI_OTA_IMAGE_MAX;
     *type = TUYA_OTA_FULL;
     return OPRT_OK;
+#endif
 }
 
 OPERATE_RET tkl_ota_start_notify(uint32_t image_size, TUYA_OTA_TYPE_E type, TUYA_OTA_PATH_E path)
@@ -83,6 +91,13 @@ OPERATE_RET tkl_ota_start_notify(uint32_t image_size, TUYA_OTA_TYPE_E type, TUYA
     int ret;
 
     (void)path;
+#if !defined(CONFIG_DOUBLE_BANK_ENABLE)
+    (void)image_size;
+    (void)type;
+    (void)max_buf;
+    (void)ret;
+    return OPRT_NOT_SUPPORTED;
+#else
     if (image_size == 0u || image_size > JIELI_OTA_IMAGE_MAX) {
         return OPRT_INVALID_PARM;
     }
@@ -111,6 +126,7 @@ OPERATE_RET tkl_ota_start_notify(uint32_t image_size, TUYA_OTA_TYPE_E type, TUYA
     }
     s_ota_active = 1;
     return OPRT_OK;
+#endif
 }
 
 OPERATE_RET tkl_ota_data_process(TUYA_OTA_DATA_T *pack, uint32_t *remain_len)

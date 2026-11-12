@@ -542,13 +542,29 @@ def _staged_vendor_fingerprint(vendor_root: Path, chip) -> str:
 
 
 def peripheral_pin_digest(config_values: Optional[Mapping[str, str]]) -> str:
-    """Join the board's adapter pin symbols so staging notices a change."""
+    """Join every board symbol the staging hooks write into staged bytes.
+
+    These are not part of BoardFacts (that covers the board's own hardware
+    facts), but staging bakes them into the generated peripheral header and
+    into the vendor app config, so each one has to force a restage when it
+    moves.
+    """
     if config_values is None:
         return ""
     symbols = (
+        "CONFIG_JIELI_BOARD_DUAL_BANK",
+        "CONFIG_JIELI_BOARD_UART1_ENABLE",
+        "CONFIG_JIELI_BOARD_SPI0_CLK_PIN",
+        "CONFIG_JIELI_BOARD_SPI0_DO_PIN",
+        "CONFIG_JIELI_BOARD_SPI0_DI_PIN",
         "CONFIG_JIELI_BOARD_SPI1_CLK_PIN",
         "CONFIG_JIELI_BOARD_SPI1_DO_PIN",
         "CONFIG_JIELI_BOARD_SPI1_DI_PIN",
+        "CONFIG_JIELI_BOARD_SPI2_CLK_PIN",
+        "CONFIG_JIELI_BOARD_SPI2_DO_PIN",
+        "CONFIG_JIELI_BOARD_SPI2_DI_PIN",
+        "CONFIG_JIELI_BOARD_UART1_TX_PIN",
+        "CONFIG_JIELI_BOARD_UART1_RX_PIN",
         "CONFIG_JIELI_BOARD_PWM0_H_PIN",
         "CONFIG_JIELI_BOARD_PWM0_L_PIN",
         "CONFIG_JIELI_BOARD_PWM1_H_PIN",

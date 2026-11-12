@@ -487,10 +487,12 @@ static OPERATE_RET tkl_io_pinmux_config_unlocked(TUYA_PIN_NAME_E pin, TUYA_PIN_F
                 jieli_spi_pins_owned((uint32_t)pin, spi_port, spi_index)) {
                 return OPRT_INVALID_PARM;
             }
+#if defined(CONFIG_ENABLE_SPI)
             if (jieli_spi_port_is_open((TUYA_SPI_NUM_E)spi_port)) {
                 /* dev_open() already latched the pins for this port. */
                 return OPRT_COM_ERROR;
             }
+#endif
             s_spi_pins[spi_port][spi_index] = (uint32_t)pin;
             return OPRT_OK;
         }

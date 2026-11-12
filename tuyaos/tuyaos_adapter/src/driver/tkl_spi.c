@@ -196,6 +196,11 @@ REGISTER_DEVICE(spi1_node) = { "spi1", &spi_dev_ops, (void *)&s_spi1_pd };
 static void *s_spi_handles[TKL_SPI_PORT_MAX];
 static uint8_t s_spi_lsb_first[TKL_SPI_PORT_MAX];
 
+int jieli_spi_port_is_open(TUYA_SPI_NUM_E port)
+{
+    return ((uint32_t)port < TKL_SPI_PORT_MAX) && (s_spi_handles[port] != NULL);
+}
+
 #if defined(JIELI_SELECTED_CHIP_WL82)
 static int8_t s_wl82_spi_pin_group[TKL_SPI_PORT_MAX] = {-1, -1, -1};
 
@@ -368,6 +373,18 @@ OPERATE_RET tkl_spi_init(TUYA_SPI_NUM_E port, const TUYA_SPI_BASE_CFG_T *cfg){
         if (s_spi_handles[port] == NULL) {
             return OPRT_NOT_SUPPORTED;
         }
+#if defined(JIELI_SELECTED_CHIP_WL82)
+        /* dev_open() muxed the group the platform data names; a group selected
+         * by jieli_wl82_spi_pinmux_select() before the open still has to be
+         * applied here. */
+        if (s_wl82_spi_pin_group[port] >= 0 &&
+            dev_ioctl(s_spi_handles[port], IOCTL_SPI_SET_PORT,
+                      (u32)s_wl82_spi_pin_group[port]) != 0) {
+            dev_close(s_spi_handles[port]);
+            s_spi_handles[port] = NULL;
+            return OPRT_OS_ADAPTER_SPI_INIT_FAILED;
+        }
+#endif
     }
 #if defined(JIELI_SELECTED_CHIP_WL83)
     if (dev_ioctl(s_spi_handles[port], IOCTL_SPI_SET_BAUDRATE, cfg->freq_hz) < 0) {

@@ -69,6 +69,48 @@ void jieli_pinmux_spi_pins_get(TUYA_SPI_NUM_E port, uint32_t *clk_pin, uint32_t 
     if (di_pin != NULL) *di_pin = s_spi_pins[port][JIELI_SPI_DI];
 }
 
+/* These pins are muxed by the vendor driver, so they are not in s_pin_fn[].
+ * A pin may still belong to only one SPI port, and TUYA_GPIO releases it. */
+static int jieli_spi_pins_owned(uint32_t pin, uint32_t owner_port, uint32_t owner_index)
+{
+    uint32_t port;
+    uint32_t index;
+
+    for (port = 0u; port < JIELI_SPI_PORTS; port++) {
+        if (port == owner_port) {
+            continue;
+        }
+        for (index = 0u; index < 3u; index++) {
+            if (s_spi_pins[port][index] == pin) {
+                return 1;
+            }
+        }
+    }
+    for (index = 0u; index < 3u; index++) {
+        if (index != owner_index && s_spi_pins[owner_port][index] == pin) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int jieli_spi_pins_release(uint32_t pin)
+{
+    uint32_t port;
+    uint32_t index;
+    int released = 0;
+
+    for (port = 0u; port < JIELI_SPI_PORTS; port++) {
+        for (index = 0u; index < 3u; index++) {
+            if (s_spi_pins[port][index] == pin) {
+                s_spi_pins[port][index] = UINT32_MAX;
+                released = 1;
+            }
+        }
+    }
+    return released;
+}
+
 static int jieli_spi_pin_index(TUYA_PIN_FUNC_E pin_func, uint32_t *port, uint32_t *index)
 {
     switch (pin_func) {
@@ -430,7 +472,8 @@ static OPERATE_RET tkl_io_pinmux_config_unlocked(TUYA_PIN_NAME_E pin, TUYA_PIN_F
         /* TUYA_GPIO releases a previously claimed peripheral function. */
         if (pin_func == TUYA_GPIO) {
             if (!s_pin_claimed[pin]) {
-                return OPRT_OK; /* nothing to release */
+                (void)jieli_spi_pins_release((uint32_t)pin);
+                return OPRT_OK; /* nothing else to release */
             }
             if (gpio_disable_function((unsigned int)pin, s_pin_fn[pin], 1) != 0) {
                 return OPRT_COM_ERROR;
@@ -440,6 +483,14 @@ static OPERATE_RET tkl_io_pinmux_config_unlocked(TUYA_PIN_NAME_E pin, TUYA_PIN_F
         }
 
         if (jieli_spi_pin_index(pin_func, &spi_port, &spi_index) == 0) {
+            if (s_pin_claimed[pin] ||
+                jieli_spi_pins_owned((uint32_t)pin, spi_port, spi_index)) {
+                return OPRT_INVALID_PARM;
+            }
+            if (jieli_spi_port_is_open((TUYA_SPI_NUM_E)spi_port)) {
+                /* dev_open() already latched the pins for this port. */
+                return OPRT_COM_ERROR;
+            }
             s_spi_pins[spi_port][spi_index] = (uint32_t)pin;
             return OPRT_OK;
         }

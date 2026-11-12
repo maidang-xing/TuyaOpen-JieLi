@@ -7,6 +7,7 @@
  * port with no custom route is a successful no-op. */
 OPERATE_RET jieli_pinmux_uart_apply(TUYA_UART_NUM_E port);
 OPERATE_RET jieli_pinmux_iic_apply(TUYA_I2C_NUM_E port);
+int jieli_spi_port_is_open(TUYA_SPI_NUM_E port);
 
 #if defined(JIELI_SELECTED_CHIP_WL83)
 /* SPI pins the application asked for through tkl_io_pinmux_config(), per TKL

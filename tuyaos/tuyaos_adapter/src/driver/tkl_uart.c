@@ -188,6 +188,10 @@ static void jieli_uart_rx_task(void *arg)
 #include "asm/gpio.h"
 #include "asm/uart.h"
 
+#if TUYA_BOARD_UART1_TX_PIN != IO_PORTH_02 || TUYA_BOARD_UART1_RX_PIN != IO_PORTH_03
+#error "WL82 uart2 only drives its PH2/PH3 group; TUYA_BOARD_UART1_TX/RX_PIN cannot move it"
+#endif
+
 static const struct uart_platform_data s_uart2_pd = {
     .baudrate = 115200,
     .port = PORTH_2_3,
@@ -197,6 +201,7 @@ static const struct uart_platform_data s_uart2_pd = {
     .idle_sys_clk_cnt = 500000,
     .clk_src = PLL_48M,
     .flags = 0,
+    .irq = IRQ_UART2_IDX,
     .rts_pin = -1,
     .cts_pin = -1,
 };

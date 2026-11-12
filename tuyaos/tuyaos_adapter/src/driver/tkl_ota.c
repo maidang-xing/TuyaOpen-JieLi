@@ -6,6 +6,8 @@
 #include "tkl_semaphore.h"
 #include "tkl_system.h"
 #include "tuya_error_code.h"
+#include "asm/sfc_norflash_api.h"
+#include "device/ioctl_cmds.h"
 
 #if defined(JIELI_SELECTED_CHIP_WL83)
 #include "generic/typedef.h"
@@ -21,10 +23,9 @@
 #define JIELI_OTA_CHUNK_DEFAULT 4096u
 #define JIELI_OTA_FINISH_TIMEOUT_MS 20000u
 
-/* Advertised ceiling for a cloud image. The flash map splits the vendor's
- * application region into two equal banks (0xF3000 each on the reference
- * layout, 0x99000..0x18C000 and 0x18C000..0x27F000); a request larger than the
- * inactive bank is rejected by dual_bank_update_allow_check() at start time. */
+/* Advertised ceiling for a cloud image. The dual-bank layout gives each bank
+ * 0x16C000 bytes (0x20020..0x18C020 and 0x18C020..0x2F8000); anything larger is
+ * rejected by dual_bank_update_allow_check() at start time. */
 #define JIELI_OTA_IMAGE_MAX (0xF0000u)
 
 static uint8_t s_ota_active;
@@ -93,37 +94,18 @@ OPERATE_RET tkl_ota_start_notify(uint32_t image_size, TUYA_OTA_TYPE_E type, TUYA
     if (s_ota_active) {
         jieli_ota_cleanup();
     }
-#if defined(JIELI_SELECTED_CHIP_WL83)
-    {
-        struct BootInfo info = {0};
-
-        (void)get_current_boot_info(&info);
-        printf("[JIELI_OTA] boot info: code=0x%x base=0x%x ver=%u\n",
-               (unsigned)info.codeLength, (unsigned)info.baseAddress, (unsigned)info.version);
-    }
-#endif
+    /* The USB downloader leaves the flash write-protected, and the vendor OTA
+     * engine does not lift it itself: every write to the target bank would
+     * fail and the transfer would be abandoned after the first buffer. */
+    (void)norflash_open(NULL, NULL, NULL);
+    (void)norflash_ioctl(NULL, IOCTL_SET_WRITE_PROTECT, 0);
     ret = dual_bank_passive_update_init(0u, image_size, (uint16_t)JIELI_OTA_CHUNK_DEFAULT, NULL);
     if (ret != 0) {
-        printf("[JIELI_OTA] passive_update_init failed %d, image 0x%x\n", (int)ret, (unsigned)image_size);
         return OPRT_COM_ERROR;
     }
     max_buf = get_dual_bank_passive_update_max_buf();
-    if (max_buf >= JIELI_OTA_CHUNK_DEFAULT) {
-        s_ota_chunk = max_buf;
-    }
-#if defined(JIELI_SELECTED_CHIP_WL83)
-    {
-        uint32_t bank_base = 0u;
-        uint32_t bank_size = 0u;
-
-        if (db_update_target_base(&bank_base, &bank_size) == 0) {
-            printf("[JIELI_OTA] target bank 0x%x size 0x%x, image 0x%x\n",
-                   (unsigned)bank_base, (unsigned)bank_size, (unsigned)image_size);
-        }
-    }
-#endif
+    s_ota_chunk = (max_buf >= 256u) ? max_buf : JIELI_OTA_CHUNK_DEFAULT;
     if (dual_bank_update_allow_check(image_size) != 0) {
-        printf("[JIELI_OTA] allow_check failed, image 0x%x\n", (unsigned)image_size);
         (void)dual_bank_passive_update_exit(NULL);
         return OPRT_COM_ERROR;
     }
@@ -143,11 +125,16 @@ OPERATE_RET tkl_ota_data_process(TUYA_OTA_DATA_T *pack, uint32_t *remain_len)
     }
     while (offset < pack->len) {
         uint32_t chunk = pack->len - offset;
+        int ret;
 
         if (chunk > s_ota_chunk) {
             chunk = s_ota_chunk;
         }
-        if (dual_bank_update_write(pack->data + offset, (uint16_t)chunk, NULL) != 0) {
+        /* A positive return is the number of bytes the engine buffered; only a
+         * negative value is a failure. */
+        ret = dual_bank_update_write(pack->data + offset, (uint16_t)chunk, NULL);
+        if (ret < 0) {
+            printf("[JIELI_OTA] write failed %d at 0x%x\n", ret, (unsigned)offset);
             return OPRT_COM_ERROR;
         }
         offset += chunk;

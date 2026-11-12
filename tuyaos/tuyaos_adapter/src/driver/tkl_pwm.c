@@ -61,6 +61,10 @@ static struct pwm_platform_data s_pwm1_pd = {
     .hd_level = GPIO_DRIVE_STRENGTH_2p5mA,
 };
 REGISTER_DEVICE(pwm1_node) = { "pwm1", &pwm_dev_ops, &s_pwm1_pd };
+
+/* Only the channels in pwm_ch get their pins muxed by dev_open(); the others
+ * are added (and removed again) at run time. */
+static u8 s_pwm_added[MCPWM_MAX_NUM];
 #else
 /* WL82 asm/pwm.h pulls vendor filesystem declarations that conflict with
  * libc. Define its public _IOW('P', n, u32) command encoding locally instead:
@@ -229,6 +233,13 @@ static OPERATE_RET jieli_pwm_cfg_validate(const TUYA_PWM_BASE_CFG_T *cfg)
     if (cfg->polarity != TUYA_PWM_POSITIVE && cfg->polarity != TUYA_PWM_NEGATIVE) {
         return OPRT_INVALID_PARM;
     }
+#if !defined(JIELI_SELECTED_CHIP_WL83)
+    /* The WL82 timer output has no inversion: the driver accepts REVDIRC for
+     * it and changes nothing. */
+    if (cfg->polarity == TUYA_PWM_NEGATIVE) {
+        return OPRT_NOT_SUPPORTED;
+    }
+#endif
     return OPRT_OK;
 }
 
@@ -251,6 +262,29 @@ static void jieli_pwm_duty_percent(const TUYA_PWM_BASE_CFG_T *cfg, float *duty, 
     }
     *duty = (float)((double)cfg->duty * 100.0 / (double)cycle);
 }
+
+#if defined(JIELI_SELECTED_CHIP_WL83)
+/* The add/remove ioctls take the same platform data as the device: the pins of
+ * this one channel, everything else disabled. */
+static void jieli_pwm_channel_pd(TUYA_PWM_NUM_E ch_id, const TUYA_PWM_BASE_CFG_T *cfg,
+                                 struct pwm_platform_data *pd)
+{
+    uint32_t i;
+
+    for (i = 0u; i < TIME_PWM_MAX; i++) {
+        pd->timer_pwm_port[i] = -1;
+    }
+    for (i = 0u; i < MCPWM_MAX_NUM * 2u; i++) {
+        pd->mcpwm_port[i] = (i == (uint32_t)ch_id || i == MCPWM_MAX_NUM + (uint32_t)ch_id)
+                            ? s_pwm1_pd.mcpwm_port[i] : -1;
+    }
+    pd->pwm_config.pwm_ch = jieli_pwm_channel_bit(ch_id);
+    pd->pwm_config.freq = cfg->frequency;
+    pd->pwm_config.deathtime = 0u;
+    jieli_pwm_duty_percent(cfg, &pd->pwm_config.duty, &pd->pwm_config.point_bit);
+    pd->hd_level = s_pwm1_pd.hd_level;
+}
+#endif
 
 /* A failed configure/run sequence may have already changed some registers.
  * Try to leave the channel in a known stopped state before returning the
@@ -287,6 +321,19 @@ OPERATE_RET tkl_pwm_init(TUYA_PWM_NUM_E ch_id, const TUYA_PWM_BASE_CFG_T *cfg)
             return OPRT_NOT_SUPPORTED;
         }
     }
+
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    if (!s_pwm_added[ch_id] &&
+        !(s_pwm1_pd.pwm_config.pwm_ch & jieli_pwm_channel_bit(ch_id))) {
+        struct pwm_platform_data pd;
+
+        jieli_pwm_channel_pd(ch_id, cfg, &pd);
+        if (dev_ioctl(s_pwm_handle, IOCTL_PWM_SET_ADD_CHANNEL, (u32)(uintptr_t)&pd) < 0) {
+            return OPRT_OS_ADAPTER_PWM_INIT_FAILED;
+        }
+        s_pwm_added[ch_id] = 1u;
+    }
+#endif
 
     /* Reinitializing an active channel must stop the old hardware configuration
      * before resetting its software state or replacing the configuration. */
@@ -410,6 +457,18 @@ OPERATE_RET tkl_pwm_deinit(TUYA_PWM_NUM_E ch_id)
         }
     }
     if (s_pwm_handle != NULL) {
+#if defined(JIELI_SELECTED_CHIP_WL83)
+        /* A channel added at run time has to be removed before dev_close(). */
+        for (i = 0; i < MCPWM_MAX_NUM; i++) {
+            if (s_pwm_added[i]) {
+                struct pwm_platform_data pd;
+
+                jieli_pwm_channel_pd((TUYA_PWM_NUM_E)i, &s_pwm_cfg[i], &pd);
+                (void)dev_ioctl(s_pwm_handle, IOCTL_PWM_SET_REMOV_CHANNEL, (u32)(uintptr_t)&pd);
+                s_pwm_added[i] = 0u;
+            }
+        }
+#endif
         dev_close(s_pwm_handle);
         s_pwm_handle = NULL;
     }
@@ -501,6 +560,9 @@ OPERATE_RET tkl_pwm_polarity_set(TUYA_PWM_NUM_E ch_id, TUYA_PWM_POLARITY_E polar
     {
         struct pwm_platform_data pd;
 
+        if (polarity == TUYA_PWM_NEGATIVE) {
+            return OPRT_NOT_SUPPORTED;
+        }
         pd.treg = NULL;
         pd.creg = NULL;
         pd.duty = 0.0f;

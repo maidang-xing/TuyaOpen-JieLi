@@ -24,7 +24,8 @@ from typing import Iterable, Mapping, Optional
 
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
-    configure_audio_board, configure_board_memory, configure_dual_bank_app_config,
+    camera_path, configure_audio_board, configure_board_memory, configure_camera_app_config,
+    configure_camera_board, configure_dual_bank_app_config,
     configure_flash_reserved_area,
     configure_full_stack_app_config, configure_full_stack_board, configure_lcd_app_config,
     configure_lcd_board, configure_lcd_board_header, configure_log_uart_baudrate,
@@ -580,6 +581,11 @@ def peripheral_pin_digest(config_values: Optional[Mapping[str, str]]) -> str:
         "CONFIG_JIELI_BOARD_IIC1_SDA_PIN",
         "CONFIG_JIELI_BOARD_IIC2_SCL_PIN",
         "CONFIG_JIELI_BOARD_IIC2_SDA_PIN",
+        "CONFIG_JIELI_CAMERA_PATH_DVP",
+        "CONFIG_JIELI_CAMERA_PATH_SPI",
+        "CONFIG_JIELI_BOARD_CAMERA_WIDTH",
+        "CONFIG_JIELI_BOARD_CAMERA_HEIGHT",
+        "CONFIG_JIELI_BOARD_CAMERA_FPS",
     )
     return ",".join(f"{name}={str(config_values.get(name, '')).strip()}" for name in symbols)
 
@@ -949,6 +955,12 @@ def create_staging_tree(
     else:
         configure_usb_download_app_config(app_config_file, usb_cdc_log)
     configure_peripheral_header(board_file, config_values)
+    camera = camera_path(config_values)
+    if camera is not None:
+        if chip.name != "wl82":
+            raise BuildError("the Jieli camera adapter is implemented for WL82 only")
+        configure_camera_app_config(app_config_file, camera, config_values)
+        configure_camera_board(board_file, camera)
     if profile is not None and profile.board_declarations:
         configure_audio_board(board_file, audio_config_source, profile)
     if chip.name == "wl83":
@@ -1076,6 +1088,13 @@ def create_staging_tree(
     if facts.display is not None:
         for include in lcd_include_lines(chip.cpu):
             content += f"    {include} \\\n"
+    if "camera" in features:
+        # The camera TKL includes video.h / video_ioctl.h / camera.h from the
+        # vendor device tree, and the sensor drivers live under
+        # apps/common/camera; the demo_hello profile carries neither path.
+        content += "    -I../../../../../include_lib/driver/device/video \\\n"
+        content += "    -I../../../../../include_lib/server \\\n"
+        content += "    -I../../../../../apps/common/camera \\\n"
     content += "    -I../../../../../include_lib/btstack \\\n"
     content += "    -I../../../../../include_lib/btstack/le \\\n"
     content += "    -I../../../../../include_lib/btctrler \\\n"
@@ -1098,6 +1117,23 @@ def create_staging_tree(
     content += "INCLUDES += -I../../../../../include_lib/net\n"
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
+    if camera is not None:
+        # The vendor make is handed no Kconfig -D, so the adapter's compile-time
+        # path selection and buffer geometry are restated here. The dimensions
+        # must match CONFIG_VIDEO*_IMAGE_* staged into app_config.h: the SPI
+        # packet parser uses them to split the BT656 line stream.
+        cam_width = (config_values or {}).get(
+            "CONFIG_JIELI_BOARD_CAMERA_WIDTH", "640" if camera == "dvp" else "320")
+        cam_height = (config_values or {}).get(
+            "CONFIG_JIELI_BOARD_CAMERA_HEIGHT", "480" if camera == "dvp" else "240")
+        cam_fps = (config_values or {}).get(
+            "CONFIG_JIELI_BOARD_CAMERA_FPS", "20" if camera == "dvp" else "12")
+        content += (
+            f"DEFINES += -DJIELI_CAMERA_PATH_{camera.upper()}=1"
+            f" -DJIELI_CAMERA_WIDTH={cam_width}"
+            f" -DJIELI_CAMERA_HEIGHT={cam_height}"
+            f" -DJIELI_CAMERA_FPS={cam_fps}\n"
+        )
     if kws_enabled:
         # Selects the vendor JLKWS algorithm (4) and enables the adapter's WL82
         # provider. It gates jl_fft.c's body and the vendor

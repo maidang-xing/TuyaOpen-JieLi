@@ -292,7 +292,13 @@ static int jieli_i2c_is_software(TUYA_I2C_NUM_E port)
 #if defined(JIELI_SELECTED_CHIP_WL83)
     return port == TUYA_I2C_NUM_2;
 #else
+#if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
+    /* The SPI camera build registers iic1 as the software IIC on PH0/PH1, so
+     * init/reset must not route the hardware pinmux onto those pads. */
+    return port == TUYA_I2C_NUM_0 || port == TUYA_I2C_NUM_1;
+#else
     return port == TUYA_I2C_NUM_0;
+#endif
 #endif
 }
 

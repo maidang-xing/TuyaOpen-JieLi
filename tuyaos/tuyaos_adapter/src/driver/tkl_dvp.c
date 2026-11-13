@@ -211,13 +211,14 @@ static void dvp_release(void)
 
 #include "asm/spi.h"
 
-/* Vendor BT656-style framing: ff0000ab frame start, ff000080 line start,
- * ff00009d line end, ff0000b6 frame end. Every line carries
- * width*2 bytes of YUYV data. Checked as bytes because the vendor sample
- * compares a byte-swapped word.
+/* Vendor framing: one frame is FHEAD + H*(LHEAD+payload+LEND) + FEND. The
+ * header/tail words live around every line, so a frame packet is
+ * (width*2 + 8) * height + 8 bytes, not just width*2*height + 24. The SPI
+ * DMA block must be at least one whole packet or READ_DATA never returns a
+ * buffer whose first and last words are the frame tags.
  */
 #define SPI_LINE_BYTES    ((u32)JIELI_CAMERA_WIDTH * 2U)
-#define SPI_PACKET_BYTES  (SPI_LINE_BYTES * (u32)JIELI_CAMERA_HEIGHT + 24U)
+#define SPI_PACKET_BYTES  ((SPI_LINE_BYTES + 8U) * (u32)JIELI_CAMERA_HEIGHT + 8U)
 #define SPI_BUF_FRAMES    2U
 #define SPI_FRAME_BYTES   (SPI_LINE_BYTES * (u32)JIELI_CAMERA_HEIGHT)
 

@@ -118,9 +118,14 @@ REGISTER_DEVICE(iic2_node) = { "iic2", &iic_dev_ops, (void *)&s_iic2_pd };
  * probe reports "check digital sensor err". Match the vendor when the SPI
  * camera path is selected; leave every other build on hardware IIC. */
 #if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
+/* The J4 camera module's control bus is PH0/PH1. The vendor DevKitBoard puts
+ * both its iic0 and iic1 on those pads, and the GC0310/GC6133 SPI drivers open
+ * "iic1" directly (gc0310.c:701). Using the generic TUYA_BOARD_IIC1 pins here
+ * put the bit-banged bus on PA7/PA8, so every sensor write NAKed at the
+ * address phase. Keep the camera bus on the pads the hardware uses. */
 SW_IIC_PLATFORM_DATA_BEGIN(s_iic1_pd)
-    .clk_pin = TUYA_BOARD_IIC1_SCL_PIN,
-    .dat_pin = TUYA_BOARD_IIC1_SDA_PIN,
+    .clk_pin = IO_PORTH_00,
+    .dat_pin = IO_PORTH_01,
     .sw_iic_delay = 50,
 SW_IIC_PLATFORM_DATA_END()
 REGISTER_DEVICE(iic1_node) = {"iic1", &iic_dev_ops, (void *)&s_iic1_pd};

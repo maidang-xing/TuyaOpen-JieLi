@@ -31,17 +31,16 @@
 #include "video/video_ioctl.h"
 #include "video/camera.h"
 
-#if defined(JIELI_SELECTED_CHIP_WL82) && \
-    ((defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)) || \
-     (defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)))
+#if defined(JIELI_SELECTED_CHIP_WL82) && ((defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)) ||          \
+                                          (defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)))
 
 /* The vendor make receives these from the staging overlay; the Tuya-side
  * compile of the adapter sees the board Kconfig through tuya_kconfig.h. */
 #if !defined(JIELI_CAMERA_WIDTH)
 #if defined(JIELI_BOARD_CAMERA_WIDTH)
-#define JIELI_CAMERA_WIDTH  (JIELI_BOARD_CAMERA_WIDTH)
+#define JIELI_CAMERA_WIDTH (JIELI_BOARD_CAMERA_WIDTH)
 #else
-#define JIELI_CAMERA_WIDTH  640
+#define JIELI_CAMERA_WIDTH 640
 #endif
 #endif
 #if !defined(JIELI_CAMERA_HEIGHT)
@@ -54,15 +53,15 @@
 
 #define CAM_TAG "camera"
 
-static TUYA_DVP_CFG_T s_cfg;
-static TKL_THREAD_HANDLE s_thread = NULL;
-static volatile int s_running = 0;
-static volatile int s_stopped = 1;
-static void *s_video_dev = NULL;
-static u8 *s_yuv_buf = NULL;
-static u32 s_yuv_buf_size = 0;
-static uint32_t s_frame_id = 0;
-static u32 s_frame_count = 0;
+static TUYA_DVP_CFG_T    s_cfg;
+static TKL_THREAD_HANDLE s_thread       = NULL;
+static volatile int      s_running      = 0;
+static volatile int      s_stopped      = 1;
+static void             *s_video_dev    = NULL;
+static u8               *s_yuv_buf      = NULL;
+static u32               s_yuv_buf_size = 0;
+static uint32_t          s_frame_id     = 0;
+static u32               s_frame_count  = 0;
 
 static void camera_deliver_frame(u8 *data, u32 len, u16 width, u16 height, TUYA_FRAME_FMT_E fmt)
 {
@@ -96,8 +95,8 @@ static void camera_deliver_frame(u8 *data, u32 len, u16 width, u16 height, TUYA_
     s_cfg.inter_cfg.post_cb(frame, s_cfg.inter_cfg.cb_param);
 
     if (s_frame_count++ == 0) {
-        printf("[%s] first frame: %ux%u fmt=%d len=%u\n",
-               CAM_TAG, (unsigned)width, (unsigned)height, (int)fmt, (unsigned)len);
+        printf("[%s] first frame: %ux%u fmt=%d len=%u\n", CAM_TAG, (unsigned)width, (unsigned)height, (int)fmt,
+               (unsigned)len);
     }
 }
 
@@ -109,8 +108,8 @@ static void camera_deliver_frame(u8 *data, u32 len, u16 width, u16 height, TUYA_
 static void dvp_capture_thread(void *arg)
 {
     struct video_format fmt;
-    struct yuv_image yuv;
-    int err;
+    struct yuv_image    yuv;
+    int                 err;
 
     (void)arg;
 
@@ -128,7 +127,7 @@ static void dvp_capture_thread(void *arg)
     }
 
     {
-        char logo[16] = {0};
+        char                      logo[16] = {0};
         struct camera_device_info info;
 
         memset(&info, 0, sizeof(info));
@@ -136,8 +135,7 @@ static void dvp_capture_thread(void *arg)
             printf("[%s] sensor: %s\n", CAM_TAG, logo);
         }
         if (dev_ioctl(s_video_dev, CAMERA_GET_SENSOR_INFO, (u32)&info) == 0) {
-            printf("[%s] sensor info: %ux%u fps=%u real_fps=%u\n", CAM_TAG,
-                   (unsigned)info.width, (unsigned)info.height,
+            printf("[%s] sensor info: %ux%u fps=%u real_fps=%u\n", CAM_TAG, (unsigned)info.width, (unsigned)info.height,
                    (unsigned)info.fps, (unsigned)info.real_fps);
         }
     }
@@ -172,8 +170,7 @@ static void dvp_capture_thread(void *arg)
             tkl_system_sleep(5);
             continue;
         }
-        camera_deliver_frame(yuv.addr, yuv.size, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
-                             TUYA_FRAME_FMT_YUV422);
+        camera_deliver_frame(yuv.addr, yuv.size, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT, TUYA_FRAME_FMT_YUV422);
         dev_ioctl(s_video_dev, VIDIOC_CLEAR_OVERLAY, 0);
     }
 
@@ -187,7 +184,7 @@ out:
 static OPERATE_RET dvp_prepare(void)
 {
     s_yuv_buf_size = (u32)JIELI_CAMERA_WIDTH * JIELI_CAMERA_HEIGHT * 2U;
-    s_yuv_buf = tkl_system_malloc(s_yuv_buf_size);
+    s_yuv_buf      = tkl_system_malloc(s_yuv_buf_size);
     if (s_yuv_buf == NULL) {
         printf("[%s] no memory for %u-byte YUV422 buffer\n", CAM_TAG, (unsigned)s_yuv_buf_size);
         return OPRT_MALLOC_FAILED;
@@ -217,20 +214,20 @@ static void dvp_release(void)
  * DMA block must be at least one whole packet or READ_DATA never returns a
  * buffer whose first and last words are the frame tags.
  */
-#define SPI_LINE_BYTES    ((u32)JIELI_CAMERA_WIDTH * 2U)
-#define SPI_PACKET_BYTES  ((SPI_LINE_BYTES + 8U) * (u32)JIELI_CAMERA_HEIGHT + 8U)
-#define SPI_FRAME_BYTES   (SPI_LINE_BYTES * (u32)JIELI_CAMERA_HEIGHT)
+#define SPI_LINE_BYTES   ((u32)JIELI_CAMERA_WIDTH * 2U)
+#define SPI_PACKET_BYTES ((SPI_LINE_BYTES + 8U) * (u32)JIELI_CAMERA_HEIGHT + 8U)
+#define SPI_FRAME_BYTES  (SPI_LINE_BYTES * (u32)JIELI_CAMERA_HEIGHT)
 
 /* The DMA buffer used to be a 311 KiB static .sram array (two packets). That
  * fits the link, but it sits in .ram0_bss from reset, cutting the internal
  * heap from ~464 KiB to ~152 KiB before the vendor network/BT stacks run.
  * Allocate one packet on demand instead: the heap is whole at boot and the
  * camera pays for the buffer only when it starts. */
-static u8 *s_spi_buf;
-static u8 *s_spi_buf_raw;
-static u32 s_spi_buf_size;
-static u8 *s_spi_frame;
-static void *s_spi_dev = NULL;
+static u8   *s_spi_buf;
+static u8   *s_spi_buf_raw;
+static u32   s_spi_buf_size;
+static u8   *s_spi_frame;
+static void *s_spi_dev    = NULL;
 static void *s_sensor_dev = NULL;
 
 static u8 *spi_aligned_alloc(u32 size, u8 **raw_out)
@@ -260,9 +257,9 @@ static int spi_packet_is_frame(const u8 *buf, int len)
 /* Copy only the line payloads into a contiguous YUYV image. */
 static u32 spi_extract_frame(const u8 *buf, int len, u8 *out, u32 out_size)
 {
-    const u8 *p = buf + 4; /* skip the frame header */
-    const u8 *end = buf + len;
-    u32 written = 0;
+    const u8 *p       = buf + 4; /* skip the frame header */
+    const u8 *end     = buf + len;
+    u32       written = 0;
 
     while (p + 8 <= end && written + SPI_LINE_BYTES <= out_size) {
         if (spi_tag_eq(p, 0x80)) {
@@ -281,15 +278,18 @@ static u32 spi_extract_frame(const u8 *buf, int len, u8 *out, u32 out_size)
 static void spi_capture_thread(void *arg)
 {
     struct spi_user su;
-    u8 *read_addr;
-    int ret;
+    u8             *read_addr;
+    int             ret;
 
     (void)arg;
 
     /* The J4 sensor clock is PH2 (shared with the DVP path on purpose). The
-     * vendor sensor driver configures its registers over iic1. */
-    printf("[%s] SPI: output XCLK PH2\n", CAM_TAG);
-    gpio_output_channle(IO_PORTH_02, CH3_PLL_24M);
+     * vendor sensor driver configures its registers over iic1. The vendor's
+     * DevKitBoard SPI-camera example drives PH2 with CH1_PLL_24M
+     * (apps/common/example/Devkitboard_test/spi_camera.c:255); CH3 is the
+     * wifi_camera board's PH8 channel and does not clock this pin. */
+    printf("[%s] SPI: output XCLK PH2 (CH1_PLL_24M)\n", CAM_TAG);
+    gpio_output_channle(IO_PORTH_02, CH1_PLL_24M);
 
     printf("[%s] SPI: opening video1.0\n", CAM_TAG);
     s_sensor_dev = dev_open("video1.0", NULL);
@@ -301,7 +301,7 @@ static void spi_capture_thread(void *arg)
     printf("[%s] SPI: video1.0 ok\n", CAM_TAG);
 
     {
-        char logo[16] = {0};
+        char                      logo[16] = {0};
         struct camera_device_info info;
 
         memset(&info, 0, sizeof(info));
@@ -309,8 +309,8 @@ static void spi_capture_thread(void *arg)
             printf("[%s] sensor: %s\n", CAM_TAG, logo);
         }
         if (dev_ioctl(s_sensor_dev, CAMERA_GET_SENSOR_INFO, (u32)&info) == 0) {
-            printf("[%s] sensor info: %ux%u fps=%u\n", CAM_TAG,
-                   (unsigned)info.width, (unsigned)info.height, (unsigned)info.fps);
+            printf("[%s] sensor info: %ux%u fps=%u\n", CAM_TAG, (unsigned)info.width, (unsigned)info.height,
+                   (unsigned)info.fps);
         }
     }
 
@@ -333,32 +333,30 @@ static void spi_capture_thread(void *arg)
     printf("[%s] SPI: SET_USER_INFO buf=%p size=%u\n", CAM_TAG, s_spi_buf, (unsigned)s_spi_buf_size);
     dev_ioctl(s_spi_dev, IOCTL_SPI_SET_USER_INFO, (u32)&su);
 
-    printf("[%s] SPI capture started (%ux%u, packet %u B)\n", CAM_TAG,
-           JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT, (unsigned)SPI_PACKET_BYTES);
+    printf("[%s] SPI capture started (%ux%u, packet %u B)\n", CAM_TAG, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+           (unsigned)SPI_PACKET_BYTES);
 
     while (s_running) {
         read_addr = NULL;
-        ret = dev_ioctl(s_spi_dev, IOCTL_SPI_READ_DATA, (u32)&read_addr);
+        ret       = dev_ioctl(s_spi_dev, IOCTL_SPI_READ_DATA, (u32)&read_addr);
         if (ret <= 0 || read_addr == NULL) {
             continue;
         }
         if (spi_packet_is_frame(read_addr, ret)) {
             u32 got = spi_extract_frame(read_addr, ret, s_spi_frame, SPI_FRAME_BYTES);
             if (got == SPI_FRAME_BYTES) {
-                camera_deliver_frame(s_spi_frame, got, JIELI_CAMERA_WIDTH,
-                                     JIELI_CAMERA_HEIGHT, TUYA_FRAME_FMT_YUV422);
+                camera_deliver_frame(s_spi_frame, got, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT, TUYA_FRAME_FMT_YUV422);
             } else {
                 static u32 bad;
                 if ((bad++ & 0x3f) == 0) {
-                    printf("[%s] short line copy %u/%u bytes\n", CAM_TAG,
-                           (unsigned)got, (unsigned)SPI_FRAME_BYTES);
+                    printf("[%s] short line copy %u/%u bytes\n", CAM_TAG, (unsigned)got, (unsigned)SPI_FRAME_BYTES);
                 }
             }
         } else {
             static u32 bad_frame;
             if ((bad_frame++ & 0x1f) == 0) {
-                printf("[%s] bad packet head=%02x%02x%02x%02x len=%d\n", CAM_TAG,
-                       read_addr[0], read_addr[1], read_addr[2], read_addr[3], ret);
+                printf("[%s] bad packet head=%02x%02x%02x%02x len=%d\n", CAM_TAG, read_addr[0], read_addr[1],
+                       read_addr[2], read_addr[3], ret);
             }
         }
         dev_ioctl(s_spi_dev, IOCTL_SPI_FREE_DATA, 0);
@@ -369,7 +367,7 @@ static void spi_capture_thread(void *arg)
 out_sensor:
     dev_close(s_sensor_dev);
     s_sensor_dev = NULL;
-    gpio_clear_output_channle(IO_PORTH_02, CH3_PLL_24M);
+    gpio_clear_output_channle(IO_PORTH_02, CH1_PLL_24M);
     printf("[%s] SPI capture stopped\n", CAM_TAG);
     s_stopped = 1;
 }
@@ -378,7 +376,7 @@ static OPERATE_RET spi_prepare(void)
 {
     /* DMA buffer first: it is the one that most benefits from internal RAM. */
     s_spi_buf_size = SPI_PACKET_BYTES;
-    s_spi_buf = spi_aligned_alloc(s_spi_buf_size, &s_spi_buf_raw);
+    s_spi_buf      = spi_aligned_alloc(s_spi_buf_size, &s_spi_buf_raw);
     if (s_spi_buf == NULL) {
         printf("[%s] no memory for %u-byte SPI DMA buffer\n", CAM_TAG, (unsigned)s_spi_buf_size);
         return OPRT_MALLOC_FAILED;
@@ -388,12 +386,12 @@ static OPERATE_RET spi_prepare(void)
     if (s_spi_frame == NULL) {
         printf("[%s] no memory for %u-byte SPI frame\n", CAM_TAG, (unsigned)SPI_FRAME_BYTES);
         tkl_system_free(s_spi_buf_raw);
-        s_spi_buf = NULL;
+        s_spi_buf     = NULL;
         s_spi_buf_raw = NULL;
         return OPRT_MALLOC_FAILED;
     }
-    printf("[%s] SPI buffers: dma=%p (%u B) frame=%p (%u B)\n", CAM_TAG, s_spi_buf,
-           (unsigned)s_spi_buf_size, s_spi_frame, (unsigned)SPI_FRAME_BYTES);
+    printf("[%s] SPI buffers: dma=%p (%u B) frame=%p (%u B)\n", CAM_TAG, s_spi_buf, (unsigned)s_spi_buf_size,
+           s_spi_frame, (unsigned)SPI_FRAME_BYTES);
     return OPRT_OK;
 }
 
@@ -406,7 +404,7 @@ static void spi_release(void)
     if (s_spi_buf != NULL) {
         /* Free the original allocation, not the aligned interior pointer. */
         tkl_system_free(s_spi_buf_raw);
-        s_spi_buf = NULL;
+        s_spi_buf     = NULL;
         s_spi_buf_raw = NULL;
     }
 }
@@ -421,7 +419,7 @@ OPERATE_RET tkl_dvp_init(TUYA_DVP_CFG_T *dvp_cfg)
         return OPRT_INVALID_PARM;
     }
     memcpy(&s_cfg, dvp_cfg, sizeof(s_cfg));
-    s_frame_id = 0;
+    s_frame_id    = 0;
     s_frame_count = 0;
 
 #if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
@@ -497,8 +495,17 @@ OPERATE_RET tkl_dvp_init(TUYA_DVP_CFG_T *dvp_cfg)
     (void)dvp_cfg;
     return OPRT_NOT_SUPPORTED;
 }
-OPERATE_RET tkl_dvp_deinit(void) { return OPRT_NOT_SUPPORTED; }
-OPERATE_RET tkl_dvp_start(void) { return OPRT_NOT_SUPPORTED; }
-OPERATE_RET tkl_dvp_stop(void) { return OPRT_NOT_SUPPORTED; }
+OPERATE_RET tkl_dvp_deinit(void)
+{
+    return OPRT_NOT_SUPPORTED;
+}
+OPERATE_RET tkl_dvp_start(void)
+{
+    return OPRT_NOT_SUPPORTED;
+}
+OPERATE_RET tkl_dvp_stop(void)
+{
+    return OPRT_NOT_SUPPORTED;
+}
 
 #endif

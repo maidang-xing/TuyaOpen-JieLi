@@ -114,7 +114,13 @@ static void dvp_capture_thread(void *arg)
 
     (void)arg;
 
-    s_video_dev = dev_open("video0", NULL);
+    /* The vendor's DVP examples open the YUV overlay channel as
+     * "video0.2"; keep a bare "video0" fallback for profiles that register
+     * the node without sub-devices. */
+    s_video_dev = dev_open("video0.2", NULL);
+    if (s_video_dev == NULL) {
+        s_video_dev = dev_open("video0", NULL);
+    }
     if (s_video_dev == NULL) {
         printf("[%s] video0 open failed (no DVP sensor?)\n", CAM_TAG);
         s_stopped = 1;

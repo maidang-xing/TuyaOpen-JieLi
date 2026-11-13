@@ -219,13 +219,29 @@ static void dvp_release(void)
  */
 #define SPI_LINE_BYTES    ((u32)JIELI_CAMERA_WIDTH * 2U)
 #define SPI_PACKET_BYTES  ((SPI_LINE_BYTES + 8U) * (u32)JIELI_CAMERA_HEIGHT + 8U)
-#define SPI_BUF_FRAMES    2U
 #define SPI_FRAME_BYTES   (SPI_LINE_BYTES * (u32)JIELI_CAMERA_HEIGHT)
 
-static u8 s_spi_buf[SPI_PACKET_BYTES * SPI_BUF_FRAMES] SEC(.sram) ALIGNE(32);
+/* The DMA buffer used to be a 311 KiB static .sram array (two packets). That
+ * fits the link, but it sits in .ram0_bss from reset, cutting the internal
+ * heap from ~464 KiB to ~152 KiB before the vendor network/BT stacks run.
+ * Allocate one packet on demand instead: the heap is whole at boot and the
+ * camera pays for the buffer only when it starts. */
+static u8 *s_spi_buf;
+static u8 *s_spi_buf_raw;
+static u32 s_spi_buf_size;
 static u8 *s_spi_frame;
 static void *s_spi_dev = NULL;
 static void *s_sensor_dev = NULL;
+
+static u8 *spi_aligned_alloc(u32 size, u8 **raw_out)
+{
+    u8 *raw = tkl_system_malloc(size + 32U);
+    if (raw == NULL) {
+        return NULL;
+    }
+    *raw_out = raw;
+    return (u8 *)(((uintptr_t)raw + 31U) & ~(uintptr_t)31U);
+}
 
 static int spi_tag_eq(const u8 *p, u8 b3)
 {
@@ -272,14 +288,17 @@ static void spi_capture_thread(void *arg)
 
     /* The J4 sensor clock is PH2 (shared with the DVP path on purpose). The
      * vendor sensor driver configures its registers over iic1. */
+    printf("[%s] SPI: output XCLK PH2\n", CAM_TAG);
     gpio_output_channle(IO_PORTH_02, CH3_PLL_24M);
 
+    printf("[%s] SPI: opening video1.0\n", CAM_TAG);
     s_sensor_dev = dev_open("video1.0", NULL);
     if (s_sensor_dev == NULL) {
         printf("[%s] video1.0 open failed (no SPI sensor?)\n", CAM_TAG);
         s_stopped = 1;
         return;
     }
+    printf("[%s] SPI: video1.0 ok\n", CAM_TAG);
 
     {
         char logo[16] = {0};
@@ -295,20 +314,23 @@ static void spi_capture_thread(void *arg)
         }
     }
 
+    printf("[%s] SPI: opening spi2\n", CAM_TAG);
     s_spi_dev = dev_open("spi2", NULL);
     if (s_spi_dev == NULL) {
         printf("[%s] spi2 open failed\n", CAM_TAG);
         goto out_sensor;
     }
+    printf("[%s] SPI: spi2 ok\n", CAM_TAG);
 
     memset(&su, 0, sizeof(su));
     su.buf            = s_spi_buf;
-    su.buf_size       = sizeof(s_spi_buf);
+    su.buf_size       = s_spi_buf_size;
     su.block_size     = SPI_PACKET_BYTES;
     su.first_dma_size = SPI_PACKET_BYTES;
     su.dma_max_cnt    = SPI_MAX_SIZE;
 
     dev_ioctl(s_spi_dev, IOCTL_SPI_SET_IRQ_CPU_ID, 1);
+    printf("[%s] SPI: SET_USER_INFO buf=%p size=%u\n", CAM_TAG, s_spi_buf, (unsigned)s_spi_buf_size);
     dev_ioctl(s_spi_dev, IOCTL_SPI_SET_USER_INFO, (u32)&su);
 
     printf("[%s] SPI capture started (%ux%u, packet %u B)\n", CAM_TAG,
@@ -354,11 +376,24 @@ out_sensor:
 
 static OPERATE_RET spi_prepare(void)
 {
+    /* DMA buffer first: it is the one that most benefits from internal RAM. */
+    s_spi_buf_size = SPI_PACKET_BYTES;
+    s_spi_buf = spi_aligned_alloc(s_spi_buf_size, &s_spi_buf_raw);
+    if (s_spi_buf == NULL) {
+        printf("[%s] no memory for %u-byte SPI DMA buffer\n", CAM_TAG, (unsigned)s_spi_buf_size);
+        return OPRT_MALLOC_FAILED;
+    }
+
     s_spi_frame = tkl_system_malloc(SPI_FRAME_BYTES);
     if (s_spi_frame == NULL) {
         printf("[%s] no memory for %u-byte SPI frame\n", CAM_TAG, (unsigned)SPI_FRAME_BYTES);
+        tkl_system_free(s_spi_buf_raw);
+        s_spi_buf = NULL;
+        s_spi_buf_raw = NULL;
         return OPRT_MALLOC_FAILED;
     }
+    printf("[%s] SPI buffers: dma=%p (%u B) frame=%p (%u B)\n", CAM_TAG, s_spi_buf,
+           (unsigned)s_spi_buf_size, s_spi_frame, (unsigned)SPI_FRAME_BYTES);
     return OPRT_OK;
 }
 
@@ -367,6 +402,12 @@ static void spi_release(void)
     if (s_spi_frame != NULL) {
         tkl_system_free(s_spi_frame);
         s_spi_frame = NULL;
+    }
+    if (s_spi_buf != NULL) {
+        /* Free the original allocation, not the aligned interior pointer. */
+        tkl_system_free(s_spi_buf_raw);
+        s_spi_buf = NULL;
+        s_spi_buf_raw = NULL;
     }
 }
 #endif /* JIELI_CAMERA_PATH_SPI */

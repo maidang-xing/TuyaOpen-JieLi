@@ -109,7 +109,22 @@ REGISTER_DEVICE(iic2_node) = { "iic2", &iic_dev_ops, (void *)&s_iic2_pd };
 
 /* Mirror the WL82 SDK hardware-IIC platform data. The pins come from the board,
  * and iic_init() stores this object directly as the device's hardware
- * configuration, so every field stays initialized. */
+ * configuration, so every field stays initialized.
+ *
+ * The SPI camera path is the exception: the vendor's own board registers iic1
+ * as the *software* IIC on PH0/PH1 for video1 (board_develop.c:630), and the
+ * GC0310/GC6133 drivers open iic1 directly. With the hardware controller the
+ * sensor writes NAK at the address phase ("iic write err"), so the camera1
+ * probe reports "check digital sensor err". Match the vendor when the SPI
+ * camera path is selected; leave every other build on hardware IIC. */
+#if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
+SW_IIC_PLATFORM_DATA_BEGIN(s_iic1_pd)
+    .clk_pin = TUYA_BOARD_IIC1_SCL_PIN,
+    .dat_pin = TUYA_BOARD_IIC1_SDA_PIN,
+    .sw_iic_delay = 50,
+SW_IIC_PLATFORM_DATA_END()
+REGISTER_DEVICE(iic1_node) = {"iic1", &iic_dev_ops, (void *)&s_iic1_pd};
+#else
 static struct iic_device s_iic1_dev;
 static struct hw_iic_platform_data s_iic1_pd = {
     .head = {
@@ -134,6 +149,7 @@ static struct hw_iic_platform_data s_iic1_pd = {
 };
 
 REGISTER_DEVICE(iic1_node) = {"iic1", &iic_dev_ops, &s_iic1_pd};
+#endif
 
 /* WL82 has no hardware IIC0: its iic0 is the vendor software IIC. Register it
  * here because the staged demo board does not, and keep it on pins the board

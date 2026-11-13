@@ -968,13 +968,16 @@ def _redefine_macro(config_file: Path, name: str, value: str) -> None:
     write_staged_text(config_file, updated)
 
 
-def _define_macro(config_file: Path, name: str) -> None:
-    """Append ``#define <name>`` before the final ``#endif`` of a staged header.
+def _define_macro(config_file: Path, name: str, value: Optional[str] = None) -> None:
+    """Append ``#define <name> [value]`` before the final ``#endif`` of a header.
 
     Used for switches the vendor profile does not define at all. Idempotent:
-    a header that already carries the define is left alone.
+    a header that already carries the define is left alone. Pass ``value`` for
+    a macro the vendor tests with ``#if NAME`` (an empty define is a syntax
+    error there); leave it unset for a pure ``#ifdef`` feature switch.
     """
-    _insert_before_final_endif(config_file, f"#define {name}\n", marker=f"#define {name}")
+    definition = f"#define {name} {value}\n" if value is not None else f"#define {name}\n"
+    _insert_before_final_endif(config_file, definition, marker=f"#define {name}")
 
 
 # The vendor file that decides the station's power mode. Both SDKs put the same
@@ -1204,9 +1207,11 @@ def configure_dual_bank_app_config(app_config_file: Path, config_values) -> None
     if str(config_values.get("CONFIG_JIELI_BOARD_DUAL_BANK", "")).strip() not in ("y", "true", "True"):
         return
     # The vendor profile defines both together: a dual-bank image needs the
-    # duplicated uboot, or the boot side cannot switch between banks.
-    _define_macro(app_config_file, "CONFIG_DOUBLE_BANK_ENABLE")
-    _define_macro(app_config_file, "CONFIG_SUPPORT_DOUBLE_UBOOT")
+    # duplicated uboot, or the boot side cannot switch between banks. WL82
+    # tests these with ``#if CONFIG_DOUBLE_BANK_ENABLE``, so they need a value;
+    # an empty define is a preprocessor error there.
+    _define_macro(app_config_file, "CONFIG_DOUBLE_BANK_ENABLE", "1")
+    _define_macro(app_config_file, "CONFIG_SUPPORT_DOUBLE_UBOOT", "1")
 
 
 def configure_usb_download_app_config(app_config_file: Path, usb_cdc_log: bool = False) -> None:

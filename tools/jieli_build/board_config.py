@@ -1618,4 +1618,17 @@ def configure_camera_board(board_file: Path, path: str) -> None:
     if device_table not in content:
         raise BuildError(f"Jieli board file has no device table: {board_file}")
     content = content.replace(device_table, device_table + "\n" + device_entries, 1)
+    if path == "spi":
+        # The SPI image's video1/spi2 nodes are initialised from devices_init()
+        # before the application logger exists. Print around it so a boot hang
+        # can be attributed to device registration rather than the camera task.
+        probe = '[SPI_PROBE] devices_init'
+        if probe not in content and "devices_init();" in content:
+            content = content.replace(
+                "devices_init();",
+                'printf("[SPI_PROBE] devices_init begin\\n");\n'
+                "    devices_init();\n"
+                '    printf("[SPI_PROBE] devices_init done\\n");',
+                1,
+            )
     write_staged_text(board_file, content)

@@ -1477,6 +1477,20 @@ def camera_path(config_values) -> Optional[str]:
     return None
 
 
+def camera_spi_attr(config_values) -> str:
+    """Return the vendor SPI2 attribute expression for the selected sensor.
+
+    The module decides the sampling edge; the board Kconfig keeps the three
+    combinations the vendor ships. The default is demo_DevKitBoard's SMPH.
+    """
+    values = config_values or {}
+    if str(values.get("CONFIG_JIELI_CAMERA_SPI_EDGE_SMPL", "")).strip() in ("y", "true", "True"):
+        return "(SPI_MODE_SLAVE | SPI_SCLK_L_UPL_SMPL | SPI_UNIDIR_MODE)"
+    if str(values.get("CONFIG_JIELI_CAMERA_SPI_EDGE_H_SMPH", "")).strip() in ("y", "true", "True"):
+        return "(SPI_MODE_SLAVE | SPI_SCLK_H_UPL_SMPH | SPI_UNIDIR_MODE)"
+    return "(SPI_MODE_SLAVE | SPI_SCLK_L_UPL_SMPH | SPI_UNIDIR_MODE)"
+
+
 def configure_camera_app_config(app_config_file: Path, path: str, config_values) -> None:
     """Stage the vendor video macros the selected camera path needs.
 
@@ -1506,7 +1520,7 @@ def configure_camera_app_config(app_config_file: Path, path: str, config_values)
             "#define CONFIG_SPI_VIDEO_ENABLE             1",
             "#define CONFIG_SPI_VIDEO_USE_ISC1_RECV      0",
             "#define CONFIG_SPI_ONE_LINE_ENABLE          0",
-            "#define TCFG_SPI_ATTR                       (SPI_MODE_SLAVE | SPI_SCLK_L_UPL_SMPH | SPI_UNIDIR_MODE)",
+            f"#define TCFG_SPI_ATTR                       {camera_spi_attr(values)}",
             "#define TCFG_VIDEO1_CAMERA_XCLOCK           IO_PORTH_02",
             "#define TCFG_VIDEO1_CAMERA_RESET            IO_PORTH_03",
             "#define TCFG_VIDEO1_CAMERA_PWDN             -1",
@@ -1517,7 +1531,7 @@ def configure_camera_app_config(app_config_file: Path, path: str, config_values)
     _insert_before_final_endif(app_config_file, "\n".join(lines), CAMERA_MARKER)
 
 
-def configure_camera_board(board_file: Path, path: str) -> None:
+def configure_camera_board(board_file: Path, path: str, config_values=None) -> None:
     """Register the vendor camera device(s) on the staged demo_hello board.
 
     The sensor is not described here: the ISP probes the registered sensor
@@ -1599,7 +1613,7 @@ def configure_camera_board(board_file: Path, path: str) -> None:
             "    .clk  = 40000000,\n"
             "    .mode = SPI_DUAL_MODE,\n"
             "    .port = 'C',\n"
-            "    .attr = (SPI_MODE_SLAVE | SPI_SCLK_L_UPL_SMPH | SPI_UNIDIR_MODE),\n"
+            f"    .attr = {camera_spi_attr(config_values)},\n"
             "SPI2_PLATFORM_DATA_END()\n"
         )
         device_entries = (

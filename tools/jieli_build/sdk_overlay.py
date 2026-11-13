@@ -960,7 +960,7 @@ def create_staging_tree(
         if chip.name != "wl82":
             raise BuildError("the Jieli camera adapter is implemented for WL82 only")
         configure_camera_app_config(app_config_file, camera, config_values)
-        configure_camera_board(board_file, camera)
+        configure_camera_board(board_file, camera, config_values)
     if profile is not None and profile.board_declarations:
         configure_audio_board(board_file, audio_config_source, profile)
     if chip.name == "wl83":

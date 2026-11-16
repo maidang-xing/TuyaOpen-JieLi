@@ -340,6 +340,10 @@ static void spi_capture_thread(void *arg)
         read_addr = NULL;
         ret       = dev_ioctl(s_spi_dev, IOCTL_SPI_READ_DATA, (u32)&read_addr);
         if (ret <= 0 || read_addr == NULL) {
+            static u32 idle;
+            if ((idle++ & 0x3fffffu) == 0u) {
+                printf("[%s] SPI idle, no data from sensor yet\n", CAM_TAG);
+            }
             continue;
         }
         if (spi_packet_is_frame(read_addr, ret)) {

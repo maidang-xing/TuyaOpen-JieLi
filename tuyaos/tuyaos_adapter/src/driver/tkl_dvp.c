@@ -229,6 +229,13 @@ static u32   s_spi_buf_size;
 static u8   *s_spi_frame;
 static void *s_spi_dev    = NULL;
 static void *s_sensor_dev = NULL;
+/* Handshake between the receive loop and the sensor bring-up: the sensor must
+ * not be (re)started until the SPI2 slave is armed, otherwise the first packet
+ * is captured mid-frame and every later packet inherits the same byte offset
+ * (the frame is exactly block_size long), so the 0xFF0000AB head never lines
+ * up. */
+static volatile int s_sensor_ready = 0;
+static volatile int s_spi_armed    = 0;
 
 static u8 *spi_aligned_alloc(u32 size, u8 **raw_out)
 {
@@ -245,34 +252,67 @@ static int spi_tag_eq(const u8 *p, u8 b3)
     return p[0] == 0xff && p[1] == 0x00 && p[2] == 0x00 && p[3] == b3;
 }
 
-static int spi_packet_is_frame(const u8 *buf, int len)
-{
-    if (len < 8) {
-        return 0;
-    }
-    return (spi_tag_eq(buf, 0xab) || spi_tag_eq(buf, 0xa9)) &&
-           (spi_tag_eq(buf + len - 4, 0xb6) || spi_tag_eq(buf + len - 4, 0xa6));
-}
+/* Streaming frame assembler. The two-wire link drops or duplicates a byte now
+ * and then (measured with this module: the frame-end tag lands one byte off),
+ * so a packet cannot be assumed to start on a frame head or to keep the vendor
+ * 1288-byte stride. Scan byte by byte for the tags and stitch line payloads
+ * across packet boundaries; a slip then costs one line, not the whole frame. */
+static u32 s_spi_line;
+static int  s_spi_assembling;
+static u32  s_st_ab;
+static u32  s_st_80;
+static u32  s_st_b6;
 
-/* Copy only the line payloads into a contiguous YUYV image. */
-static u32 spi_extract_frame(const u8 *buf, int len, u8 *out, u32 out_size)
+static int spi_consume_packet(const u8 *buf, int len)
 {
-    const u8 *p       = buf + 4; /* skip the frame header */
-    const u8 *end     = buf + len;
-    u32       written = 0;
+    const u8 *p   = buf;
+    const u8 *end = buf + len;
+    int       delivered = 0;
 
-    while (p + 8 <= end && written + SPI_LINE_BYTES <= out_size) {
-        if (spi_tag_eq(p, 0x80)) {
-            memcpy(out + written, p + 4, SPI_LINE_BYTES);
-            written += SPI_LINE_BYTES;
-            p += 4 + SPI_LINE_BYTES + 4;
-        } else if (spi_tag_eq(p, 0xb6) || spi_tag_eq(p, 0xa6)) {
+    /* Every vendor tag starts with 0xFF, and the payload here is mostly
+     * 0x0c..0x8x, so memchr skips the image in a few strides. The per-byte
+     * tag check made the whole scan slower than a frame and pushed the reader
+     * behind the stream (measured: ~3 frames/s consumed). */
+    while (p + 4 <= end) {
+        const u8 *ff = memchr(p, 0xff, (size_t)(end - p));
+
+        if (ff == NULL || ff + 4 > end) {
             break;
-        } else {
+        }
+        p = ff;
+        if (spi_tag_eq(p, 0xab)) {
+            s_st_ab++;
+            s_spi_line       = 0;
+            s_spi_assembling = 1;
             p += 4;
+        } else if (spi_tag_eq(p, 0x80)) {
+            s_st_80++;
+            /* Only take a line whose end tag is where the framing says it
+             * should be. The two-wire link slips a byte now and then; a copied
+             * line with a slip is what shows up as a flickering purple/green
+             * streak, so leave the previous line in place instead. */
+            if (s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT &&
+                p + 4 + SPI_LINE_BYTES + 4 <= end &&
+                (spi_tag_eq(p + 4 + SPI_LINE_BYTES, 0x9d) || spi_tag_eq(p + 4 + SPI_LINE_BYTES, 0xa6))) {
+                memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, p + 4, SPI_LINE_BYTES);
+                s_spi_line++;
+            }
+            p += 4;
+        } else if (spi_tag_eq(p, 0xb6) || spi_tag_eq(p, 0xa6)) {
+            s_st_b6++;
+            if (s_spi_assembling && s_spi_line == (u32)JIELI_CAMERA_HEIGHT) {
+                camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+                                     TUYA_FRAME_FMT_YUV422);
+                delivered = 1;
+            }
+            s_spi_assembling = 0;
+            s_spi_line       = 0;
+            p += 4;
+        } else {
+            p++;
         }
     }
-    return written;
+    return delivered;
 }
 
 /* The sensor streams as soon as video1.0 opens, and the vendor SPI example is
@@ -288,9 +328,18 @@ static void spi_sensor_open_thread(void *arg)
     s_sensor_dev = dev_open("video1.0", NULL);
     if (s_sensor_dev == NULL) {
         printf("[%s] video1.0 open failed (no SPI sensor?)\n", CAM_TAG);
+        s_sensor_ready = -1;
         return;
     }
     printf("[%s] SPI: video1.0 ok\n", CAM_TAG);
+
+    /* Opening video1.0 resets and reconfigures the sensor, and on this board
+     * that clears the PH2 XCLK output channel: measured on AC791, the module
+     * stays mute (PA3 PCLK never toggles) until the channel is re-armed after
+     * dev_open. Re-applying it here is what makes the sensor start clocking. */
+    gpio_output_channle(IO_PORTH_02, CH2_PLL_24M);
+    tkl_system_sleep(50);
+    printf("[%s] SPI: XCLK re-armed after video1 open\n", CAM_TAG);
 
     {
         char                      logo[16] = {0};
@@ -305,6 +354,30 @@ static void spi_sensor_open_thread(void *arg)
                    (unsigned)info.fps);
         }
     }
+
+    /* The SPI2 slave must be armed while the sensor is quiet, and the sensor
+     * must then (re)start its stream from a frame head. Signal readiness, wait
+     * for the receiver, then reset the sensor: GC0310 re-runs its table and
+     * restarts streaming, so the first clock SPI2 sees is the 0xFF0000AB head. */
+    s_sensor_ready = 1;
+    {
+        int waited = 0;
+        while (s_running && !s_spi_armed && waited < 3000) {
+            tkl_system_sleep(10);
+            waited += 10;
+        }
+        if (s_running && s_spi_armed) {
+            int r = dev_ioctl(s_sensor_dev, CAMERA_SET_SENSOR_RESET, 0);
+            printf("[%s] SPI: sensor reset after spi arm ret=%d\n", CAM_TAG, r);
+            tkl_system_sleep(30);
+        }
+    }
+
+    /* No VIDIOC_STREAM_ON here: the vendor SPI-camera demo
+     * (apps/common/example/video/camera/spi/main.c) opens video1.0 and starts
+     * receiving straight away, and on this pin/board the ioctl blocks the
+     * caller instead of starting the sensor. GC0310_init configures the SPI
+     * output block (page 0x03) during dev_open already. */
 }
 
 static void spi_capture_thread(void *arg)
@@ -320,8 +393,31 @@ static void spi_capture_thread(void *arg)
      * DevKitBoard SPI-camera example drives PH2 with CH1_PLL_24M
      * (apps/common/example/Devkitboard_test/spi_camera.c:255); CH3 is the
      * wifi_camera board's PH8 channel and does not clock this pin. */
-    printf("[%s] SPI: output XCLK PH2 (CH1_PLL_24M)\n", CAM_TAG);
-    gpio_output_channle(IO_PORTH_02, CH1_PLL_24M);
+    printf("[%s] SPI: output XCLK PH2 (CH2_PLL_24M)\n", CAM_TAG);
+    gpio_output_channle(IO_PORTH_02, CH2_PLL_24M);
+
+    /* Bring the sensor up first (open + XCLK re-arm), then arm SPI2 and only
+     * then let the sensor restart its stream: the vendor order is video1.0 ->
+     * 20 ms -> spi2 -> receive, and arming before the peer sends is mandatory
+     * (apps/common/example/peripheral/spi/spi_slave/main.c:64). */
+    {
+        static TKL_THREAD_HANDLE s_sensor_thread;
+        if (tkl_thread_create(&s_sensor_thread, "cam_sensor", 2048, 4, spi_sensor_open_thread, NULL) != OPRT_OK) {
+            printf("[%s] sensor thread create failed\n", CAM_TAG);
+            goto out_sensor;
+        }
+    }
+    {
+        int waited = 0;
+        while (s_running && s_sensor_ready == 0 && waited < 3000) {
+            tkl_system_sleep(10);
+            waited += 10;
+        }
+    }
+    if (s_sensor_ready != 1) {
+        printf("[%s] SPI: sensor did not come up\n", CAM_TAG);
+        goto out_sensor;
+    }
 
     printf("[%s] SPI: opening spi2\n", CAM_TAG);
     s_spi_dev = dev_open("spi2", NULL);
@@ -342,13 +438,6 @@ static void spi_capture_thread(void *arg)
     printf("[%s] SPI: SET_USER_INFO buf=%p size=%u\n", CAM_TAG, s_spi_buf, (unsigned)s_spi_buf_size);
     dev_ioctl(s_spi_dev, IOCTL_SPI_SET_USER_INFO, (u32)&su);
 
-    {
-        static TKL_THREAD_HANDLE s_sensor_thread;
-        if (tkl_thread_create(&s_sensor_thread, "cam_sensor", 2048, 4, spi_sensor_open_thread, NULL) != OPRT_OK) {
-            printf("[%s] sensor thread create failed\n", CAM_TAG);
-        }
-    }
-
     /* The vendor DevKitBoard SPI-camera demo programs the controller directly
      * after dev_open (spi_camera.c:266-272): clear bits 2/11, then enable the
      * receive direction, IRQ and slave mode. The platform attr alone left the
@@ -361,6 +450,7 @@ static void spi_capture_thread(void *arg)
     JL_SPI2->CON |= BIT(1);
     JL_SPI2->CON |= BIT(0);
 
+    s_spi_armed = 1;
     printf("[%s] SPI capture started (%ux%u, packet %u B)\n", CAM_TAG, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
            (unsigned)SPI_PACKET_BYTES);
 
@@ -374,23 +464,7 @@ static void spi_capture_thread(void *arg)
             }
             continue;
         }
-        if (spi_packet_is_frame(read_addr, ret)) {
-            u32 got = spi_extract_frame(read_addr, ret, s_spi_frame, SPI_FRAME_BYTES);
-            if (got == SPI_FRAME_BYTES) {
-                camera_deliver_frame(s_spi_frame, got, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT, TUYA_FRAME_FMT_YUV422);
-            } else {
-                static u32 bad;
-                if ((bad++ & 0x3f) == 0) {
-                    printf("[%s] short line copy %u/%u bytes\n", CAM_TAG, (unsigned)got, (unsigned)SPI_FRAME_BYTES);
-                }
-            }
-        } else {
-            static u32 bad_frame;
-            if ((bad_frame++ & 0x1f) == 0) {
-                printf("[%s] bad packet head=%02x%02x%02x%02x len=%d\n", CAM_TAG, read_addr[0], read_addr[1],
-                       read_addr[2], read_addr[3], ret);
-            }
-        }
+        (void)spi_consume_packet(read_addr, ret);
         dev_ioctl(s_spi_dev, IOCTL_SPI_FREE_DATA, 0);
     }
 
@@ -401,15 +475,24 @@ out_sensor:
         dev_close(s_sensor_dev);
         s_sensor_dev = NULL;
     }
-    gpio_clear_output_channle(IO_PORTH_02, CH1_PLL_24M);
+    gpio_clear_output_channle(IO_PORTH_02, CH2_PLL_24M);
     printf("[%s] SPI capture stopped\n", CAM_TAG);
     s_stopped = 1;
 }
 
 static OPERATE_RET spi_prepare(void)
 {
-    /* DMA buffer first: it is the one that most benefits from internal RAM. */
-    s_spi_buf_size = SPI_PACKET_BYTES;
+    s_sensor_ready   = 0;
+    s_spi_armed      = 0;
+    s_spi_line       = 0;
+    s_spi_assembling = 0;
+
+    /* DMA buffers: the driver fills whole block_size frames and hands them to
+     * the reader. Four blocks give the (much slower) tag scan room to fall
+     * behind without re-arming in the middle of a frame, which the vendor API
+     * docs call out as corrupting ("IOCTL_SPI_READ_DATA 需保证此时对方SPI还没有
+     * 发送数据"). Two blocks (the vendor minimum) still slipped here. */
+    s_spi_buf_size = SPI_PACKET_BYTES * 4U;
     s_spi_buf      = spi_aligned_alloc(s_spi_buf_size, &s_spi_buf_raw);
     if (s_spi_buf == NULL) {
         printf("[%s] no memory for %u-byte SPI DMA buffer\n", CAM_TAG, (unsigned)s_spi_buf_size);

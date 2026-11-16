@@ -264,6 +264,78 @@ static int spi_tag_eq(const u8 *p, u8 b3)
     return p[0] == 0xff && p[1] == 0x00 && p[2] == 0x00 && p[3] == b3;
 }
 
+/* Alternate receive path: one interrupt per wire line, like the vendor
+ * Devkitboard_test/spi_camera.c demo. The block API needs a whole 618 KiB
+ * frame per READ_DATA and starts losing bytes as soon as the reader is late;
+ * the line path re-arms 1.3 KiB every interrupt, so a late reader only costs
+ * one line. Default stays on the block path until this is verified on the
+ * board. */
+#ifndef JIELI_SPI_LINE_IRQ
+#define JIELI_SPI_LINE_IRQ 0
+#endif
+
+#if JIELI_SPI_LINE_IRQ
+#ifndef ___interrupt
+#define ___interrupt __attribute__((interrupt("")))
+#endif
+#ifndef sec
+#define sec(x) __attribute__((section(#x)))
+#endif
+extern void *ram_malloc(unsigned long size);
+extern void ram_free(void *rmem);
+
+#define SPI_IRQ_LINE_MID    (4U + SPI_LINE_BYTES + 4U)  /* LHEAD + payload + LEND */
+#define SPI_IRQ_LINE_FIRST  (4U + SPI_IRQ_LINE_MID)     /* FHEAD + line           */
+#define SPI_IRQ_BUF_NUM     8U
+#define SPI_IRQ_FRAME_NUM   3U
+#define SPI_IRQ_TAG_FHEAD   0xab0000ffU /* little-endian ff0000ab */
+#define SPI_IRQ_TAG_LHEAD   0x800000ffU /* little-endian ff000080 */
+
+static u8               *s_irq_lines;
+static u8               *s_irq_frames[SPI_IRQ_FRAME_NUM];
+static u8               *s_irq_out;
+static volatile int      s_irq_active;
+static volatile u32      s_irq_armed;
+static volatile u32      s_irq_row;
+static volatile u32      s_irq_wr;
+static volatile u32      s_irq_ready; /* completed frame index + 1, 0 = none */
+static volatile u32      s_irq_lines_done;
+static volatile u32      s_irq_tag_err;
+
+static ___interrupt void spi_line_isr(void) sec(.volatile_ram_code)
+{
+    u32 row = s_irq_row;
+    u8 *buf = s_irq_lines + (u32)s_irq_armed * SPI_IRQ_LINE_FIRST;
+    u32 tag = *(volatile u32 *)buf;
+
+    JL_SPI2->CON |= BIT(14); /* clear the line interrupt */
+
+    if (s_irq_active) {
+        if (tag == (row == 0U ? SPI_IRQ_TAG_FHEAD : SPI_IRQ_TAG_LHEAD)) {
+            memcpy(s_irq_frames[s_irq_wr] + (size_t)row * SPI_LINE_BYTES, buf + (row == 0U ? 8U : 4U),
+                   SPI_LINE_BYTES);
+            row++;
+            s_irq_lines_done++;
+        } else {
+            /* Keep the row index; the next line is re-armed for the same slot. */
+            s_irq_tag_err++;
+        }
+
+        if (row >= SPI_SENSOR_HEIGHT) {
+            s_irq_ready = s_irq_wr + 1U;
+            s_irq_wr    = (s_irq_wr + 1U) % SPI_IRQ_FRAME_NUM;
+            row         = 0U;
+        }
+        s_irq_row = row;
+
+        s_irq_armed = (s_irq_armed + 1U) % SPI_IRQ_BUF_NUM;
+        JL_SPI2->ADR = (u32)(s_irq_lines + (u32)s_irq_armed * SPI_IRQ_LINE_FIRST);
+        JL_SPI2->CNT = (row == 0U || row == SPI_SENSOR_HEIGHT - 1U) ? SPI_IRQ_LINE_FIRST : SPI_IRQ_LINE_MID;
+    }
+}
+#endif /* JIELI_SPI_LINE_IRQ */
+
+
 /* Streaming frame assembler.
  *
  * The DMA hands over one 618248-byte block at a time, but a block boundary
@@ -323,7 +395,7 @@ static int spi_line_start_ok(const u8 *p, const u8 *end)
  * {Y(sx), U(sx), Y(sx+2), V(sx)} keeps the chroma pair each output pixel
  * shares with its neighbour instead of copying bytes at the wrong phase,
  * which would tint the row. */
-static void spi_frame_to_preview(void)
+static void spi_frame_to_preview(const u8 *src)
 {
     const u32 sw = SPI_SENSOR_WIDTH;
     const u32 sh = SPI_SENSOR_HEIGHT;
@@ -335,7 +407,7 @@ static void spi_frame_to_preview(void)
     }
     for (u32 y = 0; y < dh; y++) {
         const u32  sy   = y * (sh / dh);
-        const u8  *srow = s_spi_frame + (size_t)sy * SPI_LINE_BYTES;
+        const u8  *srow = src + (size_t)sy * SPI_LINE_BYTES;
         u8        *drow = s_spi_out + (size_t)y * dw * 2U;
 
         for (u32 x = 0; x < dw; x += 2U) {
@@ -439,7 +511,7 @@ static int spi_consume_packet(const u8 *buf, int len)
                         camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
                                              TUYA_FRAME_FMT_YUV422);
                     } else {
-                        spi_frame_to_preview();
+                        spi_frame_to_preview(s_spi_frame);
                         camera_deliver_frame(s_spi_out, SPI_OUT_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
                                              TUYA_FRAME_FMT_YUV422);
                     }
@@ -529,9 +601,13 @@ static void spi_sensor_open_thread(void *arg)
 
 static void spi_capture_thread(void *arg)
 {
+#if JIELI_SPI_LINE_IRQ
+    u32 last_ms = 0;
+#else
     struct spi_user su;
     u8             *read_addr;
     int             ret;
+#endif
 
     (void)arg;
 
@@ -574,6 +650,11 @@ static void spi_capture_thread(void *arg)
     }
     printf("[%s] SPI: spi2 ok\n", CAM_TAG);
 
+#if JIELI_SPI_LINE_IRQ
+    dev_ioctl(s_spi_dev, IOCTL_SPI_SET_IRQ_CPU_ID, 1);
+    dev_ioctl(s_spi_dev, IOCTL_SPI_SET_IRQ_FUNC, (u32)spi_line_isr);
+    printf("[%s] SPI: line-IRQ mode, %u line buffers\n", CAM_TAG, (unsigned)SPI_IRQ_BUF_NUM);
+#else
     memset(&su, 0, sizeof(su));
     su.buf            = s_spi_buf;
     su.buf_size       = s_spi_buf_size;
@@ -584,6 +665,7 @@ static void spi_capture_thread(void *arg)
     dev_ioctl(s_spi_dev, IOCTL_SPI_SET_IRQ_CPU_ID, 1);
     printf("[%s] SPI: SET_USER_INFO buf=%p size=%u\n", CAM_TAG, s_spi_buf, (unsigned)s_spi_buf_size);
     dev_ioctl(s_spi_dev, IOCTL_SPI_SET_USER_INFO, (u32)&su);
+#endif
 
     /* The vendor DevKitBoard SPI-camera demo programs the controller directly
      * after dev_open (spi_camera.c:266-272): clear bits 2/11, then enable the
@@ -597,6 +679,50 @@ static void spi_capture_thread(void *arg)
     JL_SPI2->CON |= BIT(1);
     JL_SPI2->CON |= BIT(0);
 
+#if JIELI_SPI_LINE_IRQ
+    s_irq_armed  = 0;
+    s_irq_row    = 0;
+    s_irq_wr     = 0;
+    s_irq_ready  = 0;
+    s_irq_active = 1;
+    JL_SPI2->ADR = (u32)s_irq_lines;
+    JL_SPI2->CNT = SPI_IRQ_LINE_FIRST;
+
+    s_spi_armed = 1;
+    printf("[%s] SPI capture started (%ux%u, line IRQ, first %u B / line %u B)\n", CAM_TAG, SPI_SENSOR_WIDTH,
+           SPI_SENSOR_HEIGHT, (unsigned)SPI_IRQ_LINE_FIRST, (unsigned)SPI_IRQ_LINE_MID);
+
+    while (s_running) {
+        if (s_irq_ready) {
+            u32 idx = s_irq_ready - 1u;
+
+            s_irq_ready = 0;
+            if (JIELI_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
+                camera_deliver_frame(s_irq_frames[idx], SPI_FRAME_BYTES, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
+                                     TUYA_FRAME_FMT_YUV422);
+            } else {
+                spi_frame_to_preview(s_irq_frames[idx]);
+                camera_deliver_frame(s_irq_out, SPI_OUT_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+                                     TUYA_FRAME_FMT_YUV422);
+            }
+            s_dbg_frames++;
+        } else {
+            tkl_system_sleep(2);
+        }
+        {
+            u32 now_ms = (u32)tkl_system_get_millisecond();
+
+            if (last_ms == 0) {
+                last_ms = now_ms;
+            } else if (now_ms - last_ms >= 5000u) {
+                printf("[%s] SPI st frames=%u lines=%u tag_err=%u\n", CAM_TAG, (unsigned)s_dbg_frames,
+                       (unsigned)s_irq_lines_done, (unsigned)s_irq_tag_err);
+                last_ms = now_ms;
+            }
+        }
+    }
+    s_irq_active = 0;
+#else
     s_spi_armed = 1;
     printf("[%s] SPI capture started (%ux%u, packet %u B)\n", CAM_TAG, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
            (unsigned)SPI_PACKET_BYTES);
@@ -636,6 +762,7 @@ static void spi_capture_thread(void *arg)
             }
         }
     }
+#endif
 
     dev_close(s_spi_dev);
     s_spi_dev = NULL;
@@ -670,6 +797,40 @@ static OPERATE_RET spi_prepare(void)
      * without re-arming in the middle of a frame, which the vendor API docs
      * call out as corrupting ("IOCTL_SPI_READ_DATA 需保证此时对方SPI还没有发送数据").
      * Two blocks (the vendor minimum) still slipped here. */
+#if JIELI_SPI_LINE_IRQ
+    /* Line buffers must live in internal RAM: the ISR runs from
+     * .volatile_ram_code and the vendor warns that SDRAM line buffers
+     * occasionally receive corrupt data. */
+    s_irq_lines = ram_malloc((unsigned long)SPI_IRQ_BUF_NUM * SPI_IRQ_LINE_FIRST);
+    if (s_irq_lines == NULL) {
+        printf("[%s] no internal RAM for %u line buffers\n", CAM_TAG,
+               (unsigned)(SPI_IRQ_BUF_NUM * SPI_IRQ_LINE_FIRST));
+        return OPRT_MALLOC_FAILED;
+    }
+    for (u32 i = 0; i < SPI_IRQ_FRAME_NUM; i++) {
+        s_irq_frames[i] = tkl_system_malloc(SPI_FRAME_BYTES);
+        if (s_irq_frames[i] == NULL) {
+            printf("[%s] no memory for frame %u\n", CAM_TAG, (unsigned)i);
+            while (i > 0u) {
+                tkl_system_free(s_irq_frames[--i]);
+                s_irq_frames[i] = NULL;
+            }
+            ram_free(s_irq_lines);
+            s_irq_lines = NULL;
+            return OPRT_MALLOC_FAILED;
+        }
+    }
+    if (JIELI_CAMERA_WIDTH != SPI_SENSOR_WIDTH || JIELI_CAMERA_HEIGHT != SPI_SENSOR_HEIGHT) {
+        s_irq_out = tkl_system_malloc(SPI_OUT_BYTES);
+        if (s_irq_out == NULL) {
+            printf("[%s] no memory for %u-byte preview frame\n", CAM_TAG, (unsigned)SPI_OUT_BYTES);
+            return OPRT_MALLOC_FAILED;
+        }
+    }
+    printf("[%s] SPI buffers: lines=%p (%u B) frames=3x%u B out=%p\n", CAM_TAG, s_irq_lines,
+           (unsigned)(SPI_IRQ_BUF_NUM * SPI_IRQ_LINE_FIRST), (unsigned)SPI_FRAME_BYTES, s_irq_out);
+    return OPRT_OK;
+#else
     s_spi_buf_size = SPI_PACKET_BYTES * 4U;
     s_spi_buf      = spi_aligned_alloc(s_spi_buf_size, &s_spi_buf_raw);
     if (s_spi_buf == NULL) {
@@ -704,10 +865,27 @@ static OPERATE_RET spi_prepare(void)
     printf("[%s] SPI buffers: dma=%p (%u B) frame=%p (%u B) out=%p (%u B)\n", CAM_TAG, s_spi_buf,
            (unsigned)s_spi_buf_size, s_spi_frame, (unsigned)SPI_FRAME_BYTES, s_spi_out, (unsigned)SPI_OUT_BYTES);
     return OPRT_OK;
+#endif
 }
 
 static void spi_release(void)
 {
+#if JIELI_SPI_LINE_IRQ
+    if (s_irq_out != NULL) {
+        tkl_system_free(s_irq_out);
+        s_irq_out = NULL;
+    }
+    for (u32 i = 0; i < SPI_IRQ_FRAME_NUM; i++) {
+        if (s_irq_frames[i] != NULL) {
+            tkl_system_free(s_irq_frames[i]);
+            s_irq_frames[i] = NULL;
+        }
+    }
+    if (s_irq_lines != NULL) {
+        ram_free(s_irq_lines);
+        s_irq_lines = NULL;
+    }
+#else
     if (s_spi_out != NULL) {
         tkl_system_free(s_spi_out);
         s_spi_out = NULL;
@@ -722,6 +900,7 @@ static void spi_release(void)
         s_spi_buf     = NULL;
         s_spi_buf_raw = NULL;
     }
+#endif
 }
 #endif /* JIELI_CAMERA_PATH_SPI */
 

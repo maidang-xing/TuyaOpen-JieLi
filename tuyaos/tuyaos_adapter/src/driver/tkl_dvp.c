@@ -214,9 +214,17 @@ static void dvp_release(void)
  * DMA block must be at least one whole packet or READ_DATA never returns a
  * buffer whose first and last words are the frame tags.
  */
-#define SPI_LINE_BYTES   ((u32)JIELI_CAMERA_WIDTH * 2U)
-#define SPI_PACKET_BYTES ((SPI_LINE_BYTES + 8U) * (u32)JIELI_CAMERA_HEIGHT + 8U)
-#define SPI_FRAME_BYTES  (SPI_LINE_BYTES * (u32)JIELI_CAMERA_HEIGHT)
+/* GC0310 over SPI always streams its native 640x480 YUYV raster: the page-0
+ * crop window and the CISCTL output-size registers were both measured to leave
+ * the 1288-byte row stride untouched, so a smaller sensor-side mode is not
+ * available. Keep the wire geometry fixed to VGA here and decimate to the
+ * configured preview size when a frame is complete. */
+#define SPI_SENSOR_WIDTH  640U
+#define SPI_SENSOR_HEIGHT 480U
+#define SPI_LINE_BYTES    (SPI_SENSOR_WIDTH * 2U)
+#define SPI_PACKET_BYTES  ((SPI_LINE_BYTES + 8U) * SPI_SENSOR_HEIGHT + 8U)
+#define SPI_FRAME_BYTES   (SPI_LINE_BYTES * SPI_SENSOR_HEIGHT)
+#define SPI_OUT_BYTES     ((u32)JIELI_CAMERA_WIDTH * (u32)JIELI_CAMERA_HEIGHT * 2U)
 
 /* The DMA buffer used to be a 311 KiB static .sram array (two packets). That
  * fits the link, but it sits in .ram0_bss from reset, cutting the internal
@@ -227,6 +235,7 @@ static u8   *s_spi_buf;
 static u8   *s_spi_buf_raw;
 static u32   s_spi_buf_size;
 static u8   *s_spi_frame;
+static u8   *s_spi_out;
 static void *s_spi_dev    = NULL;
 static void *s_sensor_dev = NULL;
 /* Handshake between the receive loop and the sensor bring-up: the sensor must
@@ -269,9 +278,9 @@ static int spi_tag_eq(const u8 *p, u8 b3)
  *    spell 0xff000080 (Y=255,U=0,Y=0,V=128), and those false heads used to be
  *    copied as rows - the purple/green streaks on the panel.
  *
- * A frame is delivered at its end tag when 480 rows are present; a few
- * missing bottom rows are filled with the previous row rather than dropping
- * the frame.
+ * A frame is delivered at its end tag only when all 480 rows are present and
+ * no row was substituted; anything else is dropped. The panel refreshes less
+ * often on a noisy link but never shows a half-built frame.
  */
 static u32 s_spi_line;
 static int s_spi_assembling;
@@ -283,6 +292,11 @@ static int s_line_pending;
 static u32 s_dbg_frame_bad;
 static u32 s_dbg_frames;
 static u32 s_dbg_skipped;
+/* Rows this frame had to fake (duplicated/zeroed) because their end tag was
+ * misplaced. A frame with any fake row is dropped on delivery: the panel is
+ * refreshed only with frames that arrived whole, which trades refresh rate for
+ * a picture without streaks or torn bands. */
+static u32 s_frame_bad;
 
 static int spi_line_end_ok(const u8 *p, const u8 *end)
 {
@@ -298,6 +312,41 @@ static int spi_line_end_ok(const u8 *p, const u8 *end)
     return 0;
 }
 
+/* Nearest-neighbour decimation from the sensor's VGA raster to the configured
+ * preview size. Only integer ratios are supported (this board uses 2:1 in both
+ * axes); anything else is copied unscaled by the caller. The source is packed
+ * YUYV, so one output YUYV quad covers two source quads:
+ * {Y(sx), U(sx), Y(sx+2), V(sx)} keeps the chroma pair each output pixel
+ * shares with its neighbour instead of copying bytes at the wrong phase,
+ * which would tint the row. */
+static void spi_frame_to_preview(void)
+{
+    const u32 sw = SPI_SENSOR_WIDTH;
+    const u32 sh = SPI_SENSOR_HEIGHT;
+    const u32 dw = (u32)JIELI_CAMERA_WIDTH;
+    const u32 dh = (u32)JIELI_CAMERA_HEIGHT;
+
+    if (dw == 0 || dh == 0 || (dw & 1U) || (sw % dw) != 0 || (sh % dh) != 0) {
+        return;
+    }
+    for (u32 y = 0; y < dh; y++) {
+        const u32  sy   = y * (sh / dh);
+        const u8  *srow = s_spi_frame + (size_t)sy * SPI_LINE_BYTES;
+        u8        *drow = s_spi_out + (size_t)y * dw * 2U;
+
+        for (u32 x = 0; x < dw; x += 2U) {
+            const u32  sx = x * (sw / dw);
+            const u8  *s  = srow + (size_t)sx * 2U;
+            u8        *d  = drow + (size_t)x * 2U;
+
+            d[0] = s[0]; /* Y(sx)   */
+            d[1] = s[1]; /* U(sx)   */
+            d[2] = s[4]; /* Y(sx+2) */
+            d[3] = s[3]; /* V(sx)   */
+        }
+    }
+}
+
 static int spi_consume_packet(const u8 *buf, int len)
 {
     const u8 *p         = buf;
@@ -305,7 +354,7 @@ static int spi_consume_packet(const u8 *buf, int len)
     int       delivered = 0;
 
     /* Finish the line that started at the end of the previous block. */
-    if (s_line_pending && s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
+    if (s_line_pending && s_spi_assembling && s_spi_line < (u32)SPI_SENSOR_HEIGHT) {
         u32 need  = SPI_LINE_BYTES - s_line_carry_len;
         u32 avail = (u32)(end - p);
         u32 take  = (avail < need) ? avail : need;
@@ -333,27 +382,30 @@ static int spi_consume_packet(const u8 *buf, int len)
             s_spi_line       = 0;
             s_spi_assembling = 1;
             s_line_pending   = 0;
+            s_frame_bad      = 0;
             s_frame_start_ms = (u32)tkl_system_get_millisecond();
             p += 4;
         } else if (spi_tag_eq(p, 0x80)) {
-            if (s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
+            if (s_spi_assembling && s_spi_line < (u32)SPI_SENSOR_HEIGHT) {
                 if (p + 4 + SPI_LINE_BYTES <= end) {
                     u8 *dst = s_spi_frame + s_spi_line * SPI_LINE_BYTES;
 
                     /* A row whose end tag is not where the framing says is a
                      * byte-slipped or false-head line - copying it paints a
-                     * purple/green streak. Duplicate the previous row instead:
-                     * the row index stays aligned and the frame is still
-                     * delivered, unlike dropping the line (which lost the
-                     * whole frame to the row count). */
+                     * purple/green streak. Duplicate the previous row so the
+                     * row index stays aligned, and mark the frame: the
+                     * delivery gate drops it at the end tag instead of
+                     * painting the streak. */
                     if (spi_line_end_ok(p, end)) {
                         memcpy(dst, p + 4, SPI_LINE_BYTES);
                     } else if (s_spi_line > 0) {
                         memcpy(dst, dst - SPI_LINE_BYTES, SPI_LINE_BYTES);
                         s_dbg_frame_bad++;
+                        s_frame_bad++;
                     } else {
                         memset(dst, 0x10, SPI_LINE_BYTES);
                         s_dbg_frame_bad++;
+                        s_frame_bad++;
                     }
                     s_spi_line++;
                 } else {
@@ -376,23 +428,24 @@ static int spi_consume_packet(const u8 *buf, int len)
              * two frames as one. */
             if (s_spi_assembling && s_spi_line > 0 &&
                 (u32)tkl_system_get_millisecond() - s_frame_start_ms < 400u) {
-                if (s_spi_line >= (u32)JIELI_CAMERA_HEIGHT) {
-                    s_spi_line = (u32)JIELI_CAMERA_HEIGHT;
-                } else if (s_spi_line >= (u32)JIELI_CAMERA_HEIGHT - 4u) {
-                    /* A row was lost to a corrupt tag: repeat the previous row
-                     * for the missing bottom rows instead of dropping the frame. */
-                    const u8 *last = s_spi_frame + (s_spi_line - 1u) * SPI_LINE_BYTES;
-
-                    while (s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
-                        memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, last, SPI_LINE_BYTES);
-                        s_spi_line++;
+                /* Only a frame that arrived whole is painted: every source row
+                 * present and no row substituted because its end tag was
+                 * misplaced. The panel therefore refreshes at the rate of clean
+                 * frames (a few per second on this link) but never shows a
+                 * frame with streaks or a missing band. */
+                if (s_spi_line == (u32)SPI_SENSOR_HEIGHT && s_frame_bad == 0) {
+                    if (JIELI_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
+                        camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
+                                             TUYA_FRAME_FMT_YUV422);
+                    } else {
+                        spi_frame_to_preview();
+                        camera_deliver_frame(s_spi_out, SPI_OUT_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+                                             TUYA_FRAME_FMT_YUV422);
                     }
-                }
-                if (s_spi_line == (u32)JIELI_CAMERA_HEIGHT) {
-                    camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
-                                         TUYA_FRAME_FMT_YUV422);
                     s_dbg_frames++;
                     delivered = 1;
+                } else {
+                    s_dbg_skipped++;
                 }
             }
             s_spi_assembling = 0;
@@ -544,7 +597,7 @@ static void spi_capture_thread(void *arg)
     JL_SPI2->CON |= BIT(0);
 
     s_spi_armed = 1;
-    printf("[%s] SPI capture started (%ux%u, packet %u B)\n", CAM_TAG, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+    printf("[%s] SPI capture started (%ux%u, packet %u B)\n", CAM_TAG, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
            (unsigned)SPI_PACKET_BYTES);
 
     while (s_running) {
@@ -576,7 +629,7 @@ static void spi_capture_thread(void *arg)
             if (last_ms == 0) {
                 last_ms = now_ms;
             } else if (now_ms - last_ms >= 5000u) {
-                printf("[%s] SPI st good=%u bad=%u skipped=%u\n", CAM_TAG, (unsigned)s_dbg_frames,
+                printf("[%s] SPI st frames=%u badrows=%u skipped=%u\n", CAM_TAG, (unsigned)s_dbg_frames,
                        (unsigned)s_dbg_frame_bad, (unsigned)s_dbg_skipped);
                 last_ms = now_ms;
             }
@@ -633,13 +686,32 @@ static OPERATE_RET spi_prepare(void)
         return OPRT_MALLOC_FAILED;
     }
 
-    printf("[%s] SPI buffers: dma=%p (%u B) frame=%p (%u B)\n", CAM_TAG, s_spi_buf, (unsigned)s_spi_buf_size,
-           s_spi_frame, (unsigned)SPI_FRAME_BYTES);
+    /* The preview buffer only exists when the configured size differs from the
+     * sensor's fixed VGA raster (see spi_frame_to_preview). */
+    if (JIELI_CAMERA_WIDTH != SPI_SENSOR_WIDTH || JIELI_CAMERA_HEIGHT != SPI_SENSOR_HEIGHT) {
+        s_spi_out = tkl_system_malloc(SPI_OUT_BYTES);
+        if (s_spi_out == NULL) {
+            printf("[%s] no memory for %u-byte SPI preview frame\n", CAM_TAG, (unsigned)SPI_OUT_BYTES);
+            tkl_system_free(s_spi_frame);
+            s_spi_frame = NULL;
+            tkl_system_free(s_spi_buf_raw);
+            s_spi_buf     = NULL;
+            s_spi_buf_raw = NULL;
+            return OPRT_MALLOC_FAILED;
+        }
+    }
+
+    printf("[%s] SPI buffers: dma=%p (%u B) frame=%p (%u B) out=%p (%u B)\n", CAM_TAG, s_spi_buf,
+           (unsigned)s_spi_buf_size, s_spi_frame, (unsigned)SPI_FRAME_BYTES, s_spi_out, (unsigned)SPI_OUT_BYTES);
     return OPRT_OK;
 }
 
 static void spi_release(void)
 {
+    if (s_spi_out != NULL) {
+        tkl_system_free(s_spi_out);
+        s_spi_out = NULL;
+    }
     if (s_spi_frame != NULL) {
         tkl_system_free(s_spi_frame);
         s_spi_frame = NULL;

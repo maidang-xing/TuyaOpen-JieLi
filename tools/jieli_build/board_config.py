@@ -1594,16 +1594,24 @@ def configure_camera_board(board_file: Path, path: str, config_values=None) -> N
             '#include "camera.h"\n'
             '#include "asm/spi.h"\n'
             "static const struct camera_platform_data tuya_camera1_data = {\n"
+            # SPI camera on J4: the vendor board files use no DVP interface
+            # for camera1 (demo_DevKitBoard: interface -1, every dvp pin -1)
+            # because the stream arrives on SPI2, not the ISP. Declaring
+            # SEN_INTERFACE0 here made video1 claim the ISC group-A pads even
+            # though PA3 (PCLK) is wired to SPI2. XCLK is driven by the adapter
+            # (gpio_output_channle on PH2), so give the pin to the video1
+            # driver (xclk_hz 0 -> 24 MHz) and re-arm it from the adapter after
+            # dev_open, because open clears the channel on this board.
             "    .xclk_gpio      = IO_PORTH_02,\n"
             "    .reset_gpio     = IO_PORTH_03,\n"
             "    .pwdn_gpio      = -1,\n"
             "    .power_value    = 0,\n"
-            "    .interface      = SEN_INTERFACE0,\n"
+            "    .interface      = -1,\n"
             "    .dvp = {\n"
             "        .pclk_gpio  = -1,\n"
             "        .hsync_gpio = -1,\n"
             "        .vsync_gpio = -1,\n"
-            "        .group_port = 0,\n"
+            "        .group_port = -1,\n"
             "        .data_gpio  = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },\n"
             "    },\n"
             "};\n"
@@ -1615,7 +1623,7 @@ def configure_camera_board(board_file: Path, path: str, config_values=None) -> N
             "    .num  = ARRAY_SIZE(tuya_video1_subdev),\n"
             "};\n"
             "SPI2_PLATFORM_DATA_BEGIN(tuya_spi2_data)\n"
-            "    .clk  = 40000000,\n"
+            "    .clk  = 80000000,\n"
             "    .mode = SPI_DUAL_MODE,\n"
             "    .port = 'C',\n"
             f"    .attr = {camera_spi_attr(config_values)},\n"

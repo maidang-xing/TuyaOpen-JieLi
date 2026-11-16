@@ -349,6 +349,18 @@ static void spi_capture_thread(void *arg)
         }
     }
 
+    /* The vendor DevKitBoard SPI-camera demo programs the controller directly
+     * after dev_open (spi_camera.c:266-272): clear bits 2/11, then enable the
+     * receive direction, IRQ and slave mode. The platform attr alone left the
+     * controller silent, so apply the same bits here. */
+    JL_SPI2->CON &= ~BIT(2);
+    JL_SPI2->CON &= ~BIT(11);
+    JL_SPI2->CON |= BIT(10);
+    JL_SPI2->CON |= BIT(12);
+    JL_SPI2->CON |= BIT(13);
+    JL_SPI2->CON |= BIT(1);
+    JL_SPI2->CON |= BIT(0);
+
     printf("[%s] SPI capture started (%ux%u, packet %u B)\n", CAM_TAG, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
            (unsigned)SPI_PACKET_BYTES);
 

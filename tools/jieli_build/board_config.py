@@ -1623,7 +1623,10 @@ def configure_camera_board(board_file: Path, path: str, config_values=None) -> N
             "    .num  = ARRAY_SIZE(tuya_video1_subdev),\n"
             "};\n"
             "SPI2_PLATFORM_DATA_BEGIN(tuya_spi2_data)\n"
-            "    .clk  = 80000000,\n"
+            # 40 MHz is what the vendor DevKitBoard board data uses for the same
+            # J4 SPI-CAM socket; keeping it avoids sampling margin errors that
+            # show up as isolated corrupted lines.
+            "    .clk  = 40000000,\n"
             "    .mode = SPI_DUAL_MODE,\n"
             "    .port = 'C',\n"
             f"    .attr = {camera_spi_attr(config_values)},\n"

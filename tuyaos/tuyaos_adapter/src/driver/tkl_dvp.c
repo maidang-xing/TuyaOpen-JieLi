@@ -252,32 +252,71 @@ static int spi_tag_eq(const u8 *p, u8 b3)
     return p[0] == 0xff && p[1] == 0x00 && p[2] == 0x00 && p[3] == b3;
 }
 
-/* Streaming frame assembler: tags are scanned byte by byte and lines stitched
- * across packet boundaries. It is deliberately tolerant of the framing slips
- * this 2-wire link shows; the strict variants (per-line end-tag check, strict
- * whole-frame unpack) dropped whole frames whenever one tag landed off its
- * expected offset. */
-static u32 s_dbg_frame_bad;
-static u32 s_dbg_frames;
-static u32 s_dbg_skipped;
-
-/* Streaming frame assembler: tags are scanned byte by byte and lines
- * stitched across packet boundaries. Deliberately tolerant: the strict
- * variants (per-line end-tag check, whole-frame head/tail validation) never
- * matched an intact 618248-byte frame in the received byte stream and dropped
- * every frame, while this scan keeps delivering pictures. */
+/* Streaming frame assembler.
+ *
+ * The DMA hands over one 618248-byte block at a time, but a block boundary
+ * lands in the middle of a line, and the 2-wire link drops or duplicates a
+ * byte now and then. Two things follow:
+ *
+ *  - a line that starts near the end of a block is carried into the next
+ *    block (s_line_carry) instead of being dropped, which used to leave a
+ *    frame one row short and force the whole frame out;
+ *  - a line is accepted only when its end tag sits where the framing says
+ *    (within a small window for the link's byte slips). YUYV pixel data can
+ *    spell 0xff000080 (Y=255,U=0,Y=0,V=128), and those false heads used to be
+ *    copied as rows - the purple/green streaks on the panel.
+ *
+ * A frame is delivered at its end tag when 480 rows are present; a few
+ * missing bottom rows are filled with the previous row rather than dropping
+ * the frame.
+ */
 static u32 s_spi_line;
-static int  s_spi_assembling;
+static int s_spi_assembling;
+static u8  s_line_carry[SPI_LINE_BYTES];
+static u32 s_line_carry_len;
+static int s_line_pending;
 
 static u32 s_dbg_frame_bad;
 static u32 s_dbg_frames;
 static u32 s_dbg_skipped;
+
+static int spi_line_end_ok(const u8 *p, const u8 *end)
+{
+    /* p is the start tag; the end tag belongs at p + 4 + SPI_LINE_BYTES.
+     * Accept it within a small window: the link shifts framing bytes. */
+    for (int k = -6; k <= 6; k++) {
+        const u8 *t = p + 4 + SPI_LINE_BYTES + k;
+
+        if (t >= p + 4 && t + 4 <= end && (spi_tag_eq(t, 0x9d) || spi_tag_eq(t, 0xa6))) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 static int spi_consume_packet(const u8 *buf, int len)
 {
-    const u8 *p      = buf;
-    const u8 *end    = buf + len;
+    const u8 *p         = buf;
+    const u8 *end       = buf + len;
     int       delivered = 0;
+
+    /* Finish the line that started at the end of the previous block. */
+    if (s_line_pending && s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
+        u32 need  = SPI_LINE_BYTES - s_line_carry_len;
+        u32 avail = (u32)(end - p);
+        u32 take  = (avail < need) ? avail : need;
+
+        if (take > 0) {
+            memcpy(s_line_carry + s_line_carry_len, p, take);
+            s_line_carry_len += take;
+            p += take;
+        }
+        if (s_line_carry_len == SPI_LINE_BYTES) {
+            memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, s_line_carry, SPI_LINE_BYTES);
+            s_spi_line++;
+            s_line_pending = 0;
+        }
+    }
 
     while (p + 4 <= end) {
         const u8 *ff = memchr(p, 0xff, (size_t)(end - p));
@@ -289,23 +328,65 @@ static int spi_consume_packet(const u8 *buf, int len)
         if (spi_tag_eq(p, 0xab)) {
             s_spi_line       = 0;
             s_spi_assembling = 1;
+            s_line_pending   = 0;
             p += 4;
         } else if (spi_tag_eq(p, 0x80)) {
-            if (s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT &&
-                p + 4 + SPI_LINE_BYTES <= end) {
-                memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, p + 4, SPI_LINE_BYTES);
-                s_spi_line++;
+            if (s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
+                if (p + 4 + SPI_LINE_BYTES <= end) {
+                    u8 *dst = s_spi_frame + s_spi_line * SPI_LINE_BYTES;
+
+                    /* A row whose end tag is not where the framing says is a
+                     * byte-slipped or false-head line - copying it paints a
+                     * purple/green streak. Duplicate the previous row instead:
+                     * the row index stays aligned and the frame is still
+                     * delivered, unlike dropping the line (which lost the
+                     * whole frame to the row count). */
+                    if (spi_line_end_ok(p, end)) {
+                        memcpy(dst, p + 4, SPI_LINE_BYTES);
+                    } else if (s_spi_line > 0) {
+                        memcpy(dst, dst - SPI_LINE_BYTES, SPI_LINE_BYTES);
+                        s_dbg_frame_bad++;
+                    } else {
+                        memset(dst, 0x10, SPI_LINE_BYTES);
+                        s_dbg_frame_bad++;
+                    }
+                    s_spi_line++;
+                } else {
+                    /* Straddles the block: carry the head bytes into the next. */
+                    u32 avail = (u32)(end - (p + 4));
+
+                    memcpy(s_line_carry, p + 4, avail);
+                    s_line_carry_len = avail;
+                    s_line_pending   = 1;
+                    p                = end;
+                    break;
+                }
             }
             p += 4;
         } else if (spi_tag_eq(p, 0xb6) || spi_tag_eq(p, 0xa6)) {
-            if (s_spi_assembling && s_spi_line == (u32)JIELI_CAMERA_HEIGHT) {
-                camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
-                                     TUYA_FRAME_FMT_YUV422);
-                s_dbg_frames++;
-                delivered = 1;
+            if (s_spi_assembling && s_spi_line > 0) {
+                if (s_spi_line >= (u32)JIELI_CAMERA_HEIGHT) {
+                    s_spi_line = (u32)JIELI_CAMERA_HEIGHT;
+                } else if (s_spi_line >= (u32)JIELI_CAMERA_HEIGHT - 4u) {
+                    /* A row was lost to a corrupt tag: repeat the previous row
+                     * for the missing bottom rows instead of dropping the frame. */
+                    const u8 *last = s_spi_frame + (s_spi_line - 1u) * SPI_LINE_BYTES;
+
+                    while (s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
+                        memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, last, SPI_LINE_BYTES);
+                        s_spi_line++;
+                    }
+                }
+                if (s_spi_line == (u32)JIELI_CAMERA_HEIGHT) {
+                    camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+                                         TUYA_FRAME_FMT_YUV422);
+                    s_dbg_frames++;
+                    delivered = 1;
+                }
             }
             s_spi_assembling = 0;
             s_spi_line       = 0;
+            s_line_pending   = 0;
             p += 4;
         } else {
             p++;

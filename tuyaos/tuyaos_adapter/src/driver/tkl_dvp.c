@@ -236,6 +236,9 @@ static void *s_sensor_dev = NULL;
  * up. */
 static volatile int s_sensor_ready = 0;
 static volatile int s_spi_armed    = 0;
+/* Set by the sensor thread when it is done touching video1.0 / PH2, so the
+ * capture thread's teardown waits instead of closing the device underneath it. */
+static volatile int s_sensor_done = 0;
 
 static u8 *spi_aligned_alloc(u32 size, u8 **raw_out)
 {
@@ -330,7 +333,7 @@ static int spi_consume_packet(const u8 *buf, int len)
             s_spi_line       = 0;
             s_spi_assembling = 1;
             s_line_pending   = 0;
-            s_frame_start_ms = (u32)tal_system_get_millisecond();
+            s_frame_start_ms = (u32)tkl_system_get_millisecond();
             p += 4;
         } else if (spi_tag_eq(p, 0x80)) {
             if (s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
@@ -372,7 +375,7 @@ static int spi_consume_packet(const u8 *buf, int len)
              * as a horizontal split that moves. Drop it instead of painting
              * two frames as one. */
             if (s_spi_assembling && s_spi_line > 0 &&
-                (u32)tal_system_get_millisecond() - s_frame_start_ms < 400u) {
+                (u32)tkl_system_get_millisecond() - s_frame_start_ms < 400u) {
                 if (s_spi_line >= (u32)JIELI_CAMERA_HEIGHT) {
                     s_spi_line = (u32)JIELI_CAMERA_HEIGHT;
                 } else if (s_spi_line >= (u32)JIELI_CAMERA_HEIGHT - 4u) {
@@ -417,6 +420,7 @@ static void spi_sensor_open_thread(void *arg)
     if (s_sensor_dev == NULL) {
         printf("[%s] video1.0 open failed (no SPI sensor?)\n", CAM_TAG);
         s_sensor_ready = -1;
+        s_sensor_done  = 1;
         return;
     }
     printf("[%s] SPI: video1.0 ok\n", CAM_TAG);
@@ -466,6 +470,7 @@ static void spi_sensor_open_thread(void *arg)
      * receiving straight away, and on this pin/board the ioctl blocks the
      * caller instead of starting the sensor. GC0310_init configures the SPI
      * output block (page 0x03) during dev_open already. */
+    s_sensor_done = 1;
 }
 
 static void spi_capture_thread(void *arg)
@@ -567,7 +572,7 @@ static void spi_capture_thread(void *arg)
         dev_ioctl(s_spi_dev, IOCTL_SPI_FREE_DATA, 0);
         {
             static u32 last_ms;
-            u32        now_ms = (u32)tal_system_get_millisecond();
+            u32        now_ms = (u32)tkl_system_get_millisecond();
             if (last_ms == 0) {
                 last_ms = now_ms;
             } else if (now_ms - last_ms >= 5000u) {
@@ -581,6 +586,14 @@ static void spi_capture_thread(void *arg)
     dev_close(s_spi_dev);
     s_spi_dev = NULL;
 out_sensor:
+    /* The sensor thread owns video1.0 and PH2; do not close underneath it. */
+    {
+        int waited = 0;
+        while (!s_sensor_done && waited < 500) {
+            tkl_system_sleep(10);
+            waited += 10;
+        }
+    }
     if (s_sensor_dev != NULL) {
         dev_close(s_sensor_dev);
         s_sensor_dev = NULL;
@@ -592,8 +605,9 @@ out_sensor:
 
 static OPERATE_RET spi_prepare(void)
 {
-    s_sensor_ready = 0;
-    s_spi_armed    = 0;
+    s_sensor_ready   = 0;
+    s_spi_armed      = 0;
+    s_sensor_done    = 0;
     s_dbg_frames     = 0;
     s_dbg_frame_bad  = 0;
     s_dbg_skipped    = 0;
@@ -663,8 +677,24 @@ OPERATE_RET tkl_dvp_init(TUYA_DVP_CFG_T *dvp_cfg)
 OPERATE_RET tkl_dvp_start(void)
 {
     if (s_thread != NULL) {
-        return OPRT_OK;
+        if (!s_stopped) {
+            return OPRT_OK; /* already running */
+        }
+        /* The thread exited on its own (open failure). Release the stale
+         * handle so this call can start a fresh session. */
+        tkl_thread_release(s_thread);
+        s_thread = NULL;
     }
+
+#if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
+    /* Per-session handshake state: after stop -> start the old "ready/armed"
+     * values would let the sensor thread skip the ordering this code exists
+     * to guarantee. */
+    s_sensor_ready = 0;
+    s_spi_armed    = 0;
+    s_sensor_done  = 0;
+#endif
+
     s_running = 1;
     s_stopped = 0;
 
@@ -698,7 +728,11 @@ OPERATE_RET tkl_dvp_stop(void)
         tkl_system_sleep(10);
     }
     if (!s_stopped) {
-        printf("[%s] capture thread did not stop in 1s; releasing it\n", CAM_TAG);
+        /* The thread is still inside a vendor ioctl. Freeing the DMA target
+         * or the frame buffer now would leave it writing into freed memory,
+         * so keep the session and report the failure. */
+        printf("[%s] capture thread did not stop in 1s; keeping buffers\n", CAM_TAG);
+        return OPRT_COM_ERROR;
     }
     tkl_thread_release(s_thread);
     s_thread = NULL;
@@ -708,6 +742,10 @@ OPERATE_RET tkl_dvp_stop(void)
 OPERATE_RET tkl_dvp_deinit(void)
 {
     OPERATE_RET rt = tkl_dvp_stop();
+
+    if (rt != OPRT_OK) {
+        return rt;
+    }
 
 #if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
     dvp_release();

@@ -463,7 +463,25 @@ static int reinit_spi_video(void)
     return 0;
 }
 
+/* TuyaOpen experiment: start the vendor SPI camera three seconds after boot
+ * instead of waiting for the UI page, so its frame rate and loss behaviour can
+ * be read from the 1 Mbaud serial log without touching the panel. */
+#define TUYAOPEN_VENDOR_SPI_AUTOSTART 1
+#ifdef TUYAOPEN_VENDOR_SPI_AUTOSTART
+static void spi_video_autostart_task(void *p)
+{
+    os_time_dly(300);
+    printf("\n [msg] auto init_spi_video\n");
+    init_spi_video();
+}
 
+static int spi_video_autostart_init(void)
+{
+    os_task_create(spi_video_autostart_task, NULL, 3, 512, 0, "spi_auto");
+    return 0;
+}
+late_initcall(spi_video_autostart_init);
+#endif
 
 #endif
 

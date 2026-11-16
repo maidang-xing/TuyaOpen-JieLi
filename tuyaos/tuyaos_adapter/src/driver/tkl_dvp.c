@@ -272,6 +272,7 @@ static int spi_tag_eq(const u8 *p, u8 b3)
  */
 static u32 s_spi_line;
 static int s_spi_assembling;
+static u32 s_frame_start_ms;
 static u8  s_line_carry[SPI_LINE_BYTES];
 static u32 s_line_carry_len;
 static int s_line_pending;
@@ -329,6 +330,7 @@ static int spi_consume_packet(const u8 *buf, int len)
             s_spi_line       = 0;
             s_spi_assembling = 1;
             s_line_pending   = 0;
+            s_frame_start_ms = (u32)tal_system_get_millisecond();
             p += 4;
         } else if (spi_tag_eq(p, 0x80)) {
             if (s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
@@ -364,7 +366,13 @@ static int spi_consume_packet(const u8 *buf, int len)
             }
             p += 4;
         } else if (spi_tag_eq(p, 0xb6) || spi_tag_eq(p, 0xa6)) {
-            if (s_spi_assembling && s_spi_line > 0) {
+            /* A frame that took far longer than the link's frame period is a
+             * mixed assembly: its end tag or the next frame head was lost, so
+             * rows from the following frame were appended and the seam shows
+             * as a horizontal split that moves. Drop it instead of painting
+             * two frames as one. */
+            if (s_spi_assembling && s_spi_line > 0 &&
+                (u32)tal_system_get_millisecond() - s_frame_start_ms < 400u) {
                 if (s_spi_line >= (u32)JIELI_CAMERA_HEIGHT) {
                     s_spi_line = (u32)JIELI_CAMERA_HEIGHT;
                 } else if (s_spi_line >= (u32)JIELI_CAMERA_HEIGHT - 4u) {

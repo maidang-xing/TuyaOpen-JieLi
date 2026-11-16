@@ -275,27 +275,19 @@ static u32 spi_extract_frame(const u8 *buf, int len, u8 *out, u32 out_size)
     return written;
 }
 
-static void spi_capture_thread(void *arg)
+/* The sensor streams as soon as video1.0 opens, and the vendor SPI example is
+ * explicit that IOCTL_SPI_READ_DATA must be armed before the peer sends, or the
+ * receiver locks onto a partial packet. Open the sensor from its own thread so
+ * the capture loop is already waiting when the first packet arrives. */
+static void spi_sensor_open_thread(void *arg)
 {
-    struct spi_user su;
-    u8             *read_addr;
-    int             ret;
-
     (void)arg;
-
-    /* The J4 sensor clock is PH2 (shared with the DVP path on purpose). The
-     * vendor sensor driver configures its registers over iic1. The vendor's
-     * DevKitBoard SPI-camera example drives PH2 with CH1_PLL_24M
-     * (apps/common/example/Devkitboard_test/spi_camera.c:255); CH3 is the
-     * wifi_camera board's PH8 channel and does not clock this pin. */
-    printf("[%s] SPI: output XCLK PH2 (CH1_PLL_24M)\n", CAM_TAG);
-    gpio_output_channle(IO_PORTH_02, CH1_PLL_24M);
+    tkl_system_sleep(200);
 
     printf("[%s] SPI: opening video1.0\n", CAM_TAG);
     s_sensor_dev = dev_open("video1.0", NULL);
     if (s_sensor_dev == NULL) {
         printf("[%s] video1.0 open failed (no SPI sensor?)\n", CAM_TAG);
-        s_stopped = 1;
         return;
     }
     printf("[%s] SPI: video1.0 ok\n", CAM_TAG);
@@ -313,6 +305,23 @@ static void spi_capture_thread(void *arg)
                    (unsigned)info.fps);
         }
     }
+}
+
+static void spi_capture_thread(void *arg)
+{
+    struct spi_user su;
+    u8             *read_addr;
+    int             ret;
+
+    (void)arg;
+
+    /* The J4 sensor clock is PH2 (shared with the DVP path on purpose). The
+     * vendor sensor driver configures its registers over iic1. The vendor's
+     * DevKitBoard SPI-camera example drives PH2 with CH1_PLL_24M
+     * (apps/common/example/Devkitboard_test/spi_camera.c:255); CH3 is the
+     * wifi_camera board's PH8 channel and does not clock this pin. */
+    printf("[%s] SPI: output XCLK PH2 (CH1_PLL_24M)\n", CAM_TAG);
+    gpio_output_channle(IO_PORTH_02, CH1_PLL_24M);
 
     printf("[%s] SPI: opening spi2\n", CAM_TAG);
     s_spi_dev = dev_open("spi2", NULL);
@@ -332,6 +341,13 @@ static void spi_capture_thread(void *arg)
     dev_ioctl(s_spi_dev, IOCTL_SPI_SET_IRQ_CPU_ID, 1);
     printf("[%s] SPI: SET_USER_INFO buf=%p size=%u\n", CAM_TAG, s_spi_buf, (unsigned)s_spi_buf_size);
     dev_ioctl(s_spi_dev, IOCTL_SPI_SET_USER_INFO, (u32)&su);
+
+    {
+        static TKL_THREAD_HANDLE s_sensor_thread;
+        if (tkl_thread_create(&s_sensor_thread, "cam_sensor", 2048, 4, spi_sensor_open_thread, NULL) != OPRT_OK) {
+            printf("[%s] sensor thread create failed\n", CAM_TAG);
+        }
+    }
 
     printf("[%s] SPI capture started (%ux%u, packet %u B)\n", CAM_TAG, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
            (unsigned)SPI_PACKET_BYTES);
@@ -369,8 +385,10 @@ static void spi_capture_thread(void *arg)
     dev_close(s_spi_dev);
     s_spi_dev = NULL;
 out_sensor:
-    dev_close(s_sensor_dev);
-    s_sensor_dev = NULL;
+    if (s_sensor_dev != NULL) {
+        dev_close(s_sensor_dev);
+        s_sensor_dev = NULL;
+    }
     gpio_clear_output_channle(IO_PORTH_02, CH1_PLL_24M);
     printf("[%s] SPI capture stopped\n", CAM_TAG);
     s_stopped = 1;

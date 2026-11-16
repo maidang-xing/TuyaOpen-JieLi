@@ -1127,12 +1127,12 @@ def create_staging_tree(
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
     # The board's peripheral pins come from its Kconfig through a generated
     # header next to board.c, so the adapter has one source of truth for them.
+    # Use the absolute path: with the relative form the compiler searched the
+    # -I directories instead, stamped a doubled path into the .d files, and
+    # the next make failed with "No rule to make target .../.../header".
     board_relative = chip.board_build_relative.as_posix()
-    content += (
-        "CFLAGS += -include ../../../../../"
-        + board_relative
-        + "/tuya_board_periph_config.h\n"
-    )
+    periph_header = (source_overlay_root / chip.board_build_relative / "tuya_board_periph_config.h").as_posix()
+    content += "CFLAGS += -include " + periph_header + "\n"
     content += "DEFINES += " + " ".join(
         "-D" + define for define in feature_defines(features)
     ) + "\n"

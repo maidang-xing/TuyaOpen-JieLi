@@ -252,27 +252,72 @@ static int spi_tag_eq(const u8 *p, u8 b3)
     return p[0] == 0xff && p[1] == 0x00 && p[2] == 0x00 && p[3] == b3;
 }
 
-/* Streaming frame assembler. The two-wire link drops or duplicates a byte now
- * and then (measured with this module: the frame-end tag lands one byte off),
- * so a packet cannot be assumed to start on a frame head or to keep the vendor
- * 1288-byte stride. Scan byte by byte for the tags and stitch line payloads
- * across packet boundaries; a slip then costs one line, not the whole frame. */
+/* Streaming frame assembler.
+ *
+ * The DMA hands over one 618248-byte block at a time, but a block boundary
+ * lands in the middle of a line, and the 2-wire link drops or duplicates a
+ * byte now and then. Two things follow:
+ *
+ *  - a line that starts near the end of a block is carried into the next
+ *    block (s_line_carry) instead of being dropped, which used to leave a
+ *    frame one row short and force the whole frame out;
+ *  - a line is accepted only when its end tag sits where the framing says
+ *    (within a small window for the link's byte slips). YUYV pixel data can
+ *    spell 0xff000080 (Y=255,U=0,Y=0,V=128), and those false heads used to be
+ *    copied as rows - the purple/green streaks on the panel.
+ *
+ * A frame is delivered at its end tag when 480 rows are present; a few
+ * missing bottom rows are filled with the previous row rather than dropping
+ * the frame.
+ */
 static u32 s_spi_line;
-static int  s_spi_assembling;
-static u32  s_st_ab;
-static u32  s_st_80;
-static u32  s_st_b6;
+static int s_spi_assembling;
+static u8  s_line_carry[SPI_LINE_BYTES];
+static u32 s_line_carry_len;
+static int s_line_pending;
+
+static u32 s_dbg_frame_bad;
+static u32 s_dbg_frames;
+static u32 s_dbg_skipped;
+
+static int spi_line_end_ok(const u8 *p, const u8 *end)
+{
+    /* p is the start tag; the end tag belongs at p + 4 + SPI_LINE_BYTES.
+     * Accept it within a small window: the link shifts framing bytes. */
+    for (int k = -6; k <= 6; k++) {
+        const u8 *t = p + 4 + SPI_LINE_BYTES + k;
+
+        if (t >= p + 4 && t + 4 <= end && (spi_tag_eq(t, 0x9d) || spi_tag_eq(t, 0xa6))) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 static int spi_consume_packet(const u8 *buf, int len)
 {
-    const u8 *p   = buf;
-    const u8 *end = buf + len;
+    const u8 *p         = buf;
+    const u8 *end       = buf + len;
     int       delivered = 0;
 
-    /* Every vendor tag starts with 0xFF, and the payload here is mostly
-     * 0x0c..0x8x, so memchr skips the image in a few strides. The per-byte
-     * tag check made the whole scan slower than a frame and pushed the reader
-     * behind the stream (measured: ~3 frames/s consumed). */
+    /* Finish the line that started at the end of the previous block. */
+    if (s_line_pending && s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
+        u32 need  = SPI_LINE_BYTES - s_line_carry_len;
+        u32 avail = (u32)(end - p);
+        u32 take  = (avail < need) ? avail : need;
+
+        if (take > 0) {
+            memcpy(s_line_carry + s_line_carry_len, p, take);
+            s_line_carry_len += take;
+            p += take;
+        }
+        if (s_line_carry_len == SPI_LINE_BYTES) {
+            memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, s_line_carry, SPI_LINE_BYTES);
+            s_spi_line++;
+            s_line_pending = 0;
+        }
+    }
+
     while (p + 4 <= end) {
         const u8 *ff = memchr(p, 0xff, (size_t)(end - p));
 
@@ -281,32 +326,67 @@ static int spi_consume_packet(const u8 *buf, int len)
         }
         p = ff;
         if (spi_tag_eq(p, 0xab)) {
-            s_st_ab++;
             s_spi_line       = 0;
             s_spi_assembling = 1;
+            s_line_pending   = 0;
             p += 4;
         } else if (spi_tag_eq(p, 0x80)) {
-            s_st_80++;
-            /* Only take a line whose end tag is where the framing says it
-             * should be. The two-wire link slips a byte now and then; a copied
-             * line with a slip is what shows up as a flickering purple/green
-             * streak, so leave the previous line in place instead. */
-            if (s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT &&
-                p + 4 + SPI_LINE_BYTES + 4 <= end &&
-                (spi_tag_eq(p + 4 + SPI_LINE_BYTES, 0x9d) || spi_tag_eq(p + 4 + SPI_LINE_BYTES, 0xa6))) {
-                memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, p + 4, SPI_LINE_BYTES);
-                s_spi_line++;
+            if (s_spi_assembling && s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
+                if (p + 4 + SPI_LINE_BYTES <= end) {
+                    u8 *dst = s_spi_frame + s_spi_line * SPI_LINE_BYTES;
+
+                    /* A row whose end tag is not where the framing says is a
+                     * byte-slipped or false-head line - copying it paints a
+                     * purple/green streak. Duplicate the previous row instead:
+                     * the row index stays aligned and the frame is still
+                     * delivered, unlike dropping the line (which lost the
+                     * whole frame to the row count). */
+                    if (spi_line_end_ok(p, end)) {
+                        memcpy(dst, p + 4, SPI_LINE_BYTES);
+                    } else if (s_spi_line > 0) {
+                        memcpy(dst, dst - SPI_LINE_BYTES, SPI_LINE_BYTES);
+                        s_dbg_frame_bad++;
+                    } else {
+                        memset(dst, 0x10, SPI_LINE_BYTES);
+                        s_dbg_frame_bad++;
+                    }
+                    s_spi_line++;
+                } else {
+                    /* Straddles the block: carry the head bytes into the next. */
+                    u32 avail = (u32)(end - (p + 4));
+
+                    memcpy(s_line_carry, p + 4, avail);
+                    s_line_carry_len = avail;
+                    s_line_pending   = 1;
+                    p                = end;
+                    break;
+                }
             }
             p += 4;
         } else if (spi_tag_eq(p, 0xb6) || spi_tag_eq(p, 0xa6)) {
-            s_st_b6++;
-            if (s_spi_assembling && s_spi_line == (u32)JIELI_CAMERA_HEIGHT) {
-                camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
-                                     TUYA_FRAME_FMT_YUV422);
-                delivered = 1;
+            if (s_spi_assembling && s_spi_line > 0) {
+                if (s_spi_line >= (u32)JIELI_CAMERA_HEIGHT) {
+                    s_spi_line = (u32)JIELI_CAMERA_HEIGHT;
+                } else if (s_spi_line >= (u32)JIELI_CAMERA_HEIGHT - 4u) {
+                    /* A row was lost to a corrupt tag: repeat the previous row
+                     * for the missing bottom rows instead of dropping the frame. */
+                    const u8 *last = s_spi_frame + (s_spi_line - 1u) * SPI_LINE_BYTES;
+
+                    while (s_spi_line < (u32)JIELI_CAMERA_HEIGHT) {
+                        memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, last, SPI_LINE_BYTES);
+                        s_spi_line++;
+                    }
+                }
+                if (s_spi_line == (u32)JIELI_CAMERA_HEIGHT) {
+                    camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+                                         TUYA_FRAME_FMT_YUV422);
+                    s_dbg_frames++;
+                    delivered = 1;
+                }
             }
             s_spi_assembling = 0;
             s_spi_line       = 0;
+            s_line_pending   = 0;
             p += 4;
         } else {
             p++;
@@ -337,7 +417,7 @@ static void spi_sensor_open_thread(void *arg)
      * that clears the PH2 XCLK output channel: measured on AC791, the module
      * stays mute (PA3 PCLK never toggles) until the channel is re-armed after
      * dev_open. Re-applying it here is what makes the sensor start clocking. */
-    gpio_output_channle(IO_PORTH_02, CH2_PLL_24M);
+    gpio_output_channle(IO_PORTH_02, CH1_PLL_24M);
     tkl_system_sleep(50);
     printf("[%s] SPI: XCLK re-armed after video1 open\n", CAM_TAG);
 
@@ -393,8 +473,8 @@ static void spi_capture_thread(void *arg)
      * DevKitBoard SPI-camera example drives PH2 with CH1_PLL_24M
      * (apps/common/example/Devkitboard_test/spi_camera.c:255); CH3 is the
      * wifi_camera board's PH8 channel and does not clock this pin. */
-    printf("[%s] SPI: output XCLK PH2 (CH2_PLL_24M)\n", CAM_TAG);
-    gpio_output_channle(IO_PORTH_02, CH2_PLL_24M);
+    printf("[%s] SPI: output XCLK PH2 (CH1_PLL_24M)\n", CAM_TAG);
+    gpio_output_channle(IO_PORTH_02, CH1_PLL_24M);
 
     /* Bring the sensor up first (open + XCLK re-arm), then arm SPI2 and only
      * then let the sensor restart its stream: the vendor order is video1.0 ->
@@ -465,7 +545,29 @@ static void spi_capture_thread(void *arg)
             continue;
         }
         (void)spi_consume_packet(read_addr, ret);
+        {
+            static u32 dbg_reads;
+            if (dbg_reads < 20) {
+                dbg_reads++;
+                if (ret >= 4) {
+                    printf("[%s] SPI read ret=%d head=%02x%02x%02x%02x tail=%02x%02x%02x%02x\n", CAM_TAG, ret,
+                           read_addr[0], read_addr[1], read_addr[2], read_addr[3], read_addr[ret - 4],
+                           read_addr[ret - 3], read_addr[ret - 2], read_addr[ret - 1]);
+                }
+            }
+        }
         dev_ioctl(s_spi_dev, IOCTL_SPI_FREE_DATA, 0);
+        {
+            static u32 last_ms;
+            u32        now_ms = (u32)tal_system_get_millisecond();
+            if (last_ms == 0) {
+                last_ms = now_ms;
+            } else if (now_ms - last_ms >= 5000u) {
+                printf("[%s] SPI st good=%u bad=%u skipped=%u\n", CAM_TAG, (unsigned)s_dbg_frames,
+                       (unsigned)s_dbg_frame_bad, (unsigned)s_dbg_skipped);
+                last_ms = now_ms;
+            }
+        }
     }
 
     dev_close(s_spi_dev);
@@ -475,23 +577,24 @@ out_sensor:
         dev_close(s_sensor_dev);
         s_sensor_dev = NULL;
     }
-    gpio_clear_output_channle(IO_PORTH_02, CH2_PLL_24M);
+    gpio_clear_output_channle(IO_PORTH_02, CH1_PLL_24M);
     printf("[%s] SPI capture stopped\n", CAM_TAG);
     s_stopped = 1;
 }
 
 static OPERATE_RET spi_prepare(void)
 {
-    s_sensor_ready   = 0;
-    s_spi_armed      = 0;
-    s_spi_line       = 0;
-    s_spi_assembling = 0;
+    s_sensor_ready = 0;
+    s_spi_armed    = 0;
+    s_dbg_frames     = 0;
+    s_dbg_frame_bad  = 0;
+    s_dbg_skipped    = 0;
 
     /* DMA buffers: the driver fills whole block_size frames and hands them to
-     * the reader. Four blocks give the (much slower) tag scan room to fall
-     * behind without re-arming in the middle of a frame, which the vendor API
-     * docs call out as corrupting ("IOCTL_SPI_READ_DATA 需保证此时对方SPI还没有
-     * 发送数据"). Two blocks (the vendor minimum) still slipped here. */
+     * the reader. Four blocks give the unpacking copy room to fall behind
+     * without re-arming in the middle of a frame, which the vendor API docs
+     * call out as corrupting ("IOCTL_SPI_READ_DATA 需保证此时对方SPI还没有发送数据").
+     * Two blocks (the vendor minimum) still slipped here. */
     s_spi_buf_size = SPI_PACKET_BYTES * 4U;
     s_spi_buf      = spi_aligned_alloc(s_spi_buf_size, &s_spi_buf_raw);
     if (s_spi_buf == NULL) {
@@ -507,6 +610,7 @@ static OPERATE_RET spi_prepare(void)
         s_spi_buf_raw = NULL;
         return OPRT_MALLOC_FAILED;
     }
+
     printf("[%s] SPI buffers: dma=%p (%u B) frame=%p (%u B)\n", CAM_TAG, s_spi_buf, (unsigned)s_spi_buf_size,
            s_spi_frame, (unsigned)SPI_FRAME_BYTES);
     return OPRT_OK;

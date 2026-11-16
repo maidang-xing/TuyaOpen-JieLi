@@ -157,13 +157,23 @@ REGISTER_DEVICE(iic1_node) = {"iic1", &iic_dev_ops, &s_iic1_pd};
 #endif
 
 /* WL82 has no hardware IIC0: its iic0 is the vendor software IIC. Register it
- * here because the staged demo board does not, and keep it on pins the board
- * leaves free (PA0/PA1). */
+ * here because the staged demo board does not. The SPI camera path keeps iic0
+ * on the camera's PH0/PH1 as well: the vendor video probe opens iic0 when it
+ * runs as ISP_DEV_0, and with iic0 on PA0/PA1 every sensor check NACKed while
+ * the same sensor answered on iic1. */
+#if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
+SW_IIC_PLATFORM_DATA_BEGIN(s_iic0_pd)
+    .clk_pin = IO_PORTH_00,
+    .dat_pin = IO_PORTH_01,
+    .sw_iic_delay = 50,
+SW_IIC_PLATFORM_DATA_END()
+#else
 SW_IIC_PLATFORM_DATA_BEGIN(s_iic0_pd)
     .clk_pin = TUYA_BOARD_IIC0_SCL_PIN,
     .dat_pin = TUYA_BOARD_IIC0_SDA_PIN,
     .sw_iic_delay = 50,
 SW_IIC_PLATFORM_DATA_END()
+#endif
 REGISTER_DEVICE(iic0_node) = {"iic0", &iic_dev_ops, (void *)&s_iic0_pd};
 #endif
 

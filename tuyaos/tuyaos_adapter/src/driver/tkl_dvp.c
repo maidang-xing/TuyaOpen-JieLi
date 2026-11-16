@@ -278,9 +278,9 @@ static int spi_tag_eq(const u8 *p, u8 b3)
  *    spell 0xff000080 (Y=255,U=0,Y=0,V=128), and those false heads used to be
  *    copied as rows - the purple/green streaks on the panel.
  *
- * A frame is delivered at its end tag only when all 480 rows are present and
- * no row was substituted; anything else is dropped. The panel refreshes less
- * often on a noisy link but never shows a half-built frame.
+ * A frame is delivered at its end tag when at least 476 of the 480 rows are
+ * present (the missing bottom rows repeat the last one); grossly short or
+ * time-overrun assemblies are dropped instead of painting two frames as one.
  */
 static u32 s_spi_line;
 static int s_spi_assembling;
@@ -289,16 +289,15 @@ static u8  s_line_carry[SPI_LINE_BYTES];
 static u32 s_line_carry_len;
 static int s_line_pending;
 
-static u32 s_dbg_frame_bad;
 static u32 s_dbg_frames;
 static u32 s_dbg_skipped;
-/* Rows this frame had to fake (duplicated/zeroed) because their end tag was
- * misplaced. A frame with any fake row is dropped on delivery: the panel is
- * refreshed only with frames that arrived whole, which trades refresh rate for
- * a picture without streaks or torn bands. */
-static u32 s_frame_bad;
 
-static int spi_line_end_ok(const u8 *p, const u8 *end)
+/* A real line start is followed by its end tag at a fixed offset, or (when
+ * that tag itself was hit by a byte slip) by the next line head at the same
+ * fixed offset from the following word. YUYV pixel data can spell
+ * 0xFF000080 (Y=255,U=0,Y=0,V=128) in saturated scenes, so a bare tag match is
+ * not proof of a row boundary; requiring the framing around it is. */
+static int spi_line_start_ok(const u8 *p, const u8 *end)
 {
     /* p is the start tag; the end tag belongs at p + 4 + SPI_LINE_BYTES.
      * Accept it within a small window: the link shifts framing bytes. */
@@ -308,6 +307,11 @@ static int spi_line_end_ok(const u8 *p, const u8 *end)
         if (t >= p + 4 && t + 4 <= end && (spi_tag_eq(t, 0x9d) || spi_tag_eq(t, 0xa6))) {
             return 1;
         }
+    }
+    /* End tag missing: the next line head sitting exactly after this line's
+     * 4+LINE bytes still proves this was a real start. */
+    if (p + 8 + SPI_LINE_BYTES + 4 <= end && spi_tag_eq(p + 4 + SPI_LINE_BYTES + 4, 0x80)) {
+        return 1;
     }
     return 0;
 }
@@ -382,32 +386,19 @@ static int spi_consume_packet(const u8 *buf, int len)
             s_spi_line       = 0;
             s_spi_assembling = 1;
             s_line_pending   = 0;
-            s_frame_bad      = 0;
             s_frame_start_ms = (u32)tkl_system_get_millisecond();
             p += 4;
         } else if (spi_tag_eq(p, 0x80)) {
             if (s_spi_assembling && s_spi_line < (u32)SPI_SENSOR_HEIGHT) {
                 if (p + 4 + SPI_LINE_BYTES <= end) {
-                    u8 *dst = s_spi_frame + s_spi_line * SPI_LINE_BYTES;
-
-                    /* A row whose end tag is not where the framing says is a
-                     * byte-slipped or false-head line - copying it paints a
-                     * purple/green streak. Duplicate the previous row so the
-                     * row index stays aligned, and mark the frame: the
-                     * delivery gate drops it at the end tag instead of
-                     * painting the streak. */
-                    if (spi_line_end_ok(p, end)) {
-                        memcpy(dst, p + 4, SPI_LINE_BYTES);
-                    } else if (s_spi_line > 0) {
-                        memcpy(dst, dst - SPI_LINE_BYTES, SPI_LINE_BYTES);
-                        s_dbg_frame_bad++;
-                        s_frame_bad++;
-                    } else {
-                        memset(dst, 0x10, SPI_LINE_BYTES);
-                        s_dbg_frame_bad++;
-                        s_frame_bad++;
+                    /* Only a start whose framing checks out is a row. A bare
+                     * 0xFF000080 inside saturated pixel data is skipped here:
+                     * copying it painted the purple/green streaks, and faking
+                     * a row for it poisoned every frame in bright scenes. */
+                    if (spi_line_start_ok(p, end)) {
+                        memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, p + 4, SPI_LINE_BYTES);
+                        s_spi_line++;
                     }
-                    s_spi_line++;
                 } else {
                     /* Straddles the block: carry the head bytes into the next. */
                     u32 avail = (u32)(end - (p + 4));
@@ -428,12 +419,22 @@ static int spi_consume_packet(const u8 *buf, int len)
              * two frames as one. */
             if (s_spi_assembling && s_spi_line > 0 &&
                 (u32)tkl_system_get_millisecond() - s_frame_start_ms < 400u) {
-                /* Only a frame that arrived whole is painted: every source row
-                 * present and no row substituted because its end tag was
-                 * misplaced. The panel therefore refreshes at the rate of clean
-                 * frames (a few per second on this link) but never shows a
-                 * frame with streaks or a missing band. */
-                if (s_spi_line == (u32)SPI_SENSOR_HEIGHT && s_frame_bad == 0) {
+                /* A frame missing its last few rows is completed with the
+                 * previous row rather than dropped: on this link a single byte
+                 * slip per frame is common, and rejecting every shortened
+                 * frame left the panel stuck on the last good picture. Grossly
+                 * short assemblies (more than four rows) are still dropped. */
+                if (s_spi_line >= (u32)SPI_SENSOR_HEIGHT) {
+                    s_spi_line = (u32)SPI_SENSOR_HEIGHT;
+                } else if (s_spi_line >= (u32)SPI_SENSOR_HEIGHT - 4u) {
+                    const u8 *last = s_spi_frame + (s_spi_line - 1u) * SPI_LINE_BYTES;
+
+                    while (s_spi_line < (u32)SPI_SENSOR_HEIGHT) {
+                        memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, last, SPI_LINE_BYTES);
+                        s_spi_line++;
+                    }
+                }
+                if (s_spi_line == (u32)SPI_SENSOR_HEIGHT) {
                     if (JIELI_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
                         camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
                                              TUYA_FRAME_FMT_YUV422);
@@ -629,8 +630,8 @@ static void spi_capture_thread(void *arg)
             if (last_ms == 0) {
                 last_ms = now_ms;
             } else if (now_ms - last_ms >= 5000u) {
-                printf("[%s] SPI st frames=%u badrows=%u skipped=%u\n", CAM_TAG, (unsigned)s_dbg_frames,
-                       (unsigned)s_dbg_frame_bad, (unsigned)s_dbg_skipped);
+                printf("[%s] SPI st frames=%u skipped=%u\n", CAM_TAG, (unsigned)s_dbg_frames,
+                       (unsigned)s_dbg_skipped);
                 last_ms = now_ms;
             }
         }
@@ -662,7 +663,6 @@ static OPERATE_RET spi_prepare(void)
     s_spi_armed      = 0;
     s_sensor_done    = 0;
     s_dbg_frames     = 0;
-    s_dbg_frame_bad  = 0;
     s_dbg_skipped    = 0;
 
     /* DMA buffers: the driver fills whole block_size frames and hands them to

@@ -149,8 +149,8 @@ static void GC0310_config_SENSOR(u16 *width, u16 *height, u8 *format, u8 *frame_
     wrGC0310Reg(0x01, 0x0f);
     wrGC0310Reg(0x02, 0x04);
 
-    wrGC0310Reg(0x03, 0x06); //TuyaOpen: VTS 1590 (~5 fps) keeps the sensor under the 2-wire SPI sustain rate
-    wrGC0310Reg(0x04, 0x36);
+    wrGC0310Reg(0x03, 0x02);
+    wrGC0310Reg(0x04, 0x12);
 
     wrGC0310Reg(0x09, 0x00);
     wrGC0310Reg(0x0a, 0x00);

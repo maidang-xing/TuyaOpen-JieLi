@@ -271,7 +271,7 @@ static int spi_tag_eq(const u8 *p, u8 b3)
  * one line. Default stays on the block path until this is verified on the
  * board. */
 #ifndef JIELI_SPI_LINE_IRQ
-#define JIELI_SPI_LINE_IRQ 0
+#define JIELI_SPI_LINE_IRQ 1
 #endif
 
 #if JIELI_SPI_LINE_IRQ
@@ -283,6 +283,7 @@ static int spi_tag_eq(const u8 *p, u8 b3)
 #endif
 extern void *ram_malloc(unsigned long size);
 extern void ram_free(void *rmem);
+extern u8 dma_copy_async(void *dst, void *src, int len);
 
 #define SPI_IRQ_LINE_MID    (4U + SPI_LINE_BYTES + 4U)  /* LHEAD + payload + LEND */
 #define SPI_IRQ_LINE_FIRST  (4U + SPI_IRQ_LINE_MID)     /* FHEAD + line           */
@@ -312,8 +313,15 @@ static ___interrupt void spi_line_isr(void) sec(.volatile_ram_code)
 
     if (s_irq_active) {
         if (tag == (row == 0U ? SPI_IRQ_TAG_FHEAD : SPI_IRQ_TAG_LHEAD)) {
-            memcpy(s_irq_frames[s_irq_wr] + (size_t)row * SPI_LINE_BYTES, buf + (row == 0U ? 8U : 4U),
-                   SPI_LINE_BYTES);
+            /* Copy with the DMA engine, exactly like the vendor ISR: the next
+             * line follows within ~100 us at 24 MHz PCLK, and a CPU memcpy of
+             * 1280 bytes into the SDRAM frame buffer does not finish in time.
+             * Both addresses are 4-byte aligned: the line buffers come from
+             * ram_malloc with the head at +4/+8, and each frame row is 1280
+             * bytes. Rotating 8 line buffers x SPI_IRQ_FRAME_NUM frames keep
+             * the DMA ahead of the re-arm. */
+            (void)dma_copy_async((void *)(s_irq_frames[s_irq_wr] + (size_t)row * SPI_LINE_BYTES),
+                                 (void *)(buf + (row == 0U ? 8U : 4U)), (int)SPI_LINE_BYTES);
             row++;
             s_irq_lines_done++;
         } else {

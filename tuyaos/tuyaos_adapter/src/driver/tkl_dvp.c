@@ -680,6 +680,12 @@ static void spi_capture_thread(void *arg)
      * then let the sensor restart its stream: the vendor order is video1.0 ->
      * 20 ms -> spi2 -> receive, and arming before the peer sends is mandatory
      * (apps/common/example/peripheral/spi/spi_slave/main.c:64). */
+#if defined(JIELI_CAMERA_TDD_SENSOR) && (JIELI_CAMERA_TDD_SENSOR == 1)
+    /* TDD already ran the register table during open(); there is no video1
+     * device to wait for. The restart below re-aligns the stream. */
+    s_sensor_ready = 1;
+    s_sensor_done  = 1;
+#else
     {
         static TKL_THREAD_HANDLE s_sensor_thread;
         if (tkl_thread_create(&s_sensor_thread, "cam_sensor", 2048, 4, spi_sensor_open_thread, NULL) != OPRT_OK) {
@@ -698,6 +704,7 @@ static void spi_capture_thread(void *arg)
         printf("[%s] SPI: sensor did not come up\n", CAM_TAG);
         goto out_sensor;
     }
+#endif
 
     printf("[%s] SPI: opening spi2\n", CAM_TAG);
     s_spi_dev = dev_open("spi2", NULL);
@@ -748,6 +755,16 @@ static void spi_capture_thread(void *arg)
     s_spi_armed = 1;
     printf("[%s] SPI capture started (%ux%u, line IRQ, first %u B / line %u B)\n", CAM_TAG, SPI_SENSOR_WIDTH,
            SPI_SENSOR_HEIGHT, (unsigned)SPI_IRQ_LINE_FIRST, (unsigned)SPI_IRQ_LINE_MID);
+
+#if defined(JIELI_CAMERA_TDD_SENSOR) && (JIELI_CAMERA_TDD_SENSOR == 1)
+    /* The board provides this (see board_com_api.c); it resets and re-runs the
+     * TDD sensor register table so the first clock SPI2 sees is a frame head. */
+    {
+        extern OPERATE_RET tkl_camera_sensor_restart(void);
+        int r = tkl_camera_sensor_restart();
+        printf("[%s] SPI: TDD sensor restart ret=%d\n", CAM_TAG, r);
+    }
+#endif
 
     while (s_running) {
         if (s_irq_ready) {
@@ -848,6 +865,15 @@ static OPERATE_RET spi_prepare(void)
     s_sensor_done    = 0;
     s_dbg_frames     = 0;
     s_dbg_skipped    = 0;
+
+#if defined(JIELI_CAMERA_TDD_SENSOR) && (JIELI_CAMERA_TDD_SENSOR == 1)
+    /* The sensor is configured over IIC1 by the TDD before tkl_dvp_start(),
+     * so it needs its MCLK from init() rather than from the vendor video1
+     * open path. Re-asserting the channel later is harmless. */
+    printf("[%s] SPI: output XCLK PH2 early for TDD sensor init\n", CAM_TAG);
+    gpio_output_channle(IO_PORTH_02, CH1_PLL_24M);
+    tkl_system_sleep(5);
+#endif
 
     /* DMA buffers: the driver fills whole block_size frames and hands them to
      * the reader. Four blocks give the unpacking copy room to fall behind

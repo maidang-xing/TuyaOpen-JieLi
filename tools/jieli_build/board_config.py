@@ -11,12 +11,195 @@ from typing import Optional
 from .errors import BuildError
 from .audio_profile import AudioProfile
 from .board_facts import BoardFacts, LogUart, ServiceUart
+from .staging_fs import write_staged_bytes, write_staged_text
 
 # The UART platform data names both the pins and the port group they belong to
 # (``.port = PORTA_5_6`` next to ``.tx_pin = IO_PORTA_05``). The board states the
 # pins; the group is derived from them, because the schema has no field for it
 # and a pin pair is what actually selects the group.
 _PIN_PATTERN = re.compile(r"^IO_PORT([A-Z])_(\d{1,2})$")
+_ADC_INIT_CALL = re.compile(r"\badc_init\s*\(\s*\)\s*;")
+
+
+def _mask_c_noncode(content: str, *, reject_line_comment_continuation: bool = False) -> str:
+    """Mask comments and literals while preserving source offsets and lines."""
+    masked = list(content)
+    state = "code"
+    index = 0
+    while index < len(content):
+        char = content[index]
+        next_char = content[index + 1] if index + 1 < len(content) else ""
+        if state == "code":
+            if char == "/" and next_char == "/":
+                masked[index] = masked[index + 1] = " "
+                index += 2
+                state = "line_comment"
+                continue
+            if char == "/" and next_char == "*":
+                masked[index] = masked[index + 1] = " "
+                index += 2
+                state = "block_comment"
+                continue
+            if char in ('"', "'"):
+                masked[index] = " "
+                state = "string" if char == '"' else "char"
+        elif state in ("line_comment", "block_comment", "string", "char"):
+            if char not in "\r\n":
+                masked[index] = " "
+            if state == "line_comment" and char == "\\" and next_char in "\r\n":
+                # C phase-2 line splicing extends // comments across this newline.
+                if reject_line_comment_continuation:
+                    raise BuildError("board_init has a continued // comment; cannot safely stage ADC init")
+                if next_char == "\r" and index + 2 < len(content) and content[index + 2] == "\n":
+                    index += 3
+                else:
+                    index += 2
+                continue
+            if state == "line_comment" and char in "\r\n":
+                state = "code"
+            elif state == "block_comment" and char == "*" and next_char == "/":
+                masked[index + 1] = " "
+                index += 2
+                state = "code"
+                continue
+            elif state in ("string", "char"):
+                if char == "\\" and index + 1 < len(content):
+                    if content[index + 1] not in "\r\n":
+                        masked[index + 1] = " "
+                    index += 2
+                    continue
+                if (state == "string" and char == '"') or (state == "char" and char == "'"):
+                    state = "code"
+        index += 1
+    return "".join(masked)
+
+
+def _board_init_body(content: str) -> tuple[int, int]:
+    """Return the opening and closing brace offsets for board_init()."""
+    masked = _mask_c_noncode(content)
+    match = re.search(r"void\s+board_init\s*\([^)]*\)\s*\{", masked)
+    if match is None:
+        raise BuildError("Jieli board file has no board_init function")
+    opening = masked.find("{", match.start(), match.end())
+    brace_depth = 0
+    conditional_depth = 0
+    in_function = False
+    line_offset = 0
+    for line in masked.splitlines(keepends=True):
+        line_end = line_offset + len(line)
+        directive = re.match(r"\s*#\s*(\w+)\b", line)
+        if directive:
+            if in_function and any(char in line for char in "{}"):
+                raise BuildError("board_init preprocessor directive contains braces")
+            if in_function and line.rstrip("\r\n").endswith("\\"):
+                raise BuildError("board_init has a continued preprocessor directive")
+            command = directive.group(1)
+            if command in ("if", "ifdef", "ifndef"):
+                conditional_depth += 1
+            elif command == "endif":
+                conditional_depth -= 1
+                if conditional_depth < 0:
+                    raise BuildError("board_init has an unmatched #endif before its body")
+        elif conditional_depth and (in_function or line_offset <= opening < line_end) and any(
+            char in "{}" for char in line[max(0, opening - line_offset):]
+        ):
+            raise BuildError("board_init conditional branch contains braces")
+
+        for offset in range(max(opening, line_offset), line_end):
+            if offset == opening:
+                in_function = True
+            if not in_function or directive:
+                continue
+            if masked[offset] == "{":
+                brace_depth += 1
+            elif masked[offset] == "}":
+                brace_depth -= 1
+                if brace_depth == 0:
+                    body = content[opening + 1:offset]
+                    _mask_c_noncode(body, reject_line_comment_continuation=True)
+                    return opening, offset
+        line_offset = line_end
+    raise BuildError("Jieli board_init function has unbalanced braces")
+
+
+def _board_init_adc_call_count(content: str) -> int:
+    opening, closing = _board_init_body(content)
+    body = content[opening + 1 : closing]
+    # Comments and literals are not executable calls; masking preserves offsets.
+    body = _mask_c_noncode(body)
+    return len(_ADC_INIT_CALL.findall(body))
+
+
+def _make_adc_call_unconditional(content: str) -> str:
+    """Keep ADC init unconditional without changing its board_init sequence point.
+
+    We do not evaluate preprocessor expressions: the effective definitions can
+    come from nested includes and build flags. Only a one-line #if/#endif block
+    containing exactly the call can be safely moved. Other conditional shapes
+    fail staging rather than guessing about execution or initialization order.
+    """
+    opening, closing = _board_init_body(content)
+    body = content[opening + 1:closing]
+    masked = _mask_c_noncode(body)
+    match = _ADC_INIT_CALL.search(masked)
+    if match is None:
+        raise BuildError("Could not locate executable adc_init() in board_init")
+
+    lines = body.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+    call_line_index = next(
+        (index for index, start in enumerate(offsets) if start <= match.start() < start + len(lines[index])),
+        None,
+    )
+    if call_line_index is None:
+        raise BuildError("Could not identify adc_init() line in board_init")
+
+    call_line = lines[call_line_index]
+    call_line_start = offsets[call_line_index]
+    if masked[call_line_start:match.start()].strip() or masked[match.end():call_line_start + len(call_line)].strip():
+        raise BuildError("adc_init() shares a line with other code; cannot safely relocate it")
+
+    depth = 0
+    for index in range(call_line_index):
+        directive = re.match(r"\s*#\s*(if|ifdef|ifndef|endif)\b", lines[index])
+        if directive:
+            depth += 1 if directive.group(1) != "endif" else -1
+    if depth == 0:
+        return content
+
+    # Accept only a top-level guard directly wrapping this call. This keeps
+    # placement relative to surrounding hardware initialization and rejects
+    # nested guards, #else/#elif, and wider condition-controlled sequences.
+    if call_line_index == 0 or call_line_index + 1 >= len(lines):
+        raise BuildError("Conditionally guarded adc_init() has no simple #if/#endif wrapper")
+    guard_line = lines[call_line_index - 1]
+    end_line = lines[call_line_index + 1]
+    if not re.match(r"\s*#\s*if\b", guard_line) or not re.match(r"\s*#\s*endif\b", end_line):
+        raise BuildError("Conditionally guarded adc_init() uses #else/#elif or a complex guard")
+    if depth != 1:
+        raise BuildError("Conditionally guarded adc_init() is nested; cannot safely relocate it")
+    if masked[offsets[call_line_index - 1] + len(guard_line):call_line_start].strip():
+        raise BuildError("Conditionally guarded adc_init() has intervening code")
+    end_start = offsets[call_line_index + 1]
+    if masked[call_line_start + len(call_line):end_start].strip():
+        raise BuildError("Conditionally guarded adc_init() has intervening code")
+
+    indentation = re.match(r"[ \t]*", call_line).group(0)
+    newline = "\r\n" if "\r\n" in body else "\n"
+    inserted_call = f"{indentation}adc_init();{newline}"
+    guard_start = offsets[call_line_index - 1]
+    body = (
+        body[:guard_start]
+        + inserted_call
+        + body[guard_start:call_line_start]
+        + body[call_line_start:call_line_start + (match.start() - call_line_start)]
+        + body[match.end():]
+    )
+    return content[:opening + 1] + body + content[closing:]
 
 # The port-group macros the wl82 SDK's asm/uart.h defines, and the only values a
 # UART platform-data block may name. The header lists exactly these, so a pair
@@ -24,9 +207,9 @@ _PIN_PATTERN = re.compile(r"^IO_PORT([A-Z])_(\d{1,2})$")
 # name an identifier the vendor headers never define, and the compile would fail
 # inside SDK code rather than here.
 #
-# tests/test_board_config.py cross-checks this against the header when the SDK
-# checkout is present, so a vendor update that adds or removes a group fails
-# there rather than at link time.
+# A pair that is not among them has no macro to expand to: the generated block
+# would name an identifier the vendor headers never define, and the compile
+# would fail inside SDK code rather than here.
 UART_PORT_GROUPS = (
     "PORTA_3_4", "PORTA_5_6",
     "PORTB_1_2", "PORTB_3_4", "PORTB_6_7",
@@ -143,7 +326,7 @@ def configure_log_uart_block(
     )
     if count != 1:
         raise BuildError(f"Jieli debug_uart_init does not initialize UART2 in {board_file}")
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)
 
 def configure_log_uart_baudrate(
     board_header: Path, uart_port: int, baudrate: int, facts: BoardFacts
@@ -171,7 +354,7 @@ def configure_log_uart_baudrate(
         raise BuildError(
             f"UART{log_uart.port} baudrate was not found in {board_header}"
         )
-    board_header.write_text(content, encoding="utf-8")
+    write_staged_text(board_header, content)
 
 def configure_service_uart(board_file: Path, facts: BoardFacts) -> None:
     """Route the Tuya logical UART0/TAL CLI to the board's service UART.
@@ -249,7 +432,7 @@ def configure_service_uart(board_file: Path, facts: BoardFacts) -> None:
             1,
         )
 
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)
 
 def configure_full_stack_wifi(board_file: Path, reference_board_file: Optional[Path] = None) -> None:
     """Add the chip-specific RF calibration required by the WiFi SDK libraries."""
@@ -292,7 +475,7 @@ def configure_full_stack_wifi(board_file: Path, reference_board_file: Optional[P
         if board_init_marker not in content:
             raise BuildError(f"Jieli board file has no calibration insertion point: {board_file}")
         content = content.replace(board_init_marker, calibration + board_init_marker, 1)
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)
 
 def configure_full_stack_app_config(app_config_file: Path) -> None:
     """Enable the vendor Wi-Fi/BLE pieces used by the Tuya full-stack image."""
@@ -323,7 +506,7 @@ def configure_full_stack_app_config(app_config_file: Path) -> None:
     insert_at = content.rfind("#endif")
     if insert_at < 0:
         raise BuildError(f"Jieli app_config.h has no final #endif: {app_config_file}")
-    app_config_file.write_text(content[:insert_at] + config + content[insert_at:], encoding="utf-8")
+    write_staged_text(app_config_file, content[:insert_at] + config + content[insert_at:])
 
 def _rewrite_memory_macros(config_file: Path, sizes: dict[str, int]) -> None:
     """Set named memory macros exactly once in an SDK staging config."""
@@ -342,7 +525,7 @@ def _rewrite_memory_macros(config_file: Path, sizes: dict[str, int]) -> None:
                 f"Expected exactly one {macro} definition in {config_file}, found {count}"
             )
 
-    config_file.write_text(content, encoding="utf-8")
+    write_staged_text(config_file, content)
 
 def configure_board_memory(
     config_file: Path, facts: BoardFacts, ddr_config_file: Optional[Path] = None
@@ -385,7 +568,162 @@ def configure_board_memory(
             f"Expected exactly one CONFIG_NO_SDRAM_ENABLE definition in "
             f"{ddr_config_file}, found {count}"
         )
-    ddr_config_file.write_text(content, encoding="utf-8")
+    write_staged_text(ddr_config_file, content)
+
+
+_TUYA_FLASH_PARTITIONS = ("KV_KEY", "KV_DATA", "UF", "RCD", "USER0")
+
+
+def _c_hex_literal(content: str, name: str, source: Path) -> int:
+    """Read one plain hex #define; the flash map is parsed, not duplicated."""
+    match = re.search(rf"(?m)^[ \t]*#define[ \t]+{name}[ \t]+(0x[0-9A-Fa-f]+)U?[ \t]*$", content)
+    if match is None:
+        raise BuildError(
+            f"Expected one hex-literal {name} in {source}; the vendor reserved area "
+            f"is derived from it"
+        )
+    return int(match.group(1), 16)
+
+
+def tuya_flash_reserved_area(tkl_flash_c: Path) -> tuple[int, int]:
+    """Return the (start, length) span of the TuyaOpen flash partitions."""
+    if not tkl_flash_c.is_file():
+        raise BuildError(f"TuyaOpen flash map not found: {tkl_flash_c}")
+
+    content = tkl_flash_c.read_text(encoding="utf-8")
+    spans = []
+    for partition in _TUYA_FLASH_PARTITIONS:
+        start = _c_hex_literal(content, f"JIELI_{partition}_START", tkl_flash_c)
+        size = _c_hex_literal(content, f"JIELI_{partition}_SIZE", tkl_flash_c)
+        if size == 0:
+            raise BuildError(f"Zero-sized TuyaOpen flash partition: JIELI_{partition}_SIZE")
+        spans.append((start, start + size))
+
+    start = min(span[0] for span in spans)
+    end = max(span[1] for span in spans)
+    if start % 0x1000 or (end - start) % 0x1000:
+        raise BuildError("TuyaOpen flash partitions must be 4 KiB aligned")
+    return start, end - start
+
+
+def configure_flash_reserved_area(
+    rule_file: Path, tkl_flash_c: Path, facts: BoardFacts
+) -> None:
+    """Reserve the TuyaOpen partition span in the vendor flash map.
+
+    ``_OPT=1`` tells the downloader not to touch the area, so the KV
+    credentials and the UF/RCD partitions survive a USB download. The address
+    is read from tkl_flash.c, the map the runtime actually uses.
+    """
+    if not rule_file.is_file():
+        raise BuildError(f"Vendor flash rule not found: {rule_file}")
+
+    start, length = tuya_flash_reserved_area(tkl_flash_c)
+    flash_size = facts.memory.flash_mib * 1024 * 1024
+    if start + length > flash_size:
+        raise BuildError(
+            f"TuyaOpen flash area 0x{start:06X}+0x{length:06X} exceeds the "
+            f"{facts.board} {facts.memory.flash_mib} MiB flash"
+        )
+
+    block = (
+        "// TUYAOPEN_RESERVED_AREA_BEGIN\n"
+        f"TUYAOPEN_ADR=0x{start:06X}; [TuyaOpen KV/UF/RCD/USER0]\n"
+        f"TUYAOPEN_LEN=0x{length:06X};\n"
+        "TUYAOPEN_OPT=1;\n"
+        "// TUYAOPEN_RESERVED_AREA_END\n"
+    )
+    content = rule_file.read_text(encoding="utf-8")
+    content, count = re.subn(
+        r"(?ms)^[ \t]*// TUYAOPEN_RESERVED_AREA_BEGIN.*?// TUYAOPEN_RESERVED_AREA_END\r?\n?",
+        block,
+        content,
+    )
+    if count == 0:
+        anchor = "BTIF_ADR=AUTO;"
+        if anchor not in content:
+            raise BuildError(f"Vendor flash rule has no {anchor}: {rule_file}")
+        content = content.replace(anchor, block + "\n" + anchor, 1)
+    elif count != 1:
+        raise BuildError(
+            f"Expected at most one TUYAOPEN_RESERVED_AREA block in {rule_file}, found {count}"
+        )
+    write_staged_text(rule_file, content)
+
+
+def configure_peripheral_header(board_file: Path, config_values) -> Path:
+    """Stage the board's peripheral pin facts as a header next to board.c.
+
+    The adapter sources are compiled with this header force-included, so a pin
+    a board declares in Kconfig reaches the platform data without a second copy
+    in C. Symbols the board does not declare stay undefined, which lets the
+    adapter keep its own fallback, and the header is written either way so the
+    build's -include never points at a missing file.
+    """
+    pins = (
+        ("CONFIG_JIELI_BOARD_SPI0_CLK_PIN", "TUYA_BOARD_SPI0_CLK_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI0_DO_PIN", "TUYA_BOARD_SPI0_DO_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI0_DI_PIN", "TUYA_BOARD_SPI0_DI_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI1_CLK_PIN", "TUYA_BOARD_SPI1_CLK_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI1_DO_PIN", "TUYA_BOARD_SPI1_DO_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI1_DI_PIN", "TUYA_BOARD_SPI1_DI_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI2_CLK_PIN", "TUYA_BOARD_SPI2_CLK_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI2_DO_PIN", "TUYA_BOARD_SPI2_DO_PIN"),
+        ("CONFIG_JIELI_BOARD_SPI2_DI_PIN", "TUYA_BOARD_SPI2_DI_PIN"),
+        ("CONFIG_JIELI_BOARD_UART1_TX_PIN", "TUYA_BOARD_UART1_TX_PIN"),
+        ("CONFIG_JIELI_BOARD_UART1_RX_PIN", "TUYA_BOARD_UART1_RX_PIN"),
+        ("CONFIG_JIELI_BOARD_PWM0_H_PIN", "TUYA_BOARD_PWM0_H_PIN"),
+        ("CONFIG_JIELI_BOARD_PWM0_L_PIN", "TUYA_BOARD_PWM0_L_PIN"),
+        ("CONFIG_JIELI_BOARD_PWM1_H_PIN", "TUYA_BOARD_PWM1_H_PIN"),
+        ("CONFIG_JIELI_BOARD_PWM1_L_PIN", "TUYA_BOARD_PWM1_L_PIN"),
+        ("CONFIG_JIELI_BOARD_PWM2_H_PIN", "TUYA_BOARD_PWM2_H_PIN"),
+        ("CONFIG_JIELI_BOARD_PWM2_L_PIN", "TUYA_BOARD_PWM2_L_PIN"),
+        ("CONFIG_JIELI_BOARD_PWM3_H_PIN", "TUYA_BOARD_PWM3_H_PIN"),
+        ("CONFIG_JIELI_BOARD_PWM3_L_PIN", "TUYA_BOARD_PWM3_L_PIN"),
+        ("CONFIG_JIELI_BOARD_PWM0_PIN", "TUYA_BOARD_PWM0_PIN"),
+        ("CONFIG_JIELI_BOARD_IIC0_SCL_PIN", "TUYA_BOARD_IIC0_SCL_PIN"),
+        ("CONFIG_JIELI_BOARD_IIC0_SDA_PIN", "TUYA_BOARD_IIC0_SDA_PIN"),
+        ("CONFIG_JIELI_BOARD_IIC1_SCL_PIN", "TUYA_BOARD_IIC1_SCL_PIN"),
+        ("CONFIG_JIELI_BOARD_IIC1_SDA_PIN", "TUYA_BOARD_IIC1_SDA_PIN"),
+        ("CONFIG_JIELI_BOARD_IIC2_SCL_PIN", "TUYA_BOARD_IIC2_SCL_PIN"),
+        ("CONFIG_JIELI_BOARD_IIC2_SDA_PIN", "TUYA_BOARD_IIC2_SDA_PIN"),
+    )
+    defines = []
+    for symbol, macro in pins:
+        raw = None if config_values is None else config_values.get(symbol)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            value = int(text, 0)
+        except ValueError:
+            raise BuildError(f"{symbol} must be an integer pin number, got {raw!r}")
+        if value < 0:
+            raise BuildError(f"{symbol} must not be negative, got {value}")
+        defines.append(f"#define {macro} {value}")
+
+    if config_values is not None and \
+            str(config_values.get("CONFIG_JIELI_BOARD_UART1_ENABLE", "")).strip() == "y":
+        defines.append("#define TUYA_BOARD_UART1_ENABLE 1")
+
+    lines = [
+        "/* Generated by the JIELI platform from the board Kconfig. */",
+        "#ifndef TUYA_BOARD_PERIPH_CONFIG_H",
+        "#define TUYA_BOARD_PERIPH_CONFIG_H",
+        "",
+    ]
+    lines.extend(defines)
+    if defines:
+        lines.append("")
+    lines.append("#endif")
+    lines.append("")
+
+    header = board_file.parent / "tuya_board_periph_config.h"
+    write_staged_text(header, "\n".join(lines))
+    return header
+
 
 def configure_audio_board(board_file: Path, audio_config_header: Path, board: "AudioProfile") -> None:
     """Patch the staged board file with the profile's audio device and init.
@@ -418,8 +756,8 @@ def configure_audio_board(board_file: Path, audio_config_header: Path, board: "A
                 board_audio_include + '\n#include "server/audio_dev.h"',
                 1,
             )
-        board_file.write_text(content, encoding="utf-8")
-        staged_header.write_bytes(audio_config_header.read_bytes())
+        write_staged_text(board_file, content)
+        write_staged_bytes(staged_header, audio_config_header.read_bytes())
         return
 
     include_marker = '#include "asm/includes.h"'
@@ -452,11 +790,38 @@ def configure_audio_board(board_file: Path, audio_config_header: Path, board: "A
         + board.board_early_init_post
         + content[devices_finish:]
     )
-    if board.board_init:
-        init_marker = re.search(r"void\s+board_init\s*\([^)]*\)\s*\{", content)
-        if init_marker is None:
-            raise BuildError(f"Jieli board file has no board_init function: {board_file}")
-        content = content[:init_marker.end()] + board.board_init + content[init_marker.end():]
+    init_marker = re.search(
+        r"void\s+board_init\s*\([^)]*\)\s*\{", _mask_c_noncode(content)
+    )
+    if init_marker is None:
+        raise BuildError(f"Jieli board file has no board_init function: {board_file}")
+    existing_adc_calls = _board_init_adc_call_count(content)
+    if existing_adc_calls > 1:
+        raise BuildError(
+            f"Jieli board_init already contains {existing_adc_calls} adc_init() calls: {board_file}"
+        )
+    profile_init = board.board_init
+    profile_adc_calls = len(_ADC_INIT_CALL.findall(profile_init))
+    if existing_adc_calls:
+        # Do not infer effective macros from app_config.h text: nested guards,
+        # included headers, and build flags determine the actual preprocessing.
+        # Preserve unconditional calls; safely hoist only a simple direct guard.
+        try:
+            content = _make_adc_call_unconditional(content)
+        except BuildError as error:
+            raise BuildError(f"Cannot guarantee board ADC initialization in {board_file}: {error}") from error
+    if existing_adc_calls and profile_adc_calls:
+        # Do not reinitialize the shared SDK ADC queue if this board already
+        # performs startup initialization (WL83's demo board does).
+        profile_init = _ADC_INIT_CALL.sub("", profile_init)
+    elif not existing_adc_calls and not profile_adc_calls:
+        # The TKL ADC registers channels on the SDK's global queue. Ensure it
+        # exists even on a board whose profile has no ADC-specific init code.
+        profile_init = "\n    adc_init();\n" + profile_init
+    if profile_adc_calls > 1:
+        raise BuildError("Jieli audio board profile contains multiple adc_init() calls")
+    if profile_init:
+        content = content[:init_marker.end()] + profile_init + content[init_marker.end():]
 
     content = content[:table_start] + board.board_declarations + "\n" + content[table_start:]
     table_start = content.find(table_marker)
@@ -467,8 +832,8 @@ def configure_audio_board(board_file: Path, audio_config_header: Path, board: "A
         content = content[: table_open + 1] + (
             '\n    {"audio", &audio_dev_ops, (void *)&tuya_audio_data },'
         ) + content[table_open + 1 :]
-    board_file.write_text(content, encoding="utf-8")
-    staged_header.write_bytes(audio_config_header.read_bytes())
+    write_staged_text(board_file, content)
+    write_staged_bytes(staged_header, audio_config_header.read_bytes())
 
 
 def configure_full_stack_board(board_file: Path, reference_board_file: Optional[Path] = None) -> None:
@@ -488,7 +853,7 @@ def configure_full_stack_board(board_file: Path, reference_board_file: Optional[
             raise BuildError(f"Jieli board file has no board_init function: {board_file}")
         replacement = board_init_marker + "\n#ifdef CONFIG_BT_ENABLE\n    void cfg_file_parse(void);\n    cfg_file_parse();\n#endif"
         content = content.replace(board_init_marker, replacement, 1)
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)
 
 
 # The vendor SDK already implements the download-mode entry point: msd_upgrade.c
@@ -515,7 +880,7 @@ def _insert_before_final_endif(
     insert_at = content.rfind("#endif")
     if insert_at < 0:
         raise BuildError(f"Jieli config has no final #endif: {config_file}")
-    config_file.write_text(content[:insert_at] + block + content[insert_at:], encoding="utf-8")
+    write_staged_text(config_file, content[:insert_at] + block + content[insert_at:])
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +965,7 @@ def _redefine_macro(config_file: Path, name: str, value: str) -> None:
     updated, count = pattern.subn(f"#define {name} {value}", content, count=1)
     if count == 0:
         raise BuildError(f"Jieli config has no #define {name}: {config_file}")
-    config_file.write_text(updated, encoding="utf-8")
+    write_staged_text(config_file, updated)
 
 
 def _define_macro(config_file: Path, name: str) -> None:
@@ -812,7 +1177,39 @@ def configure_lowpower(
         raise BuildError(f"no Jieli low-power profile for chip '{chip_name}'")
 
 
-def configure_usb_download_app_config(app_config_file: Path) -> None:
+def _usb_class_block(usb_cdc_log: bool) -> str:
+    """The USB class list, decided here rather than by the C preprocessor.
+
+    The vendor make never sees a TuyaOpen ``-D``, so a ``#if defined(CONFIG_*)``
+    in the generated header is always false: it silently left the CDC class out
+    and cdc.c compiled to an empty object, which then failed to link against the
+    log output. The switch is a Kconfig value the caller already has, so the
+    class list is written literally. ``usb_common_def.h`` derives
+    TCFG_USB_SLAVE_CDC_ENABLE from MASSSTORAGE_CLASS/CDC_CLASS, so that macro
+    must not be set here as well.
+    """
+    classes = "MASSSTORAGE_CLASS | CDC_CLASS" if usb_cdc_log else "MASSSTORAGE_CLASS"
+    return f"#define USB_DEVICE_CLASS_CONFIG             ({classes})\n"
+
+
+def configure_dual_bank_app_config(app_config_file: Path, config_values) -> None:
+    """Turn on the vendor's dual-bank OTA engine when the board asks for it.
+
+    ``lib_update_config.c`` maps CONFIG_DOUBLE_BANK_ENABLE onto
+    ``support_dual_bank_update_en``, which is what ota_impl.h's
+    dual_bank_passive_update_* path and the uboot bank switch key off.
+    """
+    if config_values is None:
+        return
+    if str(config_values.get("CONFIG_JIELI_BOARD_DUAL_BANK", "")).strip() not in ("y", "true", "True"):
+        return
+    # The vendor profile defines both together: a dual-bank image needs the
+    # duplicated uboot, or the boot side cannot switch between banks.
+    _define_macro(app_config_file, "CONFIG_DOUBLE_BANK_ENABLE")
+    _define_macro(app_config_file, "CONFIG_SUPPORT_DOUBLE_UBOOT")
+
+
+def configure_usb_download_app_config(app_config_file: Path, usb_cdc_log: bool = False) -> None:
     """Enable the AC79 USB slave/MSD stack that serves download-mode requests.
 
     MASSSTORAGE_CLASS is what pulls in msd.c/msd_upgrade.c and enables the SCSI
@@ -832,14 +1229,8 @@ def configure_usb_download_app_config(app_config_file: Path) -> None:
         '#include "board_com_api.h"\n'
         "#endif\n"
         "#endif\n"
-        "#if (defined(ENABLE_JIELI_USB_CDC_LOG) && ENABLE_JIELI_USB_CDC_LOG) || \\\n"
-        "    (defined(CONFIG_ENABLE_JIELI_USB_CDC_LOG) && CONFIG_ENABLE_JIELI_USB_CDC_LOG)\n"
-        "#define TCFG_USB_SLAVE_CDC_ENABLE           1\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS | CDC_CLASS)\n"
-        "#else\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS)\n"
-        "#endif\n"
-        "#define TCFG_HOST_AUDIO_ENABLE              0\n"
+        + _usb_class_block(usb_cdc_log)
+        + "#define TCFG_HOST_AUDIO_ENABLE              0\n"
         "#define TCFG_HOST_UVC_ENABLE                0\n"
         "#define TCFG_HID_HOST_ENABLE                0\n"
         "#define TCFG_UDISK_ENABLE                   0\n"
@@ -850,7 +1241,9 @@ def configure_usb_download_app_config(app_config_file: Path) -> None:
     _insert_before_final_endif(app_config_file, block)
 
 
-def configure_usb_download_board_header(board_header: Path, facts: BoardFacts) -> None:
+def configure_usb_download_board_header(
+    board_header: Path, facts: BoardFacts, usb_cdc_log: bool = False
+) -> None:
     """Enable the AC792 USB slave/MSD stack in the staged board profile.
 
     board_demo.h is reached from the USB sources through
@@ -871,14 +1264,8 @@ def configure_usb_download_board_header(board_header: Path, facts: BoardFacts) -
         '#include "board_com_api.h"\n'
         "#endif\n"
         "#endif\n"
-        "#if (defined(ENABLE_JIELI_USB_CDC_LOG) && ENABLE_JIELI_USB_CDC_LOG) || \\\n"
-        "    (defined(CONFIG_ENABLE_JIELI_USB_CDC_LOG) && CONFIG_ENABLE_JIELI_USB_CDC_LOG)\n"
-        "#define TCFG_USB_SLAVE_CDC_ENABLE           1\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS | CDC_CLASS)\n"
-        "#else\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS)\n"
-        "#endif\n"
-        '#include "usb_std_class_def.h"\n'
+        + _usb_class_block(usb_cdc_log)
+        + '#include "usb_std_class_def.h"\n'
         '#include "usb_common_def.h"\n\n'
     )
     _insert_before_final_endif(board_header, block)
@@ -922,7 +1309,7 @@ def configure_usb_download_board(board_file: Path, usb_ports: str = "0x03") -> N
         device_table + '\n    { "otg", &usb_dev_ops, (void *)&otg_data},',
         1,
     )
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)
 
 
 # The vendor LCD driver has no compile-time default of its own: the panel is
@@ -1071,4 +1458,4 @@ def configure_lcd_board(board_file: Path) -> None:
         "#endif\n"
     )
     content = content.replace(device_table, device_table + "\n" + lcd_entry, 1)
-    board_file.write_text(content, encoding="utf-8")
+    write_staged_text(board_file, content)

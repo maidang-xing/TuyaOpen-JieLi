@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from tools.jieli_build.board_facts import load_board_facts
-from tools.jieli_build.build_plan import chip_probe_path, config_digest, parse_config
+from tools.jieli_build.build_plan import chip_probe_path, config_digest
 from tools.jieli_build.feature_map import enabled_features
 from tools.jieli_build.chip_profiles import JIELI_CHIPS, PLATFORM_ROOT
 from tools.jieli_build.errors import BuildError
@@ -54,8 +54,22 @@ SDK_ROOT_ENV = "JIELI_SDK_ROOT"
 
 
 def parse_build_params(path: Path) -> dict[str, str]:
-    """Read the generated build parameters, in the evaluated config's format."""
-    return parse_config(path)
+    """Read evaluated Kconfig values, retaining declared bools set to n.
+
+    The adapter manifest must distinguish a declared gate set to n from an
+    undefined symbol. Kconfig's ``# CONFIG_X is not set`` line carries that
+    distinction; generic consumers may still treat the resulting ``n`` as
+    false.
+    """
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith("# CONFIG_") and line.endswith(" is not set"):
+            values[line[2 : -len(" is not set")]] = "n"
+        elif line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"')
+    return values
 
 
 # The board catalog under boards/JIELI declares each board twice in Kconfig: the
@@ -367,6 +381,10 @@ def build(param_dir: Path, params: dict[str, str]) -> Path:
         # the board catalog decide what gets staged.
         facts=facts,
         features=enabled_features(params, has_display=facts.display is not None),
+        # build_param.config omits bools whose value is n, so it cannot tell an
+        # unset declared gate from an unknown symbol. The evaluated using.config
+        # preserves both as assignments or "is not set" comments.
+        config_values=parse_build_params(param_dir.parent / CONFIG_RELATIVE),
         # The staging step runs the chip toolchain's preprocessor to prove the
         # profile it just wrote really selects the station's power mode.
         tool_dir=tool_dir,

@@ -6,8 +6,47 @@
 #include "system/malloc.h"
 #include "system/sys_time.h"
 
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+
+extern u32 get_ram_free_heap_size(void);
+extern int get_malloc_remain_heap_size(void);
+extern u32 RAM_HEAP_BEGIN;
+extern u32 RAM_HEAP_END;
+
+/* Shared TuyaOpen code occasionally frees a PSRAM/psram-API allocation through
+ * tal_free() or vice versa. Route each free to the heap that owns the pointer
+ * instead of asserting in the vendor ram_free() range check. */
+static int __jieli_is_ram_ptr(const void *ptr)
+{
+    uintptr_t address = (uintptr_t)ptr;
+    return address >= (uintptr_t)&RAM_HEAP_BEGIN && address <= (uintptr_t)&RAM_HEAP_END;
+}
+
+/* wl83's internal heap is only about 90 KB and the vendor audio/wifi code keeps
+ * allocating from it directly, while TuyaOpen asks for 16-20 KB buffers (AI
+ * ringbufs) that no longer fit after provisioning. Keep a reserve for the
+ * vendor and serve the oversized requests from SDRAM; the frees above already
+ * dispatch on the address, so both heaps stay balanced. */
+#define JIELI_RAM_RESERVE (16U * 1024U)
+
+static void *__jieli_malloc(size_t size)
+{
+#if defined(ENABLE_EXT_RAM) && (ENABLE_EXT_RAM == 1)
+    u32 free_size = get_ram_free_heap_size();
+
+    if (free_size > size && (free_size - size) >= JIELI_RAM_RESERVE) {
+        return ram_malloc(size);
+    }
+
+    void *ptr = malloc(size);
+    if (ptr != NULL) {
+        return ptr;
+    }
+#endif
+    return ram_malloc(size);
+}
 
 static TKL_ABILITY_T s_jieli_ability = {
     .uart = TRUE,
@@ -42,44 +81,75 @@ TKL_ABILITY_T *tkl_get_ability(void)
     return &s_jieli_ability;
 }
 
-void *tkl_system_malloc(size_t size) { return malloc(size); }
-void tkl_system_free(void *ptr) { free(ptr); }
+void *tkl_system_malloc(size_t size) { return __jieli_malloc(size); }
+
+void tkl_system_free(void *ptr)
+{
+    if (ptr == NULL) {
+        return;
+    }
+    if (__jieli_is_ram_ptr(ptr)) {
+        ram_free(ptr);
+    } else {
+        free(ptr);
+    }
+}
+
 void *tkl_system_memset(void *src, int ch, const size_t n) { return memset(src, ch, n); }
 void *tkl_system_memcpy(void *src, const void *dst, const size_t n) { return memcpy(src, dst, n); }
-void *tkl_system_calloc(size_t nitems, size_t size) { return calloc(nitems, size); }
-void *tkl_system_realloc(void *ptr, size_t size) { return realloc(ptr, size); }
+
+void *tkl_system_calloc(size_t nitems, size_t size)
+{
+    size_t total = nitems * size;
+    void *ptr;
+
+    if (size != 0 && total / size != nitems) {
+        return NULL;
+    }
+    ptr = __jieli_malloc(total);
+    if (ptr != NULL) {
+        memset(ptr, 0, total);
+    }
+    return ptr;
+}
+
+void *tkl_system_realloc(void *ptr, size_t size)
+{
+    if (ptr == NULL) {
+        return __jieli_malloc(size);
+    }
+    return __jieli_is_ram_ptr(ptr) ? ram_realloc(ptr, size) : realloc(ptr, size);
+}
+
 int tkl_system_memcmp(const void *str1, const void *str2, size_t n) { return memcmp(str1, str2, n); }
 
-/* PSRAM aliases.
- *
- * JIELI defines no ENABLE_EXT_RAM, so tal_memory.h's Malloc() resolves to
- * tal_malloc() and the AI/audio path never asks for PSRAM. Direct callers do,
- * though - tal_psram_* and the shipped audio examples (output_speaker,
- * output_sdcard) call tkl_system_psram_* unconditionally, and without these
- * the whole image fails to link on JIELI with "undefined reference to
- * tkl_system_psram_malloc".
- *
- * The vendor exposes no PSRAM allocator on wl82 or wl83 (wl82 has no psram_api
- * at all), so route to the ordinary heap. That is the same memory the non-PSRAM
- * path uses, which is the honest answer on a platform with no external RAM -
- * callers asking for "large" buffers get the system heap and a NULL on failure,
- * exactly as before. */
 void *tkl_system_psram_malloc(size_t size) { return malloc(size); }
-void tkl_system_psram_free(void *ptr) { free(ptr); }
+
+void tkl_system_psram_free(void *ptr)
+{
+    if (ptr == NULL) {
+        return;
+    }
+    if (__jieli_is_ram_ptr(ptr)) {
+        ram_free(ptr);
+    } else {
+        free(ptr);
+    }
+}
+
 void *tkl_system_psram_calloc(size_t nitems, size_t size) { return calloc(nitems, size); }
-void *tkl_system_psram_realloc(void *ptr, size_t size) { return realloc(ptr, size); }
 
-int tkl_system_get_free_heap_size(void)
+void *tkl_system_psram_realloc(void *ptr, size_t size)
 {
-    /* The vendor wl82 release does not export heap statistics to apps. */
-    return 0;
+    if (ptr == NULL) {
+        return malloc(size);
+    }
+    return __jieli_is_ram_ptr(ptr) ? ram_realloc(ptr, size) : realloc(ptr, size);
 }
 
-int tkl_system_psram_get_free_heap_size(void)
-{
-    /* No separate PSRAM pool to report - see the aliases above. */
-    return 0;
-}
+int tkl_system_get_free_heap_size(void) { return (int)get_ram_free_heap_size(); }
+
+int tkl_system_psram_get_free_heap_size(void) { return get_malloc_remain_heap_size(); }
 
 SYS_TICK_T tkl_system_get_tick_count(void)
 {

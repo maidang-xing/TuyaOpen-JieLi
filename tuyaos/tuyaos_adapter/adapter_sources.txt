@@ -1,26 +1,27 @@
 src/system/tkl_output.c
 src/system/tkl_system.c
-src/driver/tkl_uart.c
-src/driver/tkl_mipi_dsi.c
-src/driver/tkl_gpio.c
+src/driver/tkl_uart.c CONFIG_ENABLE_UART
+src/driver/tkl_mipi_dsi.c CONFIG_ENABLE_MIPI_DSI
+src/driver/tkl_8080.c CONFIG_ENABLE_MCU8080
+src/driver/tkl_gpio.c CONFIG_ENABLE_GPIO
 src/driver/tkl_pinmux.c
-src/driver/tkl_i2c.c
-src/driver/tkl_pwm.c
-src/driver/tkl_timer.c
-src/driver/tkl_spi.c
+src/driver/tkl_i2c.c CONFIG_ENABLE_I2C
+src/driver/tkl_pwm.c CONFIG_ENABLE_PWM
+src/driver/tkl_timer.c CONFIG_ENABLE_TIMER
+src/driver/tkl_spi.c CONFIG_ENABLE_SPI
 src/system/tkl_thread.c
 src/system/tkl_mutex.c
 src/system/tkl_semaphore.c
 src/system/tkl_queue.c
 src/system/tkl_sleep.c
-src/driver/tkl_flash.c
+src/driver/tkl_flash.c CONFIG_ENABLE_FLASH
 src/driver/tkl_ota.c
 src/system/tkl_assert.c
-src/driver/tkl_bluetooth.c
+src/driver/tkl_bluetooth.c CONFIG_ENABLE_BLUETOOTH
 src/system/tuyaopen_license.c
 src/driver/tkl_network.c
-src/driver/tkl_wifi.c
+src/driver/tkl_wifi.c CONFIG_ENABLE_WIFI
 src/driver/tkl_audio.c
-src/driver/tkl_adc.c
+src/driver/tkl_adc.c CONFIG_ENABLE_ADC
 src/driver/tkl_vad.c
 src/driver/tkl_kws.c

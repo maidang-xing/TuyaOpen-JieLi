@@ -100,6 +100,53 @@ int tkl_system_get_free_heap_size(void);
  */
 int tkl_system_memcmp(const void *str1, const void *str2, size_t n);
 
+#if defined(ENABLE_EXT_RAM) && (ENABLE_EXT_RAM == 1)
+/**
+ * @brief Alloc memory of system in psram
+ *
+ * @param[in] size: memory size
+ *
+ * @return the memory address malloced
+ */
+void *tkl_system_psram_malloc(size_t size);
+
+/**
+ * @brief Free psram memory of system
+ *
+ * @param[in] ptr: memory point
+ *
+ * @return void
+ */
+void tkl_system_psram_free(void *ptr);
+
+/**
+ * @brief Allocate and clear the memory in psram
+ *
+ * @param[in]       nitems      the numbers of memory block
+ * @param[in]       size        the size of the memory block
+ *
+ * @return the memory address calloced
+ */
+void *tkl_system_psram_calloc(size_t nitems, size_t size);
+
+/**
+ * @brief Re-allocate the memory in psram
+ *
+ * @param[in]       ptr         source memory address
+ * @param[in]       size        the size after re-allocate
+ *
+ * @return void
+ */
+void *tkl_system_psram_realloc(void *ptr, size_t size);
+
+/**
+ * @brief Get psram free heap size
+ *
+ * @return heap size
+ */
+int tkl_system_psram_get_free_heap_size(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */

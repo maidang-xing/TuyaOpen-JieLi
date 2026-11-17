@@ -59,6 +59,7 @@ static volatile int      s_running      = 0;
 static volatile int      s_stopped      = 1;
 static void             *s_video_dev    = NULL;
 static u8               *s_yuv_buf      = NULL;
+static u8               *s_yuv_packed   = NULL;
 static u32               s_yuv_buf_size = 0;
 static uint32_t          s_frame_id     = 0;
 static u32               s_frame_count  = 0;
@@ -104,6 +105,36 @@ static void camera_deliver_frame(u8 *data, u32 len, u16 width, u16 height, TUYA_
 /* DVP: J1 / video0                                                          */
 /* ------------------------------------------------------------------------- */
 #if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+
+/* common_lib.a has no prototype in the public headers. */
+extern void flushinv_dcache(void *ptr, int len);
+
+/* video0 hands back planar YUV422P (Y, then U, then V); TDL's YUV422
+ * contract is the packed 4-byte/two-pixel group. Interleave here so the
+ * generic example and tdl_disp_convert_yuv422_to_fb see one format on both
+ * the DVP and SPI paths, instead of every consumer decoding the vendor's
+ * layout itself. */
+static void yuv422p_to_packed_yuyv(const u8 *src, u8 *dst, u32 width, u32 height)
+{
+    size_t         y_size = (size_t)width * (size_t)height;
+    const u8      *u_plane = src + y_size;
+    const u8      *v_plane = u_plane + y_size / 2U;
+
+    for (u32 row = 0; row < height; row++) {
+        const u8 *y_row = src + (size_t)row * width;
+        const u8 *u_row = u_plane + (size_t)row * (width / 2U);
+        const u8 *v_row = v_plane + (size_t)row * (width / 2U);
+        u8       *out   = dst + (size_t)row * width * 2U;
+
+        for (u32 x = 0; x < width; x += 2U) {
+            out[0] = y_row[x];
+            out[1] = u_row[x >> 1];
+            out[2] = y_row[x + 1U];
+            out[3] = v_row[x >> 1];
+            out += 4;
+        }
+    }
+}
 
 static void dvp_capture_thread(void *arg)
 {
@@ -170,7 +201,12 @@ static void dvp_capture_thread(void *arg)
             tkl_system_sleep(5);
             continue;
         }
-        camera_deliver_frame(yuv.addr, yuv.size, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT, TUYA_FRAME_FMT_YUV422);
+        /* The vendor writes the overlay buffer from DMA; the CPU copy below
+         * must not read stale lines. This is the TKL's job, not the example's. */
+        flushinv_dcache(yuv.addr, (int)yuv.size);
+        yuv422p_to_packed_yuyv(yuv.addr, s_yuv_packed, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT);
+        camera_deliver_frame(s_yuv_packed, s_yuv_buf_size, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+                             TUYA_FRAME_FMT_YUV422);
         dev_ioctl(s_video_dev, VIDIOC_CLEAR_OVERLAY, 0);
     }
 
@@ -185,8 +221,17 @@ static OPERATE_RET dvp_prepare(void)
 {
     s_yuv_buf_size = (u32)JIELI_CAMERA_WIDTH * JIELI_CAMERA_HEIGHT * 2U;
     s_yuv_buf      = tkl_system_malloc(s_yuv_buf_size);
-    if (s_yuv_buf == NULL) {
+    s_yuv_packed   = tkl_system_malloc(s_yuv_buf_size);
+    if (s_yuv_buf == NULL || s_yuv_packed == NULL) {
         printf("[%s] no memory for %u-byte YUV422 buffer\n", CAM_TAG, (unsigned)s_yuv_buf_size);
+        if (s_yuv_buf != NULL) {
+            tkl_system_free(s_yuv_buf);
+            s_yuv_buf = NULL;
+        }
+        if (s_yuv_packed != NULL) {
+            tkl_system_free(s_yuv_packed);
+            s_yuv_packed = NULL;
+        }
         return OPRT_MALLOC_FAILED;
     }
     return OPRT_OK;
@@ -197,6 +242,10 @@ static void dvp_release(void)
     if (s_yuv_buf != NULL) {
         tkl_system_free(s_yuv_buf);
         s_yuv_buf = NULL;
+    }
+    if (s_yuv_packed != NULL) {
+        tkl_system_free(s_yuv_packed);
+        s_yuv_packed = NULL;
     }
 }
 #endif /* JIELI_CAMERA_PATH_DVP */

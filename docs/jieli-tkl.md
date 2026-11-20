@@ -42,6 +42,46 @@
 改了引脚值会改变 staging 摘要（`peripheral_pins` 分量），下一次构建会重新
 staging，不会沿用旧头文件。
 
+## IIC 端口
+
+应用只按端口号调用 `tkl_i2c_init()`，**不需要知道这个口是硬件还是软件实现**，
+初始化方式和其它平台完全一样；端口类型由适配层按芯片与板级引脚决定。
+
+| 芯片 | 端口 | 实现 | 引脚 |
+|---|---|---|---|
+| wl82 | `TUYA_I2C_NUM_0` | 软件（该芯片没有硬件 IIC0） | 任意 GPIO；默认 PA0/PA1 |
+| wl82 | `TUYA_I2C_NUM_1` | 硬件 | 控制器只认 PA7/PA8、PC1/PC2、USB DPA/DMA |
+| wl82 | `TUYA_I2C_NUM_1` | 软件（自动回退） | 其余任意引脚；PH0/PH1 恒为软件（见下） |
+| wl83 | `TUYA_I2C_NUM_0/1` | 硬件 | 按板级引脚 |
+| wl83 | `TUYA_I2C_NUM_2` | 软件 | 任意 GPIO |
+
+规则：
+
+- **软件 IIC 支持任意 GPIO**：它自己拉脚，适配层不做 pinmux，所以 open 后也不能再改引脚；
+- **硬件 IIC 只支持控制器映射里的那几组引脚**，并且 open 期间一直占用这些焊盘；
+- 端口引脚落在硬件映射之外时**自动回退软件实现**（`tkl_i2c.c` 的
+  `JIELI_IIC1_IS_SOFTWARE` 由板级引脚在编译期算出），应用侧没有任何开关；
+- PH0/PH1 是摄像头模组的 2-wire 总线：交给硬件控制器后 SPI 侧收不到有效行
+  （实测 AC791，ID 探测与整表都过、SPI 0 帧 / `tag_err`≈2700/s；改软件后 4.4 fps），
+  所以这两个焊盘恒走软件；
+- **默认推荐引脚**：板级 Kconfig 的 `JIELI_BOARD_IIC*_PIN`（例如摄像头板把
+  IIC0/IIC1 都放在 PH0/PH1）；板子没有声明时适配层用 wl82 的 PA0/PA1（IIC0）
+  与 PA7/PA8（IIC1）。
+
+## DVP 同步极性
+
+`tkl_dvp_init()` 的 `sync_polarity` 由上层按**传感器**填写，不是板级开关：
+
+- 本平台注册的传感器描述符固定为 **HSYNC / VSYNC 都是高有效**
+  （`SEN_MBUS_HSYNC_ACTIVE_HIGH | SEN_MBUS_VSYNC_ACTIVE_HIGH`），而厂商描述符是
+  **静态**的、注册后改不了，所以只支持 `TUYA_DVP_SYNC_MODE_0`；其它取值返回
+  `OPRT_NOT_SUPPORTED`（越界 4.. 才返回 `OPRT_INVALID_PARM`）——**明确拒绝，不静默忽略**。
+- **H-V SYNC 互换不是极性**：WL82/AC791 把 SYNC0 接 VSYNC、SYNC1 接 HSYNC
+  （厂商 `CONFIG_CAMERA_H_V_EXCHANGE`），由板级宏 `JIELI_BOARD_CAMERA_HV_SYNC_SWAP`
+  在编译期写进描述符的 `.sync_config`。缺了它 ISP 只报 `isc line err`、永远凑不满一帧。
+  这一项不经过 `sync_polarity`，也不应该塞进极性枚举。
+- 换极性需要改描述的 arg（即改板/改平台），不是调用参数。
+
 ## 构建门控
 
 唯一门控点是 `tuyaos_adapter/adapter_sources.txt`，每行 `源文件 [CONFIG_XXX]`。

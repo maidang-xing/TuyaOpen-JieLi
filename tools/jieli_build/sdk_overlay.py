@@ -24,7 +24,8 @@ from typing import Iterable, Mapping, Optional
 
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
-    configure_audio_board, configure_board_memory, configure_dual_bank_app_config,
+    camera_path, configure_audio_board, configure_board_memory, configure_camera_app_config,
+    configure_camera_board, configure_dual_bank_app_config,
     configure_flash_reserved_area,
     configure_full_stack_app_config, configure_full_stack_board, configure_lcd_app_config,
     configure_lcd_board, configure_lcd_board_header, configure_log_uart_baudrate,
@@ -580,6 +581,11 @@ def peripheral_pin_digest(config_values: Optional[Mapping[str, str]]) -> str:
         "CONFIG_JIELI_BOARD_IIC1_SDA_PIN",
         "CONFIG_JIELI_BOARD_IIC2_SCL_PIN",
         "CONFIG_JIELI_BOARD_IIC2_SDA_PIN",
+        "CONFIG_JIELI_BOARD_CAMERA_GC2145",
+        "CONFIG_JIELI_BOARD_CAMERA_GC0310",
+        "CONFIG_JIELI_BOARD_CAMERA_WIDTH",
+        "CONFIG_JIELI_BOARD_CAMERA_HEIGHT",
+        "CONFIG_JIELI_BOARD_CAMERA_FPS",
     )
     return ",".join(f"{name}={str(config_values.get(name, '')).strip()}" for name in symbols)
 
@@ -949,6 +955,12 @@ def create_staging_tree(
     else:
         configure_usb_download_app_config(app_config_file, usb_cdc_log)
     configure_peripheral_header(board_file, config_values)
+    camera = camera_path(config_values)
+    if camera is not None:
+        if chip.name != "wl82":
+            raise BuildError("the Jieli camera adapter is implemented for WL82 only")
+        configure_camera_app_config(app_config_file, camera, config_values)
+        configure_camera_board(board_file, camera, config_values)
     if profile is not None and profile.board_declarations:
         configure_audio_board(board_file, audio_config_source, profile)
     if chip.name == "wl83":
@@ -1021,10 +1033,18 @@ def create_staging_tree(
     # the board declaring a panel is what puts "display" in that set, so listing
     # the display sources separately here would emit them twice and the linker
     # would reject the duplicate objects.
-    extra_sources_list.extend(
-        SDK_SOURCE_PREFIX + source
-        for source in feature_sources(features)
-    )
+    feature_source_list = list(feature_sources(features))
+    if camera == "dvp":
+        # The board's TDD driver configures the GC2145 over TKL I2C before the
+        # capture device opens. Keeping the vendor GC2145 driver would let the
+        # ISP probe pick it first (it probes the same module) and rewrite the
+        # register table, so the DVP build compiles the timing descriptor in
+        # tkl_dvp.c and nothing else for that module.
+        feature_source_list = [
+            source for source in feature_source_list
+            if not source.endswith("camera/gc2145_dvp/gc2145.c")
+        ]
+    extra_sources_list.extend(SDK_SOURCE_PREFIX + source for source in feature_source_list)
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):
         suffix = " \\" if index + 1 < len(extra_sources_list) else ""
@@ -1055,6 +1075,13 @@ def create_staging_tree(
     if facts.display is not None:
         for include in lcd_include_lines(chip.cpu):
             content += f"    {include} \\\n"
+    if "camera" in features:
+        # The camera TKL includes video.h / video_ioctl.h / camera.h from the
+        # vendor device tree, and the sensor drivers live under
+        # apps/common/camera; the demo_hello profile carries neither path.
+        content += "    -I../../../../../include_lib/driver/device/video \\\n"
+        content += "    -I../../../../../include_lib/server \\\n"
+        content += "    -I../../../../../apps/common/camera \\\n"
     content += "    -I../../../../../include_lib/btstack \\\n"
     content += "    -I../../../../../include_lib/btstack/le \\\n"
     content += "    -I../../../../../include_lib/btctrler \\\n"
@@ -1077,6 +1104,31 @@ def create_staging_tree(
     content += "INCLUDES += -I../../../../../include_lib/net\n"
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
+    if camera is not None:
+        # The vendor make is handed no Kconfig -D, so the capture backend the
+        # selected camera module needs and the buffer geometry are restated
+        # here. The dimensions must match CONFIG_VIDEO*_IMAGE_* staged into
+        # app_config.h: the SPI packet parser uses them to split the BT656 line
+        # stream.
+        cam_width = (config_values or {}).get(
+            "CONFIG_JIELI_BOARD_CAMERA_WIDTH", "640" if camera == "dvp" else "320")
+        cam_height = (config_values or {}).get(
+            "CONFIG_JIELI_BOARD_CAMERA_HEIGHT", "480" if camera == "dvp" else "240")
+        cam_fps = (config_values or {}).get(
+            "CONFIG_JIELI_BOARD_CAMERA_FPS", "20" if camera == "dvp" else "12")
+        content += (
+            f"DEFINES += -DJIELI_BOARD_CAMERA_{camera.upper()}=1"
+            f" -DJIELI_BOARD_CAMERA_WIDTH={cam_width}"
+            f" -DJIELI_BOARD_CAMERA_HEIGHT={cam_height}"
+            f" -DJIELI_BOARD_CAMERA_FPS={cam_fps}\n"
+        )
+        if camera == "dvp":
+            # The vendor GC2145 for WL82 sits behind CONFIG_CAMERA_H_V_EXCHANGE
+            # (app_config.h: "WL82/AC791 才可以 H-V SYNC 互换"), i.e. the ISC on
+            # this chip takes SYNC0 from VSYNC and SYNC1 from HSYNC. That define
+            # lives in the vendor's app_config.h, which the adapter sources do
+            # not see, so restate it here for tkl_dvp's timing descriptor.
+            content += "DEFINES += -DJIELI_BOARD_CAMERA_HV_SYNC_SWAP=1\n"
     spi_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_SPI")
     if spi_enabled not in ("y", "n"):
         raise BuildError(f"CONFIG_ENABLE_SPI must be an evaluated Kconfig bool when staging adapter sources: {spi_enabled!r}")
@@ -1091,12 +1143,12 @@ def create_staging_tree(
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
     # The board's peripheral pins come from its Kconfig through a generated
     # header next to board.c, so the adapter has one source of truth for them.
+    # Use the absolute path: with the relative form the compiler searched the
+    # -I directories instead, stamped a doubled path into the .d files, and
+    # the next make failed with "No rule to make target .../.../header".
     board_relative = chip.board_build_relative.as_posix()
-    content += (
-        "CFLAGS += -include ../../../../../"
-        + board_relative
-        + "/tuya_board_periph_config.h\n"
-    )
+    periph_header = (source_overlay_root / chip.board_build_relative / "tuya_board_periph_config.h").as_posix()
+    content += "CFLAGS += -include " + periph_header + "\n"
     content += "DEFINES += " + " ".join(
         "-D" + define for define in feature_defines(features)
     ) + "\n"

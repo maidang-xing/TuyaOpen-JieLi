@@ -1586,6 +1586,8 @@ typedef struct
     DVP_FRAME_ASSIGN_CB assign_cb;
     DVP_FRAME_POST_CB post_cb;
     void *cb_param;
+    /* Sensor MCLK in Hz; the T5 platform derives its clock from it. */
+    uint32_t sensor_clk;
 } TUYA_DVP_TKL_CFG_T;
 
 typedef struct {

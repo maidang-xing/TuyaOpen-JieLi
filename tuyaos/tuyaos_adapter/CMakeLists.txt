@@ -176,6 +176,12 @@ if(spi_value STREQUAL "y")
 elseif(NOT spi_value STREQUAL "n")
     message(FATAL_ERROR "CONFIG_ENABLE_SPI is not a Kconfig bool: '${spi_value}'")
 endif()
+jieli_lookup_evaluated_config("CONFIG_ENABLE_WIFI" wifi_value)
+if(wifi_value STREQUAL "y")
+    target_compile_definitions(${JIELI_ADAPTER_NAME} PRIVATE CONFIG_ENABLE_WIFI=1)
+elseif(NOT wifi_value STREQUAL "n")
+    message(FATAL_ERROR "CONFIG_ENABLE_WIFI is not a Kconfig bool: '${wifi_value}'")
+endif()
 jieli_lookup_evaluated_config("CONFIG_ENABLE_MEDIA" media_value)
 if(media_value STREQUAL "y")
     target_compile_definitions(${JIELI_ADAPTER_NAME} PRIVATE CONFIG_MEDIA_ENABLE=1)
@@ -197,6 +203,7 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${JIELI_ADAPTER_INCLUDE_DIRS}
         ${CMAKE_CURRENT_LIST_DIR}/include/utilities/include
         ${TOP_SOURCE_DIR}/src/common/include
+        ${TOP_SOURCE_DIR}/tuyaopen-core/port/tuyaopen/interface
         ${JIELI_SDK_ROOT}/include_lib
         ${JIELI_SDK_ROOT}/include_lib/btstack
         ${JIELI_SDK_ROOT}/include_lib/btstack/le

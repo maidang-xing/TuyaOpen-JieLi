@@ -603,6 +603,7 @@ def staging_input_components(
     header_dir: Optional[Path],
     tuya_lib_dir: Optional[Path],
     uart_log_port: int,
+    tuya_libs: str = "",
     uart_log_baudrate: int,
     adapter_source_selection: str = "",
     usb_cdc_log: str = "n",
@@ -626,6 +627,7 @@ def staging_input_components(
         "platform_root": _absolute(platform_root),
         "header_dir": _absolute(header_dir),
         "tuya_lib_dir": _absolute(tuya_lib_dir),
+        "tuya_libs": tuya_libs,
         "uart": f"{uart_log_port}:{uart_log_baudrate}",
         "board": board_name or "",
         # The board's own facts, and the audio header the board brings. Both are
@@ -817,6 +819,24 @@ def build_make_command(sdk_root: Path, tool_dir: Path, jobs: int = 1, chip=None)
         command.insert(5, f'MKDIR="{Path(sys.executable).as_posix()}" "{helper.as_posix()}" -p')
     return command
 
+def _resolve_tuya_libs(
+    tuya_libs: Optional[Iterable[str]],
+) -> tuple[str, ...]:
+    resolved: list[str] = []
+    if tuya_libs is not None:
+        for lib in tuya_libs:
+            name = str(lib).strip()
+            if not name:
+                continue
+            if not (name.startswith("lib") and name.endswith(".a")):
+                name = f"lib{name}.a"
+            if name not in resolved:
+                resolved.append(name)
+    if resolved:
+        return tuple(resolved)
+    return ("libtuyaapp.a", "libtuyaopen.a")
+
+
 def create_staging_tree(
     sdk_root: Path,
     staging_root: Path,
@@ -831,6 +851,7 @@ def create_staging_tree(
     features: Optional[Iterable[str]] = None,
     config_values: Optional[Mapping[str, str]] = None,
     tool_dir: Optional[Path] = None,
+    tuya_libs: Optional[Iterable[str]] = None,
 ) -> Path:
     """Create a small overlay tree without modifying the vendor checkout.
 
@@ -863,6 +884,7 @@ def create_staging_tree(
         if profile is not None and profile.board_declarations
         else None
     )
+    resolved_tuya_libs = _resolve_tuya_libs(tuya_libs)
     components = staging_input_components(
         sdk_root=sdk_root,
         tuyaopen_root=tuyaopen_root,
@@ -874,6 +896,7 @@ def create_staging_tree(
         audio_config_source=audio_config_source,
         header_dir=header_dir,
         tuya_lib_dir=tuya_lib_dir,
+        tuya_libs=','.join(resolved_tuya_libs),
         uart_log_port=uart_log_port,
         uart_log_baudrate=uart_log_baudrate,
         adapter_source_selection="\n".join(adapter_sources),
@@ -1086,7 +1109,8 @@ def create_staging_tree(
     content += "    -I../../../../../include_lib/btstack/le \\\n"
     content += "    -I../../../../../include_lib/btctrler \\\n"
     content += f"    -I../../../../../include_lib/btctrler/port/{chip.cpu} \\\n"
-    content += f"    -I{tuyaopen_root_make}/src/common/include\n"
+    content += f"    -I{tuyaopen_root_make}/src/common/include \\\n"
+    content += f"    -I{tuyaopen_root_make}/tuyaopen-core/port/tuyaopen/interface\n"
     content += "INCLUDES += \\\n"
     content += "    -I../../../../../include_lib/driver/device \\\n"
     content += f"    -I../../../../../include_lib/driver/cpu/{chip.cpu} \\\n"
@@ -1138,6 +1162,8 @@ def create_staging_tree(
         content += "DEFINES += -DCONFIG_ENABLE_SPI=1\n"
     elif "src/driver/tkl_spi.c" in adapter_sources:
         raise BuildError("tkl_spi.c is selected for the SDK build while CONFIG_ENABLE_SPI=n")
+    if "src/driver/tkl_wifi.c" in adapter_sources:
+        content += "DEFINES += -DCONFIG_ENABLE_WIFI=1\n"
     if chip.name == "wl82" and board_name == "AC79_DevKitBoard":
         content += "DEFINES += -DJIELI_AC79_DEVKIT_BOARD=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
@@ -1172,7 +1198,8 @@ def create_staging_tree(
     # vendor entry point so cpu.a[wlc.c.o] is extracted by the linker.
     content += "    -u wlc_main \\\n"
     tuya_lib_dir_make = _make_path(tuya_lib_dir)
-    content += f"    --start-group {tuya_lib_dir_make}/libtuyaapp.a {tuya_lib_dir_make}/libtuyaos.a \\\n"
+    tuya_lib_paths = " ".join(f"{tuya_lib_dir_make}/{lib}" for lib in resolved_tuya_libs)
+    content += f"    --start-group {tuya_lib_paths} \\\n"
     # AC791's vendor Makefile links cpu.a/system.a before this Tuya
     # library group. BLE/Wi-Fi archives introduce provider references
     # later, so repeat those archives inside the group for a rescan.
@@ -1187,7 +1214,7 @@ def create_staging_tree(
     # The two TuyaOpen archives live outside the staged SDK tree, so the vendor
     # "$(OUT_ELF): $(OBJS)" rule never sees them change and an app-only edit
     # leaves the image one build behind. Declare them as extra prerequisites.
-    content += f"$(OUT_ELF): {tuya_lib_dir_make}/libtuyaapp.a {tuya_lib_dir_make}/libtuyaos.a\n"
+    content += f"$(OUT_ELF): {tuya_lib_paths}\n"
     if header_dir is not None:
         content += f"INCLUDES += -I{_make_path(header_dir)}\n"
     write_staged_text(makefile, content)

@@ -1071,6 +1071,14 @@ OPERATE_RET tkl_dvp_deinit(void)
     return OPRT_OK;
 }
 
+/* The WL82 video pipeline driven here encodes JPEG/MJPEG; there is no H.264
+ * encoder behind it, so the TDD's bitrate knob has nothing to apply to. */
+OPERATE_RET tkl_dvp_set_h264_bitrate(uint32_t kbps)
+{
+    (void)kbps;
+    return OPRT_NOT_SUPPORTED;
+}
+
 #else /* not a WL82 camera build */
 
 OPERATE_RET tkl_dvp_init(TUYA_DVP_CFG_T *cfg)
@@ -1088,6 +1096,11 @@ OPERATE_RET tkl_dvp_start(void)
 }
 OPERATE_RET tkl_dvp_stop(void)
 {
+    return OPRT_NOT_SUPPORTED;
+}
+OPERATE_RET tkl_dvp_set_h264_bitrate(uint32_t kbps)
+{
+    (void)kbps;
     return OPRT_NOT_SUPPORTED;
 }
 

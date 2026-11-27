@@ -16,6 +16,11 @@
 #include "system/os/pthread.h"
 #include "system/tkl_system.h"
 
+/* gpio.h uses u32/u8 without including their definitions. */
+#include "asm/cpu.h"
+#include "gpio.h"
+
+
 #include <stdbool.h>
 
 #define JIELI_ADC_RAW_MAX       1023U
@@ -26,6 +31,48 @@
 #else
 /* WL82's ADC0 external GPIO channels occupy AD_CH_PA07 through AD_CH_DP. */
 #define JIELI_ADC_EXTERNAL_CHANNEL_COUNT 14U
+#endif
+
+#if !defined(CONFIG_CPU_WL83)
+/* AD_CH_PA07..AD_CH_PH03 in channel order, then the two USB pins (DM/DP) which
+ * have no GPIO pad to reconfigure. Kept in the vendor's own pin names so the
+ * table can be checked against asm/adc_api.h line by line. */
+static const int16_t s_ch_pin[JIELI_ADC_EXTERNAL_CHANNEL_COUNT] = {
+    IO_PORTA_07, IO_PORTA_08, IO_PORTA_10, IO_PORTB_01, IO_PORTB_06,
+    IO_PORTB_07, IO_PORTC_00, IO_PORTC_01, IO_PORTC_09, IO_PORTC_10,
+    IO_PORTH_00, IO_PORTH_03, -1,            -1,
+};
+
+/* Put the pad into the analogue function and drop the internal pulls.
+ *
+ * The vendor key driver does exactly this (gpio_set_die(pin, 0), input
+ * direction, both pulls off when the board supplies the divider's pull-up
+ * externally, which the AC79 devkit does). Without it the ADC samples through
+ * the digital gate with the internal pull-up in parallel: a key press only
+ * moved the reading from 1023 to ~991..1015 instead of the ladder's ~892, i.e.
+ * outside the button window, so the TDL debounce discarded every press and the
+ * key did nothing. Measured after the fix: idle 1023, press 892 (held samples
+ * every 10 ms), matching the vendor ADKEY table's ADC_07 value.
+ *
+ * Order matters: this runs *after* adc_add_sample_ch(), as the vendor's own
+ * key driver does, because adding the channel is what re-enters the pad setup.
+ */
+static void jieli_adc_pin_analog(uint8_t channel)
+{
+    int16_t pin;
+
+    if (channel >= JIELI_ADC_EXTERNAL_CHANNEL_COUNT) {
+        return;
+    }
+    pin = s_ch_pin[channel];
+    if (pin < 0) {
+        return;
+    }
+    (void)gpio_set_die((u32)pin, 0);
+    (void)gpio_set_direction((u32)pin, 1);
+    (void)gpio_set_pull_down((u32)pin, 0);
+    (void)gpio_set_pull_up((u32)pin, 0);
+}
 #endif
 
 static uint16_t s_active_channel_mask;
@@ -172,8 +219,18 @@ OPERATE_RET tkl_adc_init(TUYA_ADC_NUM_E port_num, TUYA_ADC_BASE_CFG_T *cfg)
             continue;
         }
 
-        /* adc_init() belongs to board startup; reinitializing it clears this shared queue. */
+        /* adc_init() belongs to board startup; reinitializing it clears this shared queue.
+         *
+         * The pad is set up *after* the channel is added: the vendor's own key
+         * driver does it in that order (adc_add_sample_ch(), then gpio_set_die
+         * and the pulls), because adding the channel is what switches the pad
+         * into the sampling path. Configuring it first let the add step put
+         * the internal pull-up back, which lifted a key press from the
+         * ladder's ~892 counts to ~1015 - outside the button window. */
         queue_index = adc_add_sample_ch(channel);
+#if !defined(CONFIG_CPU_WL83)
+        jieli_adc_pin_analog(channel);
+#endif
         if (queue_index >= ADC_MAX_CH) {
             (void)jieli_adc_unlock();
             return OPRT_COM_ERROR;

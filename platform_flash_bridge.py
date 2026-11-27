@@ -146,6 +146,41 @@ def _split_command(command_text: str) -> list[str]:
     ]
 
 
+def _dual_bank_enabled(config: Path) -> bool:
+    """Whether the staged vendor map asks for the dual-bank (A/B) layout.
+
+    The downloader only emits the OTA package (``db_update_files_data.bin``)
+    when ``-update_files`` is passed, and that package is what the cloud needs,
+    so the flag follows the map rather than a second switch.
+    """
+    try:
+        text = config.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(
+        line.strip().startswith("BR22_TWS_DB=YES") for line in text.splitlines()
+    )
+
+
+def _publish_ota_artifacts(image: Path, tools_dir: "Path | None") -> list[Path]:
+    """Copy UA/UG next to the QIO image when the packer produced them.
+
+    ``UA`` is the whole-image ufw used for SD/USB recovery, ``UG`` is the
+    code-only package the cloud serves. Names follow the QIO artifact so the
+    three files stay together.
+    """
+    if tools_dir is None or "_QIO_" not in image.name:
+        return []
+    published = []
+    for source, tag in (("jl_isd.ufw", "UA"), ("db_update_files_data.bin", "UG")):
+        candidate = tools_dir / source
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            target = image.with_name(image.name.replace("_QIO_", f"_{tag}_"))
+            shutil.copy2(candidate, target)
+            published.append(target)
+    return published
+
+
 def _default_flash_command(image: Path, chip_name: str,
                            origin: Path | None = None,
                            port: str = "",
@@ -170,6 +205,7 @@ def _default_flash_command(image: Path, chip_name: str,
     # On Windows, if isd_download.exe is available and JIELI_USE_PY_FLASHER is not set,
     # preserve legacy Windows isd_download.exe behavior for backwards compatibility.
     if os.name == "nt" and executable.is_file() and not os.environ.get("JIELI_USE_PY_FLASHER"):
+        ota_flags = ["-update_files", "normal"] if _dual_bank_enabled(config) else []
         return (
             [
                 str(executable),
@@ -193,6 +229,7 @@ def _default_flash_command(image: Path, chip_name: str,
                 "-reboot",
                 reboot_delay,
                 "-extend-bin",
+                *ota_flags,
             ],
             tools_dir,
         )
@@ -311,4 +348,6 @@ def platform_flash(
             staged_dir.cleanup()
     if result.returncode != 0:
         return {"success": False, "message": f"uploader exited with {result.returncode}"}
+    for artifact in _publish_ota_artifacts(image, working_dir):
+        logger.info(f"Jieli OTA artifact: {artifact}")
     return {"success": True, "message": "Jieli uploader completed"}

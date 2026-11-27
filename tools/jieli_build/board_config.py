@@ -574,15 +574,50 @@ def configure_board_memory(
 _TUYA_FLASH_PARTITIONS = ("KV_KEY", "KV_DATA", "UF", "RCD", "USER0")
 
 
+def _c_defines(content: str) -> dict[str, str]:
+    """Map every ``#define NAME value`` in a C file to its raw value text."""
+    return {
+        match.group(1): match.group(2).strip()
+        for match in re.finditer(r"(?m)^[ \t]*#define[ \t]+(\w+)[ \t]+([^\r\n/]+?)[ \t]*$", content)
+    }
+
+
 def _c_hex_literal(content: str, name: str, source: Path) -> int:
-    """Read one plain hex #define; the flash map is parsed, not duplicated."""
-    match = re.search(rf"(?m)^[ \t]*#define[ \t]+{name}[ \t]+(0x[0-9A-Fa-f]+)U?[ \t]*$", content)
-    if match is None:
-        raise BuildError(
-            f"Expected one hex-literal {name} in {source}; the vendor reserved area "
-            f"is derived from it"
-        )
-    return int(match.group(1), 16)
+    """Read a hex #define; resolves ``(OTHER + 0xoffset)`` against the same file.
+
+    The TuyaOpen flash map keeps every partition start relative to one base so
+    moving the span is a single-line change, which is what the A/B layout
+    needs. Only plain literals and a one-offset addition are accepted: an
+    expression the parser cannot evaluate must fail the build rather than
+    silently reserve the wrong span.
+    """
+    defines = _c_defines(content)
+    resolving: list[str] = []
+
+    def resolve(symbol: str) -> int:
+        if symbol in resolving:
+            raise BuildError(f"Circular flash-map define: {' -> '.join(resolving + [symbol])}")
+        raw = defines.get(symbol)
+        if raw is None:
+            raise BuildError(
+                f"Expected a hex-literal {symbol} in {source}; the vendor reserved area "
+                f"is derived from it"
+            )
+        match = re.fullmatch(r"(0x[0-9A-Fa-f]+)U?", raw)
+        if match is not None:
+            return int(match.group(1), 16)
+        match = re.fullmatch(r"\(\s*(\w+)\s*\+\s*(0x[0-9A-Fa-f]+)U?\s*\)", raw)
+        if match is None:
+            raise BuildError(
+                f"Expected a hex literal or '(BASE + 0xoffset)' for {symbol} in {source}, "
+                f"found: {raw}"
+            )
+        resolving.append(symbol)
+        value = resolve(match.group(1)) + int(match.group(2), 16)
+        resolving.pop()
+        return value
+
+    return resolve(name)
 
 
 def tuya_flash_reserved_area(tkl_flash_c: Path) -> tuple[int, int]:
@@ -968,13 +1003,16 @@ def _redefine_macro(config_file: Path, name: str, value: str) -> None:
     write_staged_text(config_file, updated)
 
 
-def _define_macro(config_file: Path, name: str) -> None:
+def _define_macro(config_file: Path, name: str, value: str | None = None) -> None:
     """Append ``#define <name>`` before the final ``#endif`` of a staged header.
 
     Used for switches the vendor profile does not define at all. Idempotent:
-    a header that already carries the define is left alone.
+    a header that already carries the define is left alone. ``value`` is for
+    switches the vendor tests with ``#if``: a bare ``#define X`` makes that
+    expression invalid ("expected value in expression").
     """
-    _insert_before_final_endif(config_file, f"#define {name}\n", marker=f"#define {name}")
+    line = f"#define {name}" if value is None else f"#define {name} {value}"
+    _insert_before_final_endif(config_file, line + "\n", marker=f"#define {name}")
 
 
 # The vendor file that decides the station's power mode. Both SDKs put the same
@@ -1204,9 +1242,10 @@ def configure_dual_bank_app_config(app_config_file: Path, config_values) -> None
     if str(config_values.get("CONFIG_JIELI_BOARD_DUAL_BANK", "")).strip() not in ("y", "true", "True"):
         return
     # The vendor profile defines both together: a dual-bank image needs the
-    # duplicated uboot, or the boot side cannot switch between banks.
-    _define_macro(app_config_file, "CONFIG_DOUBLE_BANK_ENABLE")
-    _define_macro(app_config_file, "CONFIG_SUPPORT_DOUBLE_UBOOT")
+    # duplicated uboot, or the boot side cannot switch between banks. Both are
+    # tested with `#if`, so they must carry a value rather than be bare.
+    _define_macro(app_config_file, "CONFIG_DOUBLE_BANK_ENABLE", "1")
+    _define_macro(app_config_file, "CONFIG_SUPPORT_DOUBLE_UBOOT", "1")
 
 
 def configure_usb_download_app_config(app_config_file: Path, usb_cdc_log: bool = False) -> None:

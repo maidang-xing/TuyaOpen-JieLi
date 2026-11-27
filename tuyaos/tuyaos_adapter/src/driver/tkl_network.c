@@ -306,28 +306,31 @@ OPERATE_RET tkl_net_set_keepalive(int fd, const BOOL_T alive, const uint32_t idl
 {
     int enabled = alive ? 1 : 0;
     OPERATE_RET result = tkl_net_setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
-    if (result != OPRT_OK || !alive) {
-        return result;
+    if (!alive) {
+        return OPRT_OK;
     }
     /* lwip's sockets.h always defines TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT,
      * but the stack only honours them when built with LWIP_TCP_KEEPALIVE -
-     * which the wl83 SDK ships disabled (lwipopts.h) and, being a prebuilt
-     * lwip_2_2_0.a, we cannot rebuild. Guarding on the macros alone therefore
-     * always takes a path that returns ENOPROTOOPT, and the transport turns
-     * any error here into OPRT_MID_TRANSPORT_SOCK_SET_KEEP_ALIVE_FAILED,
-     * aborting the AI service's connect outright. Gate on the feature flag
-     * instead: SO_KEEPALIVE above already enabled keepalive, so only the
-     * tuning is skipped and lwip's own defaults apply. */
+     * which the vendor ships disabled and, being a prebuilt lwip .a, we
+     * cannot rebuild. Worse, the wl82 lwip rejects SO_KEEPALIVE itself with
+     * ENOPROTOOPT. The transport turns any error here into
+     * OPRT_MID_TRANSPORT_SOCK_SET_KEEP_ALIVE_FAILED and aborts the whole
+     * connect (the AI service never dials its server), so keepalive must be
+     * best effort on this target: enable what the stack accepts, let it
+     * apply its own defaults otherwise, and never fail the caller. */
+    if (result != OPRT_OK) {
+        return OPRT_OK;
+    }
 #if defined(LWIP_TCP_KEEPALIVE) && LWIP_TCP_KEEPALIVE
-    result = tkl_net_setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-    result = tkl_net_setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intr, sizeof(intr));
-    result = tkl_net_setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    (void)tkl_net_setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    (void)tkl_net_setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intr, sizeof(intr));
+    (void)tkl_net_setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 #else
     (void)idle;
     (void)intr;
     (void)cnt;
 #endif
-    return result;
+    return OPRT_OK;
 }
 
 OPERATE_RET tkl_net_getsockname(int fd, TUYA_IP_ADDR_T *addr, uint16_t *port)

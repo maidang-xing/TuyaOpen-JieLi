@@ -27,3 +27,6 @@ src/driver/tkl_audio.c
 src/driver/tkl_adc.c CONFIG_ENABLE_ADC
 src/driver/tkl_vad.c
 src/driver/tkl_kws.c
+src/port/tuya_audio_aec.c CONFIG_ENABLE_AUDIO
+src/port/tal_netif_ops.c CONFIG_ENABLE_WIFI
+src/port/jieli_atomic_fix.c

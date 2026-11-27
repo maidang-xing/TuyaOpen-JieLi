@@ -8,9 +8,11 @@
 /*
  * The Tuya data partitions live in the vendor flash map declared by
  * cpu/<chip>/tools/isd_config_rule.c. tools/jieli_build/board_config.py reads
- * the hex literals below and declares their span as a fixed, OPT=1 reserved
- * area, so the vendor downloader no longer erases it on every USB download.
- * Keep the format: NAME_START / NAME_SIZE, one plain hex literal per line.
+ * the literals below and declares their span as a fixed, OPT=1 reserved area,
+ * so the vendor downloader no longer erases it on every USB download. A
+ * partition start may be written as a plain hex literal or as
+ * `(JIELI_TUYAOPEN_BASE + 0x offset)`; the parser resolves one level of the
+ * latter, so moving the whole span is a one-line change.
  */
 #if defined(JIELI_BOARD_FLASH_MIB)
 #define JIELI_FLASH_SIZE       ((uint32_t)JIELI_BOARD_FLASH_MIB * 1024U * 1024U)
@@ -19,18 +21,27 @@
 #endif
 #define JIELI_FLASH_BLOCK      0x00001000U
 #define JIELI_FLASH_BOUNCE     256U
-#define JIELI_KV_KEY_START     0x00300000U
+/* The span starts at 7 MiB so the vendor dual-bank layout has room for two
+ * application banks below it; the downloader splits (base - boot - VM) in half
+ * and refuses an image that does not fit, so the base is what sizes the banks.
+ * Measured on the AC79 devkit with the guided-UI image (3.12 MiB) at 8 MiB
+ * flash: banks are 0x37C000 each (0x000020..0x37C000 and 0x37C000..0x6F8000),
+ * VM 32 KiB at 0x6F8000, then this span, then the AUTO-placed BTIF/USER areas.
+ * A single-bank build can put the base lower; every partition below moves with
+ * it, and moving it once costs the provisioning data stored in KV.
+ * Nothing in the tree consumes TUYA_FLASH_TYPE_RCD. */
+#define JIELI_TUYAOPEN_BASE    0x00700000U
+#define JIELI_KV_KEY_START     (JIELI_TUYAOPEN_BASE + 0x00000000U)
 #define JIELI_KV_KEY_SIZE      0x00001000U
-#define JIELI_KV_DATA_START    0x00301000U
+#define JIELI_KV_DATA_START    (JIELI_TUYAOPEN_BASE + 0x00001000U)
 #define JIELI_KV_DATA_SIZE     0x00010000U
-#define JIELI_UF_START         0x00311000U
+#define JIELI_UF_START         (JIELI_TUYAOPEN_BASE + 0x00011000U)
 #define JIELI_UF_SIZE          0x00080000U
-#define JIELI_RCD_START        0x00391000U
+#define JIELI_RCD_START        (JIELI_TUYAOPEN_BASE + 0x00091000U)
 #define JIELI_RCD_SIZE         0x00030000U
-/* The generic user partition takes the last 64 KiB of the RCD area, so the
- * TuyaOpen span keeps its original end and the vendor's AUTO-placed BTIF/USER
- * areas do not move. Nothing in the tree consumes TUYA_FLASH_TYPE_RCD. */
-#define JIELI_USER0_START      0x003C1000U
+/* The generic user partition takes the last 64 KiB of the span; the areas are
+ * 4 KiB aligned and contiguous, so the reserved region stays one block. */
+#define JIELI_USER0_START      (JIELI_TUYAOPEN_BASE + 0x000C1000U)
 #define JIELI_USER0_SIZE       0x00010000U
 
 static OPERATE_RET jieli_flash_check_range(uint32_t addr, uint32_t size)

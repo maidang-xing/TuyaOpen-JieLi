@@ -876,6 +876,10 @@ def create_staging_tree(
         str((config_values or {}).get("CONFIG_ENABLE_JIELI_USB_CDC_LOG", "")).strip()
         in TRUTHY
     )
+    tal_audio = (
+        str((config_values or {}).get("CONFIG_ENABLE_AUDIO", "")).strip()
+        in TRUTHY
+    )
     adapter_sources = read_adapter_sources(platform_root, chip.name, config_values)
     board_name = facts.board
     profile = AUDIO_PROFILES.get(chip.name)
@@ -1018,6 +1022,17 @@ def create_staging_tree(
 
     makefile = source_overlay_root / chip.board_build_relative / "Makefile"
     content = makefile.read_text(encoding="utf-8")
+    # The vendor KWS engine is only part of images that can use it. Keep the
+    # default HOLD build byte-for-byte equivalent to master: no ASR define, no
+    # jl_math sources and no KWS archives unless WAKEUP or FREE is selected.
+    kws_enabled = (
+        chip.name == "wl82"
+        and config_values is not None
+        and (
+            config_values.get("CONFIG_ENABLE_COMP_AI_MODE_WAKEUP") == "y"
+            or config_values.get("CONFIG_ENABLE_COMP_AI_MODE_FREE") == "y"
+        )
+    )
     vendor_main = "../../../../../apps/demo/demo_hello/app_main.c"
     if vendor_main not in content:
         raise BuildError(f"Jieli demo Makefile has no app_main source: {makefile}")
@@ -1068,6 +1083,29 @@ def create_staging_tree(
             if not source.endswith("camera/gc2145_dvp/gc2145.c")
         ]
     extra_sources_list.extend(SDK_SOURCE_PREFIX + source for source in feature_source_list)
+    if tal_audio:
+        # The TAL archive is C++ under a C wrapper; this shim supplies the few
+        # libc++/libc++abi platform symbols the vendor image does not define.
+        extra_sources_list.append(
+            "../../../../../tuyaos_adapter/src/port/tal_cxx_shim.c"
+        )
+        # The archive's default model is not the shipped wake word; this strong
+        # definition replaces g_fsmn_v8_0515_avg_int8_model_data with the nhty
+        # training run.
+        extra_sources_list.append(
+            "../../../../../tuyaos_adapter/src/port/tal_nhty_model.c"
+        )
+
+    if kws_enabled:
+        # The vendor far-keyword KWS object calls jl_fft_N(), which lives in
+        # apps/common/jl_math (not in an archive). jl_fft.c only compiles its
+        # body when an audio/ASR macro is set, so the JLKWS demo builds these
+        # three sources together with CONFIG_ASR_ALGORITHM=4.
+        extra_sources_list.extend([
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/jl_fft.c",
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/flfft_core_pi32v2.c",
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/jl_math.c",
+        ])
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):
         suffix = " \\" if index + 1 < len(extra_sources_list) else ""
@@ -1090,6 +1128,8 @@ def create_staging_tree(
     # The two nested public-header layouts are part of the platform adapter.
     content += "    -I../../../../../tuyaos_adapter/include/init/include \\\n"
     content += "    -I../../../../../tuyaos_adapter/include/utilities/include \\\n"
+    # The TAL library headers sit beside the archive, one level below include/kws.
+    content += "    -I../../../../../tuyaos_adapter/include/kws/libaudio_subsys \\\n"
     tuyaopen_root_make = _make_path(tuyaopen_root)
     content += "    -I../../../../../apps/common/include \\\n"
     content += "    -I../../../../../apps/common/config/include \\\n"
@@ -1110,6 +1150,8 @@ def create_staging_tree(
     content += "    -I../../../../../include_lib/btctrler \\\n"
     content += f"    -I../../../../../include_lib/btctrler/port/{chip.cpu} \\\n"
     content += f"    -I{tuyaopen_root_make}/src/common/include \\\n"
+    # The port's core ops cards include tuyaopen-core's contract headers
+    # (core_netif_ops.h, core_network_ops.h, ...).
     content += f"    -I{tuyaopen_root_make}/tuyaopen-core/port/tuyaopen/interface\n"
     content += "INCLUDES += \\\n"
     content += "    -I../../../../../include_lib/driver/device \\\n"
@@ -1153,6 +1195,12 @@ def create_staging_tree(
             # lives in the vendor's app_config.h, which the adapter sources do
             # not see, so restate it here for tkl_dvp's timing descriptor.
             content += "DEFINES += -DJIELI_BOARD_CAMERA_HV_SYNC_SWAP=1\n"
+    if kws_enabled:
+        # Selects the vendor JLKWS algorithm (4) and enables the adapter's WL82
+        # provider. It gates jl_fft.c's body and the vendor
+        # get_kws_auth_key()/get_kws_code() helpers that profile.a's
+        # get_kws_lisence() path expects. The vendor demo uses the same value.
+        content += "DEFINES += -DCONFIG_ASR_ALGORITHM=4 -DJIELI_KWS_ENABLE=1\n"
     spi_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_SPI")
     if spi_enabled not in ("y", "n"):
         raise BuildError(f"CONFIG_ENABLE_SPI must be an evaluated Kconfig bool when staging adapter sources: {spi_enabled!r}")
@@ -1166,6 +1214,13 @@ def create_staging_tree(
         content += "DEFINES += -DCONFIG_ENABLE_WIFI=1\n"
     if chip.name == "wl82" and board_name == "AC79_DevKitBoard":
         content += "DEFINES += -DJIELI_AC79_DEVKIT_BOARD=1\n"
+    dual_bank = (config_values or {}).get("CONFIG_JIELI_BOARD_DUAL_BANK")
+    if str(dual_bank).strip() in ("y", "true", "True"):
+        # app_config.h is not on the adapter's include path, so the vendor make
+        # would compile tkl_ota.c's dual-bank path out and every cloud OTA would
+        # silently no-op (the core ignores the TKL return values). Restate the
+        # staged switches here for the adapter sources.
+        content += "DEFINES += -DCONFIG_DOUBLE_BANK_ENABLE=1 -DCONFIG_SUPPORT_DOUBLE_UBOOT=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
     # The board's peripheral pins come from its Kconfig through a generated
     # header next to board.c, so the adapter has one source of truth for them.
@@ -1208,9 +1263,37 @@ def create_staging_tree(
     # only) and video.a (display only) are the two chip/board-conditional
     # additions; feature_map.py owns both facts, so the chip and display cases
     # are stated once instead of branched here.
-    for library in link_libraries(chip.name, features):
+    for library in link_libraries(chip.name, features, kws_enabled=kws_enabled):
         content += f"    {liba}/{library} \\\n"
+    if tal_audio:
+        # User-supplied TAL engine (pi32v2 bitcode) plus the C++ runtime its
+        # C wrapper is built on. Order matters: the archive before libc++.
+        # The archive sits with the adapter, next to tkl_kws.h, as the other
+        # platforms keep their wake-word libraries.
+        tal_lib = _make_path(
+            PLATFORM_ROOT / "tuyaos/tuyaos_adapter/include/kws/libaudio_subsys/audio_subsys.a"
+        )
+        content += f"    {tal_lib} \\\n"
+        content += "    ../../../../../include_lib/c++/libstdc++/libc++.a \\\n"
+        content += "    ../../../../../include_lib/c++/libstdc++/libc++abi.a \\\n"
     content += "    --end-group\n"
+    if tal_audio:
+        # libc++'s locale objects reference newlib's reentrant entry points.
+        # The vendor LTO link internalizes every global the used-symbol list
+        # does not name, so those references survive as undefined symbols
+        # unless -u force-retains them (the same mechanism wlc_main above
+        # uses). The merged module and the newlib archive then both carry a
+        # strtod definition, which is benign, so allow the duplicate.
+        content += ("LFLAGS += -u _malloc_r -u _free_r -u _calloc_r "
+                    "-u _realloc_r --allow-multiple-definition\n")
+    if chip.name == "wl82":
+        # Retain our fixed __sync_fetch_and_sub_{1,2,4,8} definitions across LTO
+        # so backend lowering of __atomic_sub_fetch() does not pull the buggy
+        # sync_fetch_and_sub.o member from WL82's libcompiler_rt.a.
+        content += (
+            "LFLAGS += -u __sync_fetch_and_sub_1 -u __sync_fetch_and_sub_2 "
+            "-u __sync_fetch_and_sub_4 -u __sync_fetch_and_sub_8\n"
+        )
     # The two TuyaOpen archives live outside the staged SDK tree, so the vendor
     # "$(OUT_ELF): $(OBJS)" rule never sees them change and an app-only edit
     # leaves the image one build behind. Declare them as extra prerequisites.

@@ -165,6 +165,8 @@ foreach(include_entry IN LISTS JIELI_ADAPTER_INCLUDE_ENTRIES)
     endif()
 endforeach()
 list(APPEND JIELI_ADAPTER_INCLUDE_DIRS "${CMAKE_CURRENT_LIST_DIR}/include/init/include")
+# The TAL library headers sit beside the archive, one level below include/kws.
+list(APPEND JIELI_ADAPTER_INCLUDE_DIRS "${CMAKE_CURRENT_LIST_DIR}/include/kws/libaudio_subsys")
 
 add_library(${JIELI_ADAPTER_NAME} STATIC ${JIELI_ADAPTER_SRC})
 target_compile_definitions(${JIELI_ADAPTER_NAME} PRIVATE

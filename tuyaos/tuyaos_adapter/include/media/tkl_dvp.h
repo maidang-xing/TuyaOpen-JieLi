@@ -49,6 +49,12 @@ OPERATE_RET tkl_dvp_start(void);
  */
 OPERATE_RET tkl_dvp_stop(void);
 
+/**
+ * @brief Change the H.264 encoder bitrate; not supported on Jieli (the video
+ *        pipeline encodes JPEG/MJPEG), returns OPRT_NOT_SUPPORTED.
+ */
+OPERATE_RET tkl_dvp_set_h264_bitrate(uint32_t kbps);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

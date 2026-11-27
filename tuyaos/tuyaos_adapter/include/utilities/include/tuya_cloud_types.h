@@ -32,6 +32,15 @@ typedef unsigned long TIME_MS;
 typedef unsigned long TIME_S;
 typedef unsigned int TIME_T;
 
+/* The TuyaOS vocabulary the upstream cloud libraries are written in. Every
+ * other platform's header carries these; they are aliases of the stdint /
+ * stddef types, not a bridge to any TuyaOpen contract type. */
+typedef size_t SIZE_T;
+
+#ifndef INLINE
+#define INLINE inline
+#endif
+
 #ifndef SIZEOF
 #define SIZEOF sizeof
 #endif

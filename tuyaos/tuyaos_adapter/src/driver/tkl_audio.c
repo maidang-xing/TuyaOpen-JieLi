@@ -79,6 +79,15 @@ void jieli_audio_native_critical_exit(uintptr_t state);
 
 /* Same translation unit family: declared here rather than in a private header. */
 void tkl_jieli_vad_feed_capture(const uint8_t *data, size_t size);
+#if defined(ENABLE_AUDIO) && (ENABLE_AUDIO == 1) && defined(JIELI_SELECTED_CHIP_WL82)
+/* Echo canceller on the TAL archive's speexdsp engine: playback taps the
+ * reference signal, capture runs the cancellation before the frame reaches
+ * the application (VAD, KWS and voice all see the cleaned mic). */
+void tuya_audio_aec_ref_write(const int16_t *pcm, int samples);
+void tuya_audio_aec_process(int16_t *mic, int samples);
+/* The AI modes expect the platform to feed the keyword engine itself. */
+void tkl_jieli_kws_feed_capture(const uint8_t *data, size_t size);
+#endif
 
 static OPERATE_RET __ao_lazy_open(const TKL_AUDIO_CONFIG_T *config);
 
@@ -148,8 +157,15 @@ static void __capture(void *cookie, const uint8_t *data, size_t size, uint64_t p
         goto __done;
     }
     memcpy(copy, data, size);
-    /* A capture callback may aggregate several configured VAD frames. Feed
-     * complete subframes while preserving the original application callback. */
+#if defined(ENABLE_AUDIO) && (ENABLE_AUDIO == 1) && defined(JIELI_SELECTED_CHIP_WL82)
+    tuya_audio_aec_process((int16_t *)copy, (int)(size / 2u));
+    tkl_jieli_kws_feed_capture((const uint8_t *)copy, size);
+#endif
+    /* A capture callback may aggregate several configured VAD frames, so the
+     * engine accumulator slices whatever arrives. The chatbot's AI modes never
+     * call tkl_vad_feed() themselves (the wakeup mode polls tkl_vad_get_status
+     * in AUTO mode), so the capture path is the only source; tkl_vad_feed()
+     * yields to it when both are active to avoid advancing the model twice. */
     tkl_jieli_vad_feed_capture((const uint8_t *)copy, size);
     memset(&frame, 0, sizeof(frame));
     frame.type = TKL_AUDIO_FRAME;
@@ -1632,6 +1648,11 @@ int jieli_audio_native_ao_flush(void *stream)
 #include "server/audio_server.h"
 
 #define JIELI_AUDIO_PLAY_QUEUE_SIZE (16u * 1024u)
+/* Decoder read depth. See __play_open_decoder(): this is the audio that is
+ * already inside the vendor decoder when our queue reports empty. */
+#define JIELI_AUDIO_PLAY_TAIL_BUF_SIZE (4u * 1024u)
+/* 4 KiB at 16 kHz mono 16-bit is ~128 ms; add ~20 ms for the DAC FIFO. */
+#define JIELI_AO_TAIL_SETTLE_TICKS 15u
 /* Ticks to let the decoder drain the play queue on flush (~10 ms each, so this
  * is ~1 s - more than the 0.5 s the 16 KiB queue can hold at 16 kHz). */
 #define JIELI_AUDIO_PLAY_FLUSH_LIMIT 100u
@@ -2071,7 +2092,13 @@ static int __play_open_decoder(void)
      * while only the analog volume was set, which is heard as playback that is
      * simply too quiet. */
     req.dec.digital_volume = (u8)s_play.volume;
-    req.dec.output_buf_len = JIELI_AUDIO_PLAY_QUEUE_SIZE;
+    /* How much PCM the decoder pulls per read, i.e. how much it has already
+     * accepted but not yet played. tkl_ao_stop can only wait on our own queue
+     * (wl82 exposes no DAC-idle query), so this depth is exactly the tail that
+     * a stop would discard. 16 KiB was ~0.5 s, heard as the last syllable
+     * being cut; 4 KiB bounds it to ~125 ms, which the tail settle in
+     * tkl_ao_stop covers. */
+    req.dec.output_buf_len = JIELI_AUDIO_PLAY_TAIL_BUF_SIZE;
     req.dec.sample_rate = s_play.sample_rate;
     req.dec.dec_type = "pcm";
     req.dec.sample_source = "dac";
@@ -2189,6 +2216,14 @@ int jieli_audio_native_ao_stop(void *stream)
 {
     union audio_req req;
     if (stream != &s_play || !s_play.initialized) return -2;
+    /* The caller flushes first, and that flush only waits on our own queue; the
+     * vendor decoder is still holding up to JIELI_AUDIO_PLAY_TAIL_BUF_SIZE of
+     * PCM, with the DAC FIFO behind it. Let that play out before the decoder is
+     * stopped, otherwise the last syllable of every reply is cut (the previous
+     * 16 KiB depth dropped up to half a second). */
+    if (s_play.running) {
+        os_time_dly(JIELI_AO_TAIL_SETTLE_TICKS);
+    }
     __lock();
     s_play.running = 0;
     s_play.read_pos = s_play.write_pos = s_play.used = 0;
@@ -2271,6 +2306,9 @@ int jieli_audio_native_ao_write(void *stream, const uint8_t *data, size_t size)
     u32 first;
     if (stream != &s_play || data == NULL || size == 0 || size > JIELI_AUDIO_PLAY_QUEUE_SIZE || (size & 1u))
         return -2;
+#if defined(ENABLE_AUDIO) && (ENABLE_AUDIO == 1) && defined(JIELI_SELECTED_CHIP_WL82)
+    tuya_audio_aec_ref_write((const int16_t *)data, (int)(size / 2u));
+#endif
     __lock();
     if (!s_play.running) {
         __unlock();

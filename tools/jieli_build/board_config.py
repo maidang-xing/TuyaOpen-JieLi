@@ -369,23 +369,49 @@ def configure_service_uart(board_file: Path, facts: BoardFacts) -> None:
         return
 
     name = f"uart{service.port}"
-    port_group = _uart_port_group(service.tx_pin, service.rx_pin)
+    shared_with_log = facts.log_uart is not None and service.port == facts.log_uart.port
+    port_specific_groups = {
+        0: {"PORTA_5_6", "PORTB_1_2", "PORTA_3_4", "PORTH_0_1"},
+        1: {"PORTH_6_7", "PORTC_3_4", "PORTB_3_4"},
+        2: {"PORTH_2_3", "PORTC_9_10", "PORTB_6_7", "PORTE_0_1"},
+    }
+    tx_match = _PIN_PATTERN.match(service.tx_pin)
+    rx_match = _PIN_PATTERN.match(service.rx_pin)
+    candidate_group = (
+        f"PORT{tx_match.group(1)}_{int(tx_match.group(2))}_{int(rx_match.group(2))}"
+        if tx_match and rx_match and tx_match.group(1) == rx_match.group(1)
+        else None
+    )
+    use_remap = shared_with_log or (
+        candidate_group not in port_specific_groups.get(service.port, set())
+    )
+    port_group = "PORT_REMAP" if use_remap else candidate_group
+    out_ch = "OUTPUT_CHANNEL0" if shared_with_log else "OUTPUT_CHANNEL1"
+    in_ch = "INPUT_CHANNEL0" if shared_with_log else "INPUT_CHANNEL1"
     content = board_file.read_text(encoding="utf-8")
     begin = f"UART{service.port}_PLATFORM_DATA_BEGIN({name}_data)"
     end = f"UART{service.port}_PLATFORM_DATA_END();"
     start = content.find(begin)
     finish = content.find(end, start) if start >= 0 else -1
     if start < 0:
+        extra_channels = (
+            f"    .output_channel = {out_ch},\n"
+            f"    .input_channel = {in_ch},\n"
+            if use_remap
+            else ""
+        )
+        flags_line = "    .flags = UART_DEBUG,\n" if shared_with_log else "    .flags = 0,\n"
         uart_block = (
             f"UART{service.port}_PLATFORM_DATA_BEGIN({name}_data)\n"
             "    .baudrate = 115200,\n"
             f"    .port = {port_group},\n"
+            f"{extra_channels}"
             f"    .tx_pin = {service.tx_pin},\n"
             f"    .rx_pin = {service.rx_pin},\n"
             "    .max_continue_recv_cnt = 1024,\n"
             "    .idle_sys_clk_cnt = 500000,\n"
             "    .clk_src = PLL_48M,\n"
-            "    .flags = 0,\n"
+            f"{flags_line}"
             f"UART{service.port}_PLATFORM_DATA_END();\n\n"
         )
         insertion = content.find("UART1_PLATFORM_DATA_BEGIN(uart1_data)")
@@ -402,18 +428,32 @@ def configure_service_uart(board_file: Path, facts: BoardFacts) -> None:
             )
         finish += len(end)
         uart_block = content[start:finish]
-        replacements = (
-            (r"\.baudrate\s*=\s*\d+\s*,", ".baudrate = 115200,"),
+        replacements = [
             (r"\.port\s*=\s*[^,]+,", f".port = {port_group},"),
             (r"\.tx_pin\s*=\s*[^,]+,", f".tx_pin = {service.tx_pin},"),
             (r"\.rx_pin\s*=\s*[^,]+,", f".rx_pin = {service.rx_pin},"),
-            (r"\.flags\s*=\s*[^,]+,", ".flags = 0,"),
-        )
+        ]
+        if not shared_with_log:
+            replacements.insert(0, (r"\.baudrate\s*=\s*\d+\s*,", ".baudrate = 115200,"))
+            replacements.append((r"\.flags\s*=\s*[^,]+,", ".flags = 0,"))
         for pattern, replacement in replacements:
             uart_block, count = re.subn(pattern, replacement, uart_block, count=1)
             if count != 1:
                 raise BuildError(
                     f"UART{service.port} service setting was not found in {board_file}"
+                )
+        if shared_with_log and ".input_channel" not in uart_block:
+            uart_block, count = re.subn(
+                r"(\.output_channel\s*=\s*[^,]+,)",
+                r"\1\n    .input_channel = INPUT_CHANNEL0,",
+                uart_block,
+                count=1,
+            )
+            if count != 1:
+                uart_block = uart_block.replace(
+                    f".tx_pin = {service.tx_pin},",
+                    f".input_channel = INPUT_CHANNEL0,\n    .tx_pin = {service.tx_pin},",
+                    1,
                 )
         content = content[:start] + uart_block + content[finish:]
 
@@ -574,15 +614,50 @@ def configure_board_memory(
 _TUYA_FLASH_PARTITIONS = ("KV_KEY", "KV_DATA", "UF", "RCD", "USER0")
 
 
+def _c_defines(content: str) -> dict[str, str]:
+    """Map every ``#define NAME value`` in a C file to its raw value text."""
+    return {
+        match.group(1): match.group(2).strip()
+        for match in re.finditer(r"(?m)^[ \t]*#define[ \t]+(\w+)[ \t]+([^\r\n/]+?)[ \t]*$", content)
+    }
+
+
 def _c_hex_literal(content: str, name: str, source: Path) -> int:
-    """Read one plain hex #define; the flash map is parsed, not duplicated."""
-    match = re.search(rf"(?m)^[ \t]*#define[ \t]+{name}[ \t]+(0x[0-9A-Fa-f]+)U?[ \t]*$", content)
-    if match is None:
-        raise BuildError(
-            f"Expected one hex-literal {name} in {source}; the vendor reserved area "
-            f"is derived from it"
-        )
-    return int(match.group(1), 16)
+    """Read a hex #define; resolves ``(OTHER + 0xoffset)`` against the same file.
+
+    The TuyaOpen flash map keeps every partition start relative to one base so
+    moving the span is a single-line change, which is what the A/B layout
+    needs. Only plain literals and a one-offset addition are accepted: an
+    expression the parser cannot evaluate must fail the build rather than
+    silently reserve the wrong span.
+    """
+    defines = _c_defines(content)
+    resolving: list[str] = []
+
+    def resolve(symbol: str) -> int:
+        if symbol in resolving:
+            raise BuildError(f"Circular flash-map define: {' -> '.join(resolving + [symbol])}")
+        raw = defines.get(symbol)
+        if raw is None:
+            raise BuildError(
+                f"Expected a hex-literal {symbol} in {source}; the vendor reserved area "
+                f"is derived from it"
+            )
+        match = re.fullmatch(r"(0x[0-9A-Fa-f]+)U?", raw)
+        if match is not None:
+            return int(match.group(1), 16)
+        match = re.fullmatch(r"\(\s*(\w+)\s*\+\s*(0x[0-9A-Fa-f]+)U?\s*\)", raw)
+        if match is None:
+            raise BuildError(
+                f"Expected a hex literal or '(BASE + 0xoffset)' for {symbol} in {source}, "
+                f"found: {raw}"
+            )
+        resolving.append(symbol)
+        value = resolve(match.group(1)) + int(match.group(2), 16)
+        resolving.pop()
+        return value
+
+    return resolve(name)
 
 
 def tuya_flash_reserved_area(tkl_flash_c: Path) -> tuple[int, int]:
@@ -704,9 +779,13 @@ def configure_peripheral_header(board_file: Path, config_values) -> Path:
             raise BuildError(f"{symbol} must not be negative, got {value}")
         defines.append(f"#define {macro} {value}")
 
-    if config_values is not None and \
-            str(config_values.get("CONFIG_JIELI_BOARD_UART1_ENABLE", "")).strip() == "y":
-        defines.append("#define TUYA_BOARD_UART1_ENABLE 1")
+    if config_values is not None:
+        if str(config_values.get("CONFIG_JIELI_BOARD_UART1_ENABLE", "")).strip() == "y":
+            defines.append("#define TUYA_BOARD_UART1_ENABLE 1")
+        if str(config_values.get("CONFIG_JIELI_BOARD_HAS_SERVICE_UART", "")).strip() == "y":
+            svc_port = str(config_values.get("CONFIG_JIELI_BOARD_SERVICE_UART_PORT", "")).strip()
+            if svc_port:
+                defines.append(f"#define TUYA_BOARD_SERVICE_UART_PORT {int(svc_port, 0)}")
 
     lines = [
         "/* Generated by the JIELI platform from the board Kconfig. */",
@@ -968,13 +1047,16 @@ def _redefine_macro(config_file: Path, name: str, value: str) -> None:
     write_staged_text(config_file, updated)
 
 
-def _define_macro(config_file: Path, name: str) -> None:
+def _define_macro(config_file: Path, name: str, value: str | None = None) -> None:
     """Append ``#define <name>`` before the final ``#endif`` of a staged header.
 
     Used for switches the vendor profile does not define at all. Idempotent:
-    a header that already carries the define is left alone.
+    a header that already carries the define is left alone. ``value`` is for
+    switches the vendor tests with ``#if``: a bare ``#define X`` makes that
+    expression invalid ("expected value in expression").
     """
-    _insert_before_final_endif(config_file, f"#define {name}\n", marker=f"#define {name}")
+    line = f"#define {name}" if value is None else f"#define {name} {value}"
+    _insert_before_final_endif(config_file, line + "\n", marker=f"#define {name}")
 
 
 # The vendor file that decides the station's power mode. Both SDKs put the same
@@ -1204,9 +1286,10 @@ def configure_dual_bank_app_config(app_config_file: Path, config_values) -> None
     if str(config_values.get("CONFIG_JIELI_BOARD_DUAL_BANK", "")).strip() not in ("y", "true", "True"):
         return
     # The vendor profile defines both together: a dual-bank image needs the
-    # duplicated uboot, or the boot side cannot switch between banks.
-    _define_macro(app_config_file, "CONFIG_DOUBLE_BANK_ENABLE")
-    _define_macro(app_config_file, "CONFIG_SUPPORT_DOUBLE_UBOOT")
+    # duplicated uboot, or the boot side cannot switch between banks. Both are
+    # tested with `#if`, so they must carry a value rather than be bare.
+    _define_macro(app_config_file, "CONFIG_DOUBLE_BANK_ENABLE", "1")
+    _define_macro(app_config_file, "CONFIG_SUPPORT_DOUBLE_UBOOT", "1")
 
 
 def configure_usb_download_app_config(app_config_file: Path, usb_cdc_log: bool = False) -> None:
@@ -1458,4 +1541,182 @@ def configure_lcd_board(board_file: Path) -> None:
         "#endif\n"
     )
     content = content.replace(device_table, device_table + "\n" + lcd_entry, 1)
+    write_staged_text(board_file, content)
+
+
+# The AC79 DevKit has two camera connectors that share pins (PA2/PA3/PA4 and
+# PH0-PH3), so the board Kconfig choice selects exactly one path: video0 (24-pin
+# DVP on J1) or spi2 (12-pin SPI on J4, sensor configured by the TDD over IIC1).
+CAMERA_MARKER = "/* TuyaOpen Jieli camera configuration. */"
+
+
+def camera_path(config_values) -> Optional[str]:
+    """Return "dvp", "spi" or None from the evaluated board config."""
+    values = config_values or {}
+    if str(values.get("CONFIG_JIELI_BOARD_CAMERA_GC2145", "")).strip() in ("y", "true", "True"):
+        return "dvp"
+    if str(values.get("CONFIG_JIELI_BOARD_CAMERA_GC0310", "")).strip() in ("y", "true", "True"):
+        return "spi"
+    return None
+
+
+def camera_spi_attr(config_values) -> str:
+    """Return the vendor SPI2 attribute expression for the SPI camera.
+
+    Slave, CLK low / update low / sample high -- the value the vendor's own
+    DevKitBoard demo uses. The board no longer exposes this as a choice: the
+    other combinations existed for modules this board does not carry.
+    """
+    return "(SPI_MODE_SLAVE | SPI_SCLK_L_UPL_SMPH | SPI_UNIDIR_MODE)"
+
+
+def configure_camera_app_config(app_config_file: Path, path: str, config_values) -> None:
+    """Stage the vendor video macros the selected camera path needs.
+
+    CONFIG_VIDEO_ENABLE gates the sensor driver bodies and the CAMERA image
+    size macros. The SPI path additionally needs VIDEO1 (the sensor device) and
+    the SPI/BT656 receive mode the J4 wiring uses: two data lines on
+    PA2/PA3/PA4, which only the software SPI receive path handles (the
+    hardware BT656 receiver is wired to PC8/PH4 on this chip).
+    """
+    values = config_values or {}
+    default_w, default_h = (640, 480) if path == "dvp" else (320, 240)
+    width = int(values.get("CONFIG_JIELI_BOARD_CAMERA_WIDTH", default_w))
+    height = int(values.get("CONFIG_JIELI_BOARD_CAMERA_HEIGHT", default_h))
+
+    lines = [
+        f"{CAMERA_MARKER}",
+        "#define CONFIG_VIDEO_ENABLE                 1",
+        f"#define CONFIG_VIDEO_IMAGE_W                {width}",
+        f"#define CONFIG_VIDEO_IMAGE_H                {height}",
+        "#define CONFIG_CAMERA_H_V_EXCHANGE          1",
+    ]
+    if path == "spi":
+        lines.extend([
+            "#define CONFIG_VIDEO1_ENABLE                1",
+            f"#define CONFIG_VIDEO1_IMAGE_W               {width}",
+            f"#define CONFIG_VIDEO1_IMAGE_H               {height}",
+            "#define CONFIG_SPI_VIDEO_ENABLE             1",
+            "#define CONFIG_SPI_VIDEO_USE_ISC1_RECV      0",
+            "#define CONFIG_SPI_ONE_LINE_ENABLE          0",
+            f"#define TCFG_SPI_ATTR                       {camera_spi_attr(values)}",
+            "#define TCFG_VIDEO1_CAMERA_XCLOCK           IO_PORTH_02",
+            "#define TCFG_VIDEO1_CAMERA_RESET            IO_PORTH_03",
+            "#define TCFG_VIDEO1_CAMERA_PWDN             -1",
+            "#define TCFG_IIC1_CLK                       IO_PORTH_00",
+            "#define TCFG_IIC1_DAT                       IO_PORTH_01",
+        ])
+    lines.append("")
+    _insert_before_final_endif(app_config_file, "\n".join(lines), CAMERA_MARKER)
+
+
+def configure_camera_board(board_file: Path, path: str, config_values=None) -> None:
+    """Register the vendor camera device(s) on the staged demo_hello board.
+
+    The sensor is not described here: the ISP probes the registered sensor
+    drivers and configures whichever module answers. The board supplies the
+    connector wiring (data pins, PCLK/HSYNC/VSYNC, XCLK/RESET) and, for the
+    SPI path, the SPI2 slave mode the J4 two-wire stream needs.
+    """
+    content = board_file.read_text(encoding="utf-8")
+    if CAMERA_MARKER in content:
+        return
+
+    include_anchor = '#include "asm/includes.h"'
+    if include_anchor not in content:
+        raise BuildError(f"Jieli board file has no asm include point: {board_file}")
+
+    if path == "dvp":
+        block = (
+            f"\n{CAMERA_MARKER}\n"
+            '#include "video.h"\n'
+            '#include "camera.h"\n'
+            "static const struct camera_platform_data tuya_camera0_data = {\n"
+            "    .xclk_gpio      = IO_PORTH_02,\n"
+            # The TDD configures the sensor over IIC and drives its reset, so
+            # the vendor framework must not touch the pin.
+            "    .reset_gpio     = -1,\n"
+            "    .pwdn_gpio      = -1,\n"
+            "    .power_value    = 0,\n"
+            "    .interface      = SEN_INTERFACE0,\n"
+            "    .dvp = {\n"
+            "        .pclk_gpio  = IO_PORTA_08,\n"
+            "        .hsync_gpio = IO_PORTA_09,\n"
+            "        .vsync_gpio = IO_PORTA_10,\n"
+            "        .group_port = ISC_GROUPA,\n"
+            "        .data_gpio  = {\n"
+            "            IO_PORTA_07, IO_PORTA_06, IO_PORTA_05, IO_PORTA_04,\n"
+            "            IO_PORTA_03, IO_PORTA_02, IO_PORTA_01, IO_PORTA_00,\n"
+            "            -1, -1,\n"
+            "        },\n"
+            "    },\n"
+            "};\n"
+            "static const struct video_subdevice_data tuya_video0_subdev[] = {\n"
+            "    { VIDEO_TAG_CAMERA, (void *)&tuya_camera0_data },\n"
+            "};\n"
+            "static const struct video_platform_data tuya_video0_data = {\n"
+            "    .data = tuya_video0_subdev,\n"
+            "    .num  = ARRAY_SIZE(tuya_video0_subdev),\n"
+            "};\n"
+        )
+        device_entries = (
+            f"{CAMERA_MARKER}\n"
+            '    { "video0.*", &video_dev_ops, (void *)&tuya_video0_data },\n'
+        )
+    else:
+        block = (
+            f"\n{CAMERA_MARKER}\n"
+            '#include "video.h"\n'
+            '#include "camera.h"\n'
+            '#include "asm/spi.h"\n'
+            "static const struct camera_platform_data tuya_camera1_data = {\n"
+            # SPI camera on J4: the vendor board files use no DVP interface
+            # for camera1 (demo_DevKitBoard: interface -1, every dvp pin -1)
+            # because the stream arrives on SPI2, not the ISP. Declaring
+            # SEN_INTERFACE0 here made video1 claim the ISC group-A pads even
+            # though PA3 (PCLK) is wired to SPI2. XCLK is driven by the adapter
+            # (gpio_output_channle on PH2), so give the pin to the video1
+            # driver (xclk_hz 0 -> 24 MHz) and re-arm it from the adapter after
+            # dev_open, because open clears the channel on this board.
+            "    .xclk_gpio      = IO_PORTH_02,\n"
+            "    .reset_gpio     = IO_PORTH_03,\n"
+            "    .pwdn_gpio      = -1,\n"
+            "    .power_value    = 0,\n"
+            "    .interface      = -1,\n"
+            "    .dvp = {\n"
+            "        .pclk_gpio  = -1,\n"
+            "        .hsync_gpio = -1,\n"
+            "        .vsync_gpio = -1,\n"
+            "        .group_port = -1,\n"
+            "        .data_gpio  = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },\n"
+            "    },\n"
+            "};\n"
+            "static const struct video_subdevice_data tuya_video1_subdev[] = {\n"
+            "    { VIDEO_TAG_CAMERA, (void *)&tuya_camera1_data },\n"
+            "};\n"
+            "static const struct video_platform_data tuya_video1_data = {\n"
+            "    .data = tuya_video1_subdev,\n"
+            "    .num  = ARRAY_SIZE(tuya_video1_subdev),\n"
+            "};\n"
+            "SPI2_PLATFORM_DATA_BEGIN(tuya_spi2_data)\n"
+            # 40 MHz is what the vendor DevKitBoard board data uses for the same
+            # J4 SPI-CAM socket; keeping it avoids sampling margin errors that
+            # show up as isolated corrupted lines.
+            "    .clk  = 40000000,\n"
+            "    .mode = SPI_DUAL_MODE,\n"
+            "    .port = 'C',\n"
+            f"    .attr = {camera_spi_attr(config_values)},\n"
+            "SPI2_PLATFORM_DATA_END()\n"
+        )
+        device_entries = (
+            f"{CAMERA_MARKER}\n"
+            '    { "video1.*", &video_dev_ops, (void *)&tuya_video1_data },\n'
+            '    { "spi2", &spi_dev_ops, (void *)&tuya_spi2_data },\n'
+        )
+
+    content = content.replace(include_anchor, include_anchor + "\n" + block, 1)
+    device_table = "REGISTER_DEVICES(device_table) = {"
+    if device_table not in content:
+        raise BuildError(f"Jieli board file has no device table: {board_file}")
+    content = content.replace(device_table, device_table + "\n" + device_entries, 1)
     write_staged_text(board_file, content)

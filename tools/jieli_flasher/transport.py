@@ -91,9 +91,19 @@ class JLUsbScsiTransport(JLTransport):
             logger.warning("pyusb is not installed; USB transport unavailable.")
             return []
 
+        backend = None
+        try:
+            import libusb_package
+            backend = libusb_package.get_libusb1_backend()
+        except Exception:
+            pass
+
         devices = []
         try:
-            for dev in usb.core.find(find_all=True):
+            find_kwargs = {"find_all": True}
+            if backend is not None:
+                find_kwargs["backend"] = backend
+            for dev in usb.core.find(**find_kwargs):
                 is_jieli = False
                 mfg = ""
                 prod = ""

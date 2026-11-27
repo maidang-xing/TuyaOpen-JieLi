@@ -32,6 +32,15 @@ typedef unsigned long TIME_MS;
 typedef unsigned long TIME_S;
 typedef unsigned int TIME_T;
 
+/* The TuyaOS vocabulary the upstream cloud libraries are written in. Every
+ * other platform's header carries these; they are aliases of the stdint /
+ * stddef types, not a bridge to any TuyaOpen contract type. */
+typedef size_t SIZE_T;
+
+#ifndef INLINE
+#define INLINE inline
+#endif
+
 #ifndef SIZEOF
 #define SIZEOF sizeof
 #endif
@@ -1576,6 +1585,20 @@ typedef struct
     H264_CFG h264_cfg;
 } TUYA_DVP_ENCODED_QUALITY;
 
+typedef OPERATE_RET (*DVP_SET_UP_CB)(void *args);
+typedef TUYA_DVP_FRAME_MANAGE_T *(*DVP_FRAME_ASSIGN_CB)(TUYA_FRAME_FMT_E fmt, void *args);
+typedef OPERATE_RET (*DVP_FRAME_POST_CB)(TUYA_DVP_FRAME_MANAGE_T *dvp_frame, void *args);
+
+typedef struct
+{
+    DVP_SET_UP_CB setup_cb;
+    DVP_FRAME_ASSIGN_CB assign_cb;
+    DVP_FRAME_POST_CB post_cb;
+    void *cb_param;
+    /* Sensor MCLK in Hz; the T5 platform derives its clock from it. */
+    uint32_t sensor_clk;
+} TUYA_DVP_TKL_CFG_T;
+
 typedef struct {
     uint16_t fps;
     uint16_t width;
@@ -1583,6 +1606,7 @@ typedef struct {
     TUYA_DVP_SYNC_MODE sync_polarity;
     TUYA_CAMERA_OUTPUT_MODE output_mode;
     TUYA_DVP_ENCODED_QUALITY encoded_quality;
+    TUYA_DVP_TKL_CFG_T inter_cfg;
 } TUYA_DVP_CFG_T;
 
 /**

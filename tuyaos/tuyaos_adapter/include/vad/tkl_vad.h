@@ -34,9 +34,18 @@ typedef uint8_t TKL_VAD_STATUS_T;
 #define TKL_VAD_STATUS_NONE 0
 #define TKL_VAD_STATUS_SPEECH 1
 
+/* Sensitivity preset, same contract the AI modes use on the other platforms. */
+typedef enum {
+    TKL_AUDIO_VAD_HIGH,
+    TKL_AUDIO_VAD_MID,
+    TKL_AUDIO_VAD_LOW,
+} TKL_AUDIO_VAD_THRESHOLD_E;
+
 /***********************************************************
 ********************function declaration********************
 ***********************************************************/
+
+OPERATE_RET tkl_vad_set_threshold(TKL_AUDIO_VAD_THRESHOLD_E level);
 
 OPERATE_RET tkl_vad_init(TKL_VAD_CONFIG_T *config);
 

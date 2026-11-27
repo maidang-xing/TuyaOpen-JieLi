@@ -107,9 +107,44 @@ REGISTER_DEVICE(iic2_node) = { "iic2", &iic_dev_ops, (void *)&s_iic2_pd };
 #define TUYA_BOARD_IIC1_SDA_PIN IO_PORTA_08
 #endif
 
+/* IIC ports on WL82, as the adapter presents them to the application:
+ *
+ *   TUYA_I2C_NUM_0  software   this chip has no hardware IIC0
+ *   TUYA_I2C_NUM_1  hardware   only the pads in the controller's outport map
+ *
+ * The split is not part of the TKL contract: the caller just calls
+ * tkl_i2c_init() on the port it wants, exactly as on any other platform.
+ * Software IIC drives the pads as plain GPIO and takes any pins; the hardware
+ * controller keeps its pads muxed while the port is open, so it only works on
+ * PA7/PA8, PC1/PC2 or USB DPA/DMA. PH0/PH1 are the camera module's own 2-wire
+ * bus on this board family, so a port pinned there is bit-banged even though
+ * the controller lists the pads: with the hardware mux the TDD's ID probe and
+ * register table pass, but the SPI receiver never sees a valid line (frames=0,
+ * tag errors only; 4.4 fps once bit-banged). Any other pin pair also falls
+ * back to software, which is what "software IIC supports arbitrary pins" means
+ * for a caller.
+ *
+ * The pins are board-staged integers, so this is a compile-time decision.
+ */
+#define JIELI_IIC_PIN_PAIR(scl, sda, a, b)                                                                           \
+    ((((scl) == (a)) && ((sda) == (b))) || (((scl) == (b)) && ((sda) == (a))))
+
+#define JIELI_IIC1_IS_SOFTWARE                                                                                        \
+    (!(JIELI_IIC_PIN_PAIR(TUYA_BOARD_IIC1_SCL_PIN, TUYA_BOARD_IIC1_SDA_PIN, IO_PORTA_07, IO_PORTA_08) ||               \
+       JIELI_IIC_PIN_PAIR(TUYA_BOARD_IIC1_SCL_PIN, TUYA_BOARD_IIC1_SDA_PIN, IO_PORTC_01, IO_PORTC_02) ||               \
+       JIELI_IIC_PIN_PAIR(TUYA_BOARD_IIC1_SCL_PIN, TUYA_BOARD_IIC1_SDA_PIN, IO_PORT_USB_DPA, IO_PORT_USB_DMA)))
+
 /* Mirror the WL82 SDK hardware-IIC platform data. The pins come from the board,
  * and iic_init() stores this object directly as the device's hardware
  * configuration, so every field stays initialized. */
+#if JIELI_IIC1_IS_SOFTWARE
+SW_IIC_PLATFORM_DATA_BEGIN(s_iic1_pd)
+    .clk_pin = TUYA_BOARD_IIC1_SCL_PIN,
+    .dat_pin = TUYA_BOARD_IIC1_SDA_PIN,
+    .sw_iic_delay = 50,
+SW_IIC_PLATFORM_DATA_END()
+REGISTER_DEVICE(iic1_node) = {"iic1", &iic_dev_ops, (void *)&s_iic1_pd};
+#else
 static struct iic_device s_iic1_dev;
 static struct hw_iic_platform_data s_iic1_pd = {
     .head = {
@@ -134,10 +169,10 @@ static struct hw_iic_platform_data s_iic1_pd = {
 };
 
 REGISTER_DEVICE(iic1_node) = {"iic1", &iic_dev_ops, &s_iic1_pd};
+#endif
 
 /* WL82 has no hardware IIC0: its iic0 is the vendor software IIC. Register it
- * here because the staged demo board does not, and keep it on pins the board
- * leaves free (PA0/PA1). */
+ * here because the staged demo board does not; the pins come from the board. */
 SW_IIC_PLATFORM_DATA_BEGIN(s_iic0_pd)
     .clk_pin = TUYA_BOARD_IIC0_SCL_PIN,
     .dat_pin = TUYA_BOARD_IIC0_SDA_PIN,
@@ -271,7 +306,14 @@ static int jieli_i2c_is_software(TUYA_I2C_NUM_E port)
 #if defined(JIELI_SELECTED_CHIP_WL83)
     return port == TUYA_I2C_NUM_2;
 #else
+#if JIELI_IIC1_IS_SOFTWARE
+    /* iic1 is registered as the software IIC (its pins are outside what the
+     * hardware controller can drive), so init/reset must not route the
+     * hardware pinmux onto those pads. */
+    return port == TUYA_I2C_NUM_0 || port == TUYA_I2C_NUM_1;
+#else
     return port == TUYA_I2C_NUM_0;
+#endif
 #endif
 }
 
@@ -322,8 +364,13 @@ OPERATE_RET tkl_i2c_init(TUYA_I2C_NUM_E port, const TUYA_IIC_BASE_CFG_T *cfg)
     }
 #if defined(JIELI_SELECTED_CHIP_WL82)
     /* WL82's hardware iic1 has a fixed divider (about 385 kHz); port 0 is the
-     * software IIC whose timing comes from its own delay field. */
-    if (port == TUYA_I2C_NUM_1) {
+     * software IIC whose timing comes from its own delay field. The SPI camera
+     * build registers iic1 as software too (PH0/PH1), so the 400 kHz gate only
+     * applies to the hardware controller -- otherwise a perfectly valid 100 kHz
+     * request from a sensor TDD is refused with OPRT_NOT_SUPPORTED. */
+    if (jieli_i2c_is_software(port)) {
+        /* Bit-banged port: the speed field does not drive the bus. */
+    } else if (port == TUYA_I2C_NUM_1) {
         if (cfg->speed != TUYA_IIC_BUS_SPEED_400K) {
             return OPRT_NOT_SUPPORTED;
         }
@@ -631,7 +678,10 @@ OPERATE_RET tkl_i2c_reset(TUYA_I2C_NUM_E port)
         rt = OPRT_OS_ADAPTER_I2C_TRANS_ERR;
         goto out;
     }
-    rt = jieli_pinmux_iic_apply(port);
+    /* A software port owns its pads directly; routing the hardware IIC1
+     * function onto them here would take PH0/PH1 away from the bit-banged
+     * bus (the SPI camera build registers iic1 that way). */
+    rt = jieli_i2c_is_software(port) ? OPRT_OK : jieli_pinmux_iic_apply(port);
     if (rt == OPRT_OK) rt = jieli_i2c_set_speed(port, s_i2c_speed_hz[port]);
     if (rt != OPRT_OK) {
         (void)dev_close(s_i2c_handles[port]);

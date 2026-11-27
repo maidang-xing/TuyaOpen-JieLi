@@ -364,6 +364,10 @@ def build(param_dir: Path, params: dict[str, str]) -> Path:
     header_dir_text = params.get("OPEN_HEADER_DIR", "").split()
     header_dir = Path(header_dir_text[0]) if header_dir_text else None
     tuya_lib_dir = Path(params.get("OPEN_LIBS_DIR", ""))
+    tuya_libs = tuple(
+        lib if (lib.startswith("lib") and lib.endswith(".a")) else f"lib{lib}.a"
+        for lib in params.get("PLATFORM_NEED_LIBS", "").split()
+    )
     facts = load_board_facts(params)
     build_root = create_staging_tree(
         sdk_root,
@@ -371,6 +375,7 @@ def build(param_dir: Path, params: dict[str, str]) -> Path:
         tuyaopen_root,
         header_dir,
         tuya_lib_dir=tuya_lib_dir,
+        tuya_libs=tuya_libs or None,
         uart_log_port=plan["uart"]["log_port"],
         uart_log_baudrate=plan["uart"]["log_baudrate"],
         platform_root=PLATFORM_ROOT,
